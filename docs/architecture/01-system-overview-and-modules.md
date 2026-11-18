@@ -167,7 +167,7 @@ flowchart LR
 * **Data Entities**: `categories`, `products`, `product_images`.
 * **Public API Endpoints**:
   * Storefront (read-only): `GET /api/v1/categories`, `GET /api/v1/products`, `GET /api/v1/products/{slug}`.
-  * Admin/Staff (via `/api/v1/admin/*`): `POST /api/v1/admin/categories`, `PATCH /api/v1/admin/categories/{category_id}`, `GET /api/v1/admin/products`, `POST /api/v1/admin/products`, `PATCH /api/v1/admin/products/{product_id}`, `DELETE /api/v1/admin/products/{product_id}` (soft-archive to `ARCHIVED`).
+  * Admin/Staff (via `/api/v1/admin/*`): `POST /api/v1/admin/categories`, `PATCH /api/v1/admin/categories/{category_id}`, `GET /api/v1/admin/products`, `GET /api/v1/admin/products/{product_id}`, `POST /api/v1/admin/products`, `PATCH /api/v1/admin/products/{product_id}`, `DELETE /api/v1/admin/products/{product_id}` (soft-archive to `ARCHIVED`).
 * **Authorization Requirements**:
   * Storefront endpoints: public (`anonymous`+); return **only** `ACTIVE` products and active categories.
   * Admin catalog endpoints: `staff` or `admin` + CSRF token on mutations.
@@ -187,7 +187,7 @@ flowchart LR
 * **Data Entities**: `product_variants`, `inventory_stocks`, `inventory_reservations`, `inventory_ledger_entries`.
 * **Public API Endpoints**:
   * Storefront: `GET /api/v1/variants/{variant_id}/availability` (plus availability embedded in `GET /api/v1/products/{slug}`).
-  * Admin/Staff: `POST /api/v1/admin/products/{product_id}/variants`, `PATCH /api/v1/admin/variants/{variant_id}`, `POST /api/v1/admin/inventory/{variant_id}/adjust`, `GET /api/v1/admin/inventory/{variant_id}/ledger`.
+  * Admin/Staff: `GET /api/v1/admin/inventory`, `POST /api/v1/admin/products/{product_id}/variants`, `PATCH /api/v1/admin/variants/{variant_id}`, `POST /api/v1/admin/inventory/{variant_id}/adjust`, `GET /api/v1/admin/inventory/{variant_id}/ledger`.
 * **Authorization Requirements**:
   * Availability reads: public (`anonymous`+).
   * Variant & stock mutations + ledger reads: `staff` or `admin` + CSRF on mutations.
@@ -215,7 +215,7 @@ flowchart LR
   * `POST /api/v1/cart/merge`
 * **Authorization Requirements**:
   * Accessible to `anonymous` (with `ecom_guest_cart` cookie) and authenticated users (`customer`, `staff`, `admin`).
-  * `POST /api/v1/cart/merge` requires authenticated user + valid `ecom_guest_cart` cookie + CSRF token.
+  * `POST /api/v1/cart/merge` requires authenticated user + CSRF token; idempotent (`200 OK` returning user cart if no `ecom_guest_cart` cookie or guest cart is absent/empty).
   * Ownership check: a user or guest can only view/modify items belonging to their own active cart.
 * **Business Invariants**:
   * At most one `ACTIVE` cart per authenticated `user_id` (enforced via PostgreSQL partial unique index).

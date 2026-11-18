@@ -122,7 +122,36 @@ Error envelope (`4xx` / `5xx`; `422` uses `"code": "VALIDATION_ERROR"`):
 
 ### `GET /api/v1/products/{slug}`
 * **Auth**: Public (`ACTIVE` product with active category).
-* **200 OK**: Full `ProductDetailDTO` with `images` and `variants` (`id`, `sku`, `title`, `attributes`, `price_cents`, `compare_at_price_cents`, `currency`, `is_active`, `available_quantity`, `in_stock`).
+* **Query Strategy**: Single-query/joined fetch of `products`, `categories`, `product_images`, `product_variants`, and `inventory_stocks` (zero N+1 queries; availability computed server-side as `available_quantity = GREATEST(0, on_hand - reserved)`, `in_stock = available_quantity > 0`, `low_stock = available_quantity > 0 AND available_quantity <= low_stock_threshold`).
+* **200 OK** (`ProductDetailDTO`):
+  ```json
+  {
+    "id": "uuid",
+    "title": "Merino Crewneck Tee",
+    "slug": "merino-crewneck-tee",
+    "description": "...",
+    "status": "ACTIVE",
+    "category": { "id": "uuid", "name": "Apparel", "slug": "apparel" },
+    "images": [
+      { "id": "uuid", "url": "https://...", "alt_text": "Merino Tee front", "sort_order": 0, "is_primary": true }
+    ],
+    "variants": [
+      {
+        "id": "uuid",
+        "sku": "TEE-MRN-M",
+        "title": "Charcoal / Medium",
+        "attributes": { "color": "Charcoal", "size": "M" },
+        "price_cents": 4500,
+        "compare_at_price_cents": 5500,
+        "currency": "USD",
+        "is_active": true,
+        "available_quantity": 14,
+        "in_stock": true,
+        "low_stock": false
+      }
+    ]
+  }
+  ```
 * **Errors**: `404 PRODUCT_NOT_FOUND`.
 
 ---
@@ -140,7 +169,38 @@ Error envelope (`4xx` / `5xx`; `422` uses `"code": "VALIDATION_ERROR"`):
 
 ### `GET /api/v1/cart`
 * **Auth**: Anonymous (`ecom_guest_cart` cookie) or Authenticated (`ecom_session`). Fails closed (`401`) on invalid `ecom_session`.
-* **200 OK**: Live server pricing & stock projected from `product_variants` + `inventory_stocks` (`id`, `currency`, `items`, `item_count`, `subtotal_cents`, `estimated_shipping_cents`, `estimated_total_cents`).
+* **Query Strategy**: Single joined query projecting `cart_items` with `product_variants`, `products`, `categories`, `inventory_stocks`, and primary `product_images` (zero N+1 queries).
+* **200 OK** (`CartDTO`):
+  ```json
+  {
+    "id": "uuid",
+    "currency": "USD",
+    "items": [
+      {
+        "id": "uuid",
+        "variant_id": "uuid",
+        "product_id": "uuid",
+        "product_slug": "merino-crewneck-tee",
+        "product_title": "Merino Crewneck Tee",
+        "variant_title": "Charcoal / Medium",
+        "sku": "TEE-MRN-M",
+        "image_url": "https://...",
+        "unit_price_cents": 4500,
+        "quantity": 2,
+        "line_total_cents": 9000,
+        "available_quantity": 14,
+        "in_stock": true,
+        "low_stock": false,
+        "is_available": true
+      }
+    ],
+    "item_count": 2,
+    "subtotal_cents": 9000,
+    "estimated_shipping_cents": 1000,
+    "estimated_total_cents": 10000
+  }
+  ```
+  *Note*: `is_available` is `true` iff `categories.is_active AND products.status == 'ACTIVE' AND product_variants.is_active AND available_quantity >= quantity`.
 
 ### `POST /api/v1/cart/items`
 * **Auth**: Anonymous or Authenticated (+ `X-CSRF-Token` if `ecom_session` active; rate-limited).
@@ -159,8 +219,9 @@ Error envelope (`4xx` / `5xx`; `422` uses `"code": "VALIDATION_ERROR"`):
 * **200 OK**: Updated `CartDTO`.
 
 ### `POST /api/v1/cart/merge`
-* **Auth**: Authenticated + `X-CSRF-Token`. Merges `ecom_guest_cart` items into user's `ACTIVE` cart (`min(99, available_quantity)`), marks guest cart `CONVERTED`, clears `ecom_guest_cart`.
-* **200 OK**: Merged `CartDTO`.
+* **Auth**: Authenticated + `X-CSRF-Token`.
+* **Idempotent Behavior**: Reads `ecom_guest_cart` cookie if present. If no `ecom_guest_cart` cookie exists, or the guest cart is missing, empty, or already `CONVERTED`, safely returns **`200 OK`** with the authenticated user's current active `CartDTO` (without error). When an active non-empty guest cart exists, merges quantities into the user's `ACTIVE` cart (`min(99, available_quantity)`), marks the guest cart `CONVERTED`, and clears `ecom_guest_cart`.
+* **200 OK**: Merged (or current) `CartDTO`.
 
 ---
 
@@ -297,17 +358,44 @@ Error envelope (`4xx` / `5xx`; `422` uses `"code": "VALIDATION_ERROR"`):
 
 All `/api/v1/admin/*` routes require authenticated `ecom_session`, live `users.is_active == true`, `X-CSRF-Token` on all mutations, and `role IN ('staff', 'admin')` (or `role == 'admin'` where specified). **Every** mutating `/api/v1/admin/*` operation records an `audit_logs` row with secret-redacted `before_state` and `after_state`.
 
-### 9.1 Admin Catalog & Variants (`staff | admin`)
+### `9.1 Admin Catalog & Variants` (`staff | admin`)
 * `POST /api/v1/admin/categories` $\rightarrow$ `201 Created` (`audit_logs` written).
 * `PATCH /api/v1/admin/categories/{category_id}` $\rightarrow$ `200 OK` (`422 CATEGORY_CYCLE_DETECTED`, `audit_logs` written).
-* `GET /api/v1/admin/products`: lists `DRAFT | ACTIVE | ARCHIVED`, paginated.
-* `POST /api/v1/admin/products`: validates `product_images[].url` (`https://` or `/assets/...`), creates `DRAFT` product $\rightarrow$ `201 Created`.
-* `PATCH /api/v1/admin/products/{product_id}`: updates fields or `status` (`DRAFT -> ACTIVE` checks `>= 1` active variant).
-* `DELETE /api/v1/admin/products/{product_id}`: sets `status = 'ARCHIVED'` $\rightarrow$ `200 OK`.
-* `POST /api/v1/admin/products/{product_id}/variants`: atomically creates `product_variants`, `inventory_stocks`, and `INITIAL_SEED` ledger row $\rightarrow$ `201 Created`.
-* `PATCH /api/v1/admin/variants/{variant_id}`: updates price, attributes, title, `is_active`, `low_stock_threshold`.
+* `GET /api/v1/admin/products`: lists `DRAFT | ACTIVE | ARCHIVED`, paginated (supports `q`, `status`, `category_id`).
+* `GET /api/v1/admin/products/{product_id}`: returns **`AdminProductDetailDTO`** for deep-linked editor views/refreshes across any status (`DRAFT | ACTIVE | ARCHIVED`), including `category`, ordered `images`, and all `variants` with server-derived `on_hand`, `reserved`, `available_quantity`, `low_stock_threshold`, `in_stock`, and `low_stock` (`404 PRODUCT_NOT_FOUND`).
+* `POST /api/v1/admin/products`: validates `product_images[].url` (`https://` or `/assets/...`), creates `DRAFT` product $\rightarrow$ `201 Created` (`audit_logs` written).
+* `PATCH /api/v1/admin/products/{product_id}`: updates fields or `status` (`DRAFT -> ACTIVE` checks `>= 1` active variant) (`audit_logs` written).
+* `DELETE /api/v1/admin/products/{product_id}`: sets `status = 'ARCHIVED'` $\rightarrow$ `200 OK` (`audit_logs` written).
+* `POST /api/v1/admin/products/{product_id}/variants`: atomically creates `product_variants`, `inventory_stocks`, and `INITIAL_SEED` ledger row $\rightarrow$ `201 Created` (`audit_logs` written).
+* `PATCH /api/v1/admin/variants/{variant_id}`: updates price, attributes, title, `is_active`, `low_stock_threshold` (`audit_logs` written).
 
-### 9.2 Admin Inventory (`staff | admin`)
+### `9.2 Admin Inventory` (`staff | admin`)
+* `GET /api/v1/admin/inventory`:
+  * **Query Params**: `q` (`<= 100` chars, escaped `ILIKE` on SKU, product title, or variant title), `stock_status` (`all | in_stock | low_stock | out_of_stock`, default `all`), `page`, `page_size`.
+  * **200 OK**: Paginated envelope of `AdminInventoryItemDTO` computed in a single joined SQL query:
+    ```json
+    {
+      "items": [
+        {
+          "variant_id": "uuid",
+          "product_id": "uuid",
+          "sku": "TEE-MRN-M",
+          "product_title": "Merino Crewneck Tee",
+          "variant_title": "Charcoal / Medium",
+          "product_status": "ACTIVE",
+          "is_active": true,
+          "on_hand": 16,
+          "reserved": 2,
+          "available_quantity": 14,
+          "low_stock_threshold": 5,
+          "in_stock": true,
+          "low_stock": false,
+          "updated_at": "2026-11-18T11:30:00Z"
+        }
+      ],
+      "total": 42, "page": 1, "page_size": 20, "has_next": true
+    }
+    ```
 * `POST /api/v1/admin/inventory/{variant_id}/adjust`: `{ "delta_on_hand": 10, "note": "Restock PO-1042" }` (`422 INVALID_STOCK_ADJUSTMENT` if `on_hand + delta < reserved` or `< 0`). Records `inventory_ledger_entries` + `audit_logs`.
 * `GET /api/v1/admin/inventory/{variant_id}/ledger`: paginated `inventory_ledger_entries`.
 

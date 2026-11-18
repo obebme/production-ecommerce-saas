@@ -74,7 +74,7 @@
 
 ## 3. Product Detail Page (`/products/[slug]`)
 
-Consumes `GET /api/v1/products/{slug}` (`ProductDetailDTO`), with optional fresh availability check via `GET /api/v1/variants/{variant_id}/availability` on focus/variant switch.
+Consumes `GET /api/v1/products/{slug}` (`ProductDetailDTO`), where `variants[]` already include server-derived `available_quantity`, `in_stock`, and `low_stock` computed in a single joined query without N+1 per-variant calls. `GET /api/v1/variants/{variant_id}/availability` is reserved for post-conflict (`409`) revalidation or optional window-focus refresh.
 
 ### 3.1 Two-Column Layout (`lg`: `55%` Gallery / `45%` Buy Box; stacked on `< lg`)
 * **Breadcrumb**: `Home / {category.name} / {product.title}` (`<nav aria-label="Breadcrumb">`).
@@ -86,16 +86,16 @@ Consumes `GET /api/v1/products/{slug}` (`ProductDetailDTO`), with optional fresh
   * `<h1>` Product Title + active variant `sku` in subtle `font-mono` (`SKU: TEE-MRN-M`).
   * **Dynamic Pricing** (`tabular-nums`): Current `price_cents` prominently in `h2`. When `compare_at_price_cents != null && compare_at_price_cents > price_cents`, show original price struck through (`line-through text-muted-foreground`) alongside an `--accent` savings badge (`Save 20%`).
 * **Variant Selector**:
-  * Filters to `is_active === true` variants (if a product somehow has none, shows `"Currently unavailable"`).
+  * Filters `ProductDetailDTO.variants[]` to `is_active === true` variants (if a product somehow has none, shows `"Currently unavailable"`).
   * Parses `variants[].attributes` (e.g., `color`, `size`) into clean `role="radiogroup"` pill/swatch selectors. If attributes vary inconsistently across variants, falls back gracefully to a single `"Option"` `radiogroup` displaying `variant.title`.
-  * Selecting an option immediately updates SKU, price, compare-at price, and live stock availability. Out-of-stock active variants remain selectable with subtle dashed border / `"(Out of stock)"` screen-reader suffix so shoppers can view pricing and option details.
+  * Selecting an option immediately updates SKU, price, compare-at price, and stock availability directly from `ProductDetailDTO.variants[]` (`available_quantity`, `in_stock`, `low_stock`) with zero extra network calls. Out-of-stock active variants remain selectable with subtle dashed border / `"(Out of stock)"` screen-reader suffix so shoppers can view pricing and option details.
 * **Live Stock Availability Badge**:
-  * Uses `available_quantity`, `in_stock`, and `low_stock` threshold:
+  * Driven directly by the selected variant's server-computed `available_quantity`, `in_stock`, and `low_stock` fields:
     * `in_stock && !low_stock`: `--success` dot + `"In stock"`
     * `in_stock && low_stock`: `--warning` badge + `"Low stock — only {available_quantity} left"`
     * `!in_stock || available_quantity <= 0`: `--destructive` badge + `"Out of stock"`
 * **Quantity Stepper & Add to Cart**:
-  * Stepper bounded `1 .. Math.min(99, available_quantity)`. Disabled when out of stock.
+  * Stepper bounded `1 .. Math.min(99, available_quantity)`. Disabled when `!in_stock`.
   * Primary CTA: `"Add to Cart"` (`Button size="lg"`). When `!in_stock`, label reads `"Out of Stock"` and button is `disabled`.
   * **Submit Flow (`POST /api/v1/cart/items`)**:
     * Button enters loading state (`disabled`, `aria-busy="true"`, `"Adding..."`).
@@ -108,14 +108,15 @@ Consumes `GET /api/v1/products/{slug}` (`ProductDetailDTO`), with optional fresh
 
 ## 4. Cart Drawer (`Sheet`) & Cart Page (`/cart`)
 
-Both surfaces consume the same server-reconciled `CartDTO` (`GET /api/v1/cart`) and enforce server pricing authority.
+Both surfaces consume the same server-reconciled `CartDTO` (`GET /api/v1/cart`), where every `CartDTO.items[]` entry provides `product_slug`, `image_url`, `available_quantity`, `in_stock`, `low_stock`, and `is_available` derived server-side in a single joined query (zero N+1 product or availability calls), and enforce server pricing authority.
 
 ### 4.1 Line Item Reconciliation & Controls
-* **Displayed Per Item**: Thumbnail (`4:5`), Product & Variant title (linking to `/products/[slug]`), SKU (`caption`), Live unit price & line total (`tabular-nums`), Quantity Stepper (`1..99`, capped at `available_quantity`), and Remove button (`DELETE /api/v1/cart/items/{item_id}`).
+* **Displayed Per Item**: Thumbnail (`4:5`, rendered from `item.image_url` with clean placeholder fallback when `null`), Product & Variant title (`product_title`, `variant_title`, linking directly to `/products/{item.product_slug}`), SKU (`item.sku`, `caption`), Live unit price (`unit_price_cents`) & line total (`line_total_cents`, `tabular-nums`), Low-stock cue when `item.is_available && item.low_stock` (`--warning` caption `"Only {available_quantity} left"`), Quantity Stepper (`1..Math.min(99, available_quantity)`), and Remove button (`DELETE /api/v1/cart/items/{item_id}`).
 * **In-Flight Lock**: While `PATCH /api/v1/cart/items/{item_id}` or `DELETE` is pending for a row, disable that row's stepper buttons to prevent out-of-order quantity races.
-* **Server-Reconciled Edge Notices**:
-  * **Out of Stock (`available_quantity === 0` or unavailable variant)**: Highlight line item border with `--destructive`, display inline notice `"Out of stock — remove this item to proceed to checkout"`, and disable `"Proceed to Checkout"` button until resolved.
-  * **Quantity Exceeds Available (`item.quantity > available_quantity > 0`)**: Highlight line item with `--warning-subtle` alert (`"Only {available_quantity} left in stock"`), provide 1-click `"Adjust to {available_quantity}"` button, and block Checkout until adjusted.
+* **Server-Reconciled Edge Notices** (gate Checkout whenever `items.some(i => !i.is_available)`):
+  * **Out of Stock (`!item.in_stock || item.available_quantity === 0`)**: Highlight line item border with `--destructive`, display inline notice `"Out of stock — remove this item to proceed to checkout"`, and disable `"Proceed to Checkout"` button until resolved.
+  * **Quantity Exceeds Available (`item.in_stock && item.available_quantity > 0 && item.quantity > item.available_quantity`)**: Highlight line item with `--warning-subtle` alert (`"Only {available_quantity} left in stock"`), provide 1-click `"Adjust to {available_quantity}"` button (`PATCH /api/v1/cart/items/{item_id}`), and block Checkout until adjusted.
+  * **Variant / Product Deactivated (`!item.is_available && item.in_stock && item.quantity <= item.available_quantity`)**: Highlight line item border with `--destructive`, display inline notice `"This item is no longer available — remove it to proceed to checkout"`, and block Checkout until removed.
   * **Price Change Notice**: If live unit price differs from the price last observed in the client session state, display subtle informational chip `"Price updated to ${formatted}"`.
 
 ### 4.2 Shipping Threshold Indicator & Totals
@@ -128,16 +129,16 @@ Both surfaces consume the same server-reconciled `CartDTO` (`GET /api/v1/cart`) 
   * `Tax`: `"Calculated at checkout"` (explicit note referencing server calculation)
   * `Estimated Total`: `estimated_total_cents`
 * **Actions**:
-  * Primary CTA: `"Proceed to Checkout"` (`/checkout`, disabled if empty or unresolved stock conflicts).
+  * Primary CTA: `"Proceed to Checkout"` (`/checkout`, disabled if empty or any item has `is_available === false`).
   * Secondary link (in Drawer): `"View Full Cart"` (`/cart`).
   * On `/cart` page: `"Clear Cart"` (`DELETE /api/v1/cart`) gated by confirmation `Dialog`.
 
 ### 4.3 Guest-to-User Cart Merge Flow (`POST /api/v1/cart/merge`)
-1. Before login/registration, client holds current `cart.item_count` in React state (never tokens in `localStorage`).
+1. Before login/registration, client may track pre-auth `cart.item_count` in React state (never tokens in `localStorage`) for merge-toast UX; browser JS cannot inspect the `HttpOnly` `ecom_guest_cart` cookie directly.
 2. Immediately after `POST /api/v1/auth/login` (`200`) or `POST /api/v1/auth/register` (`201`) succeeds and establishes `ecom_session` + `csrf_token`:
-   * If a guest cart had items (`hadGuestItems`), client calls `POST /api/v1/cart/merge` with `X-CSRF-Token`.
-   * On `200 OK`, replace client cart state with the merged `CartDTO`. If any item quantity was clamped (`min(99, available_quantity)`), display an informational toast/banner: `"Your guest cart items were merged. Quantities were adjusted to current stock limits."`
-   * If `hadGuestItems` was false (or guest cart absent), simply refresh `GET /api/v1/cart`.
+   * Client calls `POST /api/v1/cart/merge` with `X-CSRF-Token` (safe to call unconditionally on auth completion).
+   * **Idempotent No-Cookie / Empty Behavior**: `POST /api/v1/cart/merge` is idempotent and returns **`200 OK`** with the authenticated user's active `CartDTO` even if no `ecom_guest_cart` cookie exists, or the guest cart is missing, empty, or already `CONVERTED` (never fails with an error). When an active non-empty guest cart exists, the server merges its items (`min(99, available_quantity)`), marks the guest cart `CONVERTED`, and clears `ecom_guest_cart`.
+   * On `200 OK`, replace client cart state with the returned `CartDTO`. If guest items were merged and any item quantity was clamped (`min(99, available_quantity)`), display an informational toast/banner: `"Your guest cart items were merged. Quantities were adjusted to current stock limits."` (or `"Your guest cart items were merged."` if un-clamped; if no guest cart existed, hydrate quietly without a merge toast).
 
 ---
 

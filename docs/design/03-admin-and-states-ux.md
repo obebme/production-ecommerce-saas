@@ -77,18 +77,20 @@ Consumes `/api/v1/admin/analytics/summary`, `/timeseries`, `/top-products`, and 
 
 ### 3.2 Products List & Editor (`/admin/products`, `/admin/products/[id]`)
 * **List View (`/admin/products`)**:
+  * Consumes `GET /api/v1/admin/products` (paginated across `DRAFT`, `ACTIVE`, `ARCHIVED`).
   * Filter bar: Search `q` (`<= 100` chars), `status` (`ALL`, `DRAFT`, `ACTIVE`, `ARCHIVED`), `category_id`, paginated.
   * Status Badges: `DRAFT` (`outline` neutral), `ACTIVE` (`success`), `ARCHIVED` (`secondary` muted).
-  * Row actions: `Edit`, `Archive` (`DELETE /api/v1/admin/products/{product_id}` -> confirmation `Dialog`: `"Archiving sets status to ARCHIVED and hides the product from the storefront while preserving historical order snapshots."`).
-* **Product Editor**:
-  * **Section 1 — Core Details**: `title` (`1..200`), `slug` (`1..220`, `409 SLUG_CONFLICT` inline error), `category_id`, `description`, `status` selector.
+  * Row actions: `Edit` (`/admin/products/{id}`), `Archive` (`DELETE /api/v1/admin/products/{product_id}` -> confirmation `Dialog`: `"Archiving sets status to ARCHIVED and hides the product from the storefront while preserving historical order snapshots."`).
+* **Product Editor (`/admin/products/[id]`)**:
+  * **Deep-Linked Loading & Refresh**: Consumes `GET /api/v1/admin/products/{product_id}` (`AdminProductDetailDTO`) on initial navigation, hard refresh, and post-mutation sync across any status (`DRAFT | ACTIVE | ARCHIVED`), providing `category`, ordered `images`, and all `variants` with server-derived `on_hand`, `reserved`, `available_quantity`, `low_stock_threshold`, `in_stock`, and `low_stock`. Maps `404 PRODUCT_NOT_FOUND` to a clean Not Found recovery card linking back to `/admin/products`.
+  * **Section 1 — Core Details**: `title` (`1..200`), `slug` (`1..220`, `409 SLUG_CONFLICT` inline error), `category_id`, `description`, `status` selector (`DRAFT | ACTIVE | ARCHIVED`, saved via `PATCH /api/v1/admin/products/{product_id}`).
     * **Activation Rule UX**: Products initialize as `DRAFT`. Before transitioning `DRAFT -> ACTIVE`, UI checks whether `variants.some(v => v.is_active)`. If `0` active variants exist, displays inline `--warning` callout `"Add and activate at least 1 variant before setting status to ACTIVE"` (and handles `422 PRODUCT_CANNOT_ACTIVATE_WITHOUT_VARIANT` cleanly).
   * **Section 2 — Images Manager (`product_images`)**:
     * Ordered list (`sort_order`), `is_primary` single-select radio, `url` input, and `alt_text` input (`1..200`).
     * **URL Validation Hint**: Explicitly displays helper `"Allowed formats: https://... or /assets/..."` and rejects `http://`, `data:`, or `javascript:` client-side before submit.
     * **Alt Text Warning**: Shows gentle inline hint if `alt_text` is empty (`"Describe the image for screen-reader accessibility"`).
   * **Section 3 — Variants & SKUs (`product_variants`)**:
-    * Table of existing variants (`sku`, `title`, `attributes`, `price_cents`, `compare_at_price_cents`, `is_active`, `available`, `Edit`).
+    * Table of existing variants from `AdminProductDetailDTO.variants[]` (`sku`, `title`, `attributes`, `price_cents`, `compare_at_price_cents`, `is_active`, `on_hand`, `reserved`, `available_quantity` with `in_stock`/`low_stock` status badge against `low_stock_threshold`, `Edit`).
     * **Create Variant Modal** (`POST /api/v1/admin/products/{product_id}/variants`):
       * `sku` (`1..64`, unique -> `409 SKU_CONFLICT` field error)
       * `title` (`1..160`, e.g., `"Charcoal / Medium"`)
@@ -99,25 +101,29 @@ Consumes `/api/v1/admin/analytics/summary`, `/timeseries`, `/top-products`, and 
       * `initial_on_hand` (`integer >= 0`, seeds `INITIAL_SEED` ledger entry)
       * `low_stock_threshold` (`integer >= 0`, default `5`)
       * `is_active` toggle (default `true`)
-    * **Edit Variant Modal** (`PATCH /api/v1/admin/variants/{variant_id}`): Edits price, compare-at price, title, attributes, `low_stock_threshold`, `is_active`. Displays read-only stock counts with `"Adjust stock in Inventory ->"` link (never mutates `on_hand` directly here so every stock change carries an explicit adjustment `note`).
+    * **Edit Variant Modal** (`PATCH /api/v1/admin/variants/{variant_id}`): Edits price, compare-at price, title, attributes, `low_stock_threshold`, `is_active`. Displays read-only `on_hand`, `reserved`, and `available_quantity` counts with `"Adjust stock in Inventory ->"` link (never mutates `on_hand` directly here so every stock change carries an explicit adjustment `note`). Refreshes `AdminProductDetailDTO` on save.
 
 ---
 
 ## 4. Inventory Control & Ledger (`/admin/inventory`)
 
 ### 4.1 Stock Overview Table
-* Searchable by SKU / product title (`q`), filterable by stock state (`All`, `Low Stock`, `Out of Stock`).
-* **Columns** (all counts `tabular-nums`):
-  * `SKU` (`font-mono`)
-  * `Product / Variant`
+* Consumes `GET /api/v1/admin/inventory` (paginated `AdminInventoryItemDTO`, computed in a single joined SQL query).
+* **Query Params / Filter Controls**:
+  * Search `q` (`<= 100` chars; matches SKU, `product_title`, or `variant_title`).
+  * `stock_status`: `all` (*"All"* — default), `in_stock` (*"In Stock"*), `low_stock` (*"Low Stock"*), `out_of_stock` (*"Out of Stock"*).
+  * `page` & `page_size`.
+* **Columns** (all counts `tabular-nums`, mapped to `AdminInventoryItemDTO`):
+  * `SKU` (`sku`, `font-mono`)
+  * `Product / Variant` (`product_title` / `variant_title`, with `product_status` and `is_active` status cues)
   * `On Hand` (`on_hand` — total physical units)
   * `Reserved` (`reserved` — units held in active `PENDING_PAYMENT` reservations)
-  * `Available` (`on_hand - reserved` — sellable units, highlighted `--destructive` at `0` or `--warning` at `<= low_stock_threshold`)
+  * `Available` (`available_quantity` — server-derived sellable units) + stock status badge (`in_stock`, `low_stock`): `--destructive` (`Out of Stock`) when `!in_stock`, `--warning` (`Low Stock`) when `in_stock && low_stock`, `--success` (`In Stock`) when `in_stock && !low_stock`
   * `Threshold` (`low_stock_threshold`)
-  * `Actions`: `Adjust Stock` button + `View Ledger` button.
+  * `Actions`: `Adjust Stock` button + `View Ledger` button (`variant_id`).
 
 ### 4.2 Manual Stock Adjustment Modal (`POST /api/v1/admin/inventory/{variant_id}/adjust`)
-* Header displays immutable current snapshot: `On Hand: {on_hand}`, `Reserved: {reserved}`, `Available: {available}`.
+* Header displays immutable current snapshot: `On Hand: {on_hand}`, `Reserved: {reserved}`, `Available: {available_quantity}`.
 * **Signed Delta Input (`delta_on_hand`)**: Accepts positive (`+10`) or negative (`-2`) non-zero integers; live preview computes `Projected On Hand = on_hand + delta` and `Projected Available = projected_on_hand - reserved`.
 * **Client + Server Invariant Guard**: If `on_hand + delta_on_hand < reserved` (or `< 0`), immediately highlight preview in `--destructive`, disable submit, and show `"Cannot reduce physical on-hand stock below currently reserved units ({reserved})."` (also maps `422 INVALID_STOCK_ADJUSTMENT`).
 * **Mandatory Note (`note`)**: Textarea (`1..255` chars, placeholder `"e.g., Restock PO-1042 or Damaged units write-off"`). Submit button remains disabled while `note.trim().length === 0`.
@@ -201,7 +207,7 @@ Consumes `GET /api/v1/admin/orders/{order_number}` (full order, items, events, p
 | **Storefront Home & Catalog** (`/`, `/products`) | 8–12 card `Skeleton` grid matching 4:5 aspect ratio (zero CLS) | `"No products match your filters."` + `"Reset Filters"` CTA (or `"Catalog coming soon"` if store empty) | Inline retry `Alert` (`"Unable to load products"`) preserving current URL query params | Populated grid + live `aria-live="polite"` result count (`"Showing X of Y products"`) |
 | **Product Detail** (`/products/[slug]`) | 2-col image + title/price/variant `Skeleton` | `404 PRODUCT_NOT_FOUND`: Clean `"Product unavailable"` card + `"Back to Catalog"` CTA | Variant stock conflict `409` refreshes `/availability` & clamps stepper; network error shows inline `"Retry"` | `"Added to Cart"` opens Cart Drawer + `aria-live="polite"` announcement |
 | **Cart Drawer & Page** (`/cart`) | Line-item `Skeleton` rows; button `aria-busy` on stepper patch | `"Your cart is empty"` illustration + `"Explore Products"` CTA | Line-level `409 INSUFFICIENT_STOCK` / `VARIANT_UNAVAILABLE` warning + `"Adjust"` / `"Remove"` CTA | Updated subtotal, free-shipping progress bar, merge notification toast after login |
-| **Login & Register** (`/login`, `/register`) | Submit button disabled + spinner (`"Signing in..."`) | N/A | Top `role="alert"` banner (`401`, `403`, `429`) or field-level inline error (`409 email`, `422`) | Optional `POST /cart/merge` -> navigate to sanitized `returnTo` |
+| **Login & Register** (`/login`, `/register`) | Submit button disabled + spinner (`"Signing in..."`) | N/A | Top `role="alert"` banner (`401`, `403`, `429`) or field-level inline error (`409 email`, `422`) | Idempotent `POST /cart/merge` -> navigate to sanitized `returnTo` |
 | **Checkout** (`/checkout`) | Summary + form guard skeleton; submit locked during `POST /checkout/orders` | Empty cart redirects/shows `"Your cart is empty"` + link to `/products` | Preserves form inputs & `Idempotency-Key` on transient errors; `409 INSUFFICIENT_STOCK` links to `/cart` | `201` / `200` replay -> redirect to `/orders/{order_number}` |
 | **Customer Order & Sandbox Pay** (`/orders/[order_number]`) | Header, items, and timeline `Skeleton` blocks | Guest without token / `403`: `"Order Access Required"` sign-in or `X-Guest-Order-Token` prompt | `403 SANDBOX_MODE_DISABLED` hides simulate controls; `409 PAYMENT_INTENT_ALREADY_FINAL` refreshes order | Countdown clears -> `--success-subtle` `"Payment Confirmed"` banner + refreshed timeline |
 | **Customer Order History** (`/orders`) | Table / mobile card `Skeleton` rows | `"No orders yet"` + `"Browse Catalog"` CTA | Retryable `Alert` (`401` redirects to `/login?returnTo=/orders`) | Paginated/chronological order rows with separate status badges |
