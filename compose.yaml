@@ -1,0 +1,113 @@
+# ==============================================================================
+# E-Commerce SaaS — Minimal Local Development Compose Topology
+# Services: db (PostgreSQL 16), migrate (Alembic one-shot), api (FastAPI), web (Next.js)
+# Intentionally omits Redis, Celery, and extra infrastructure per ARCH-001.
+# ==============================================================================
+
+x-backend-env: &backend-env
+  DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set in .env}
+  ENVIRONMENT: ${ENVIRONMENT:-development}
+  COOKIE_SECURE: ${COOKIE_SECURE:-false}
+  ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000}
+  CSRF_HMAC_SECRET: ${CSRF_HMAC_SECRET:?CSRF_HMAC_SECRET must be set in .env}
+  GUEST_ORDER_HMAC_SECRET: ${GUEST_ORDER_HMAC_SECRET:?GUEST_ORDER_HMAC_SECRET must be set in .env}
+  PAYMENT_WEBHOOK_SECRET: ${PAYMENT_WEBHOOK_SECRET:?PAYMENT_WEBHOOK_SECRET must be set in .env}
+  PAYMENT_SANDBOX_MODE: ${PAYMENT_SANDBOX_MODE:-true}
+  SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-168}
+  FREE_SHIPPING_THRESHOLD_CENTS: ${FREE_SHIPPING_THRESHOLD_CENTS:-10000}
+  STANDARD_SHIPPING_CENTS: ${STANDARD_SHIPPING_CENTS:-1000}
+  TAX_RATE_BPS: ${TAX_RATE_BPS:-800}
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB must be set in .env}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER}", "-d", "${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  migrate:
+    build:
+      context: ./backend
+      # Relative to build context (./backend) per Compose specification
+      dockerfile: ../infra/docker/backend.Dockerfile
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    environment:
+      <<: *backend-env
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: ../infra/docker/backend.Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      <<: *backend-env
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import sys, urllib.request; resp = urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=3); sys.exit(0 if resp.status == 200 else 1)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  web:
+    build:
+      context: ./frontend
+      # Relative to build context (./frontend) per Compose specification
+      dockerfile: ../infra/docker/frontend.Dockerfile
+      args:
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000/api/v1}
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      HOSTNAME: "0.0.0.0"
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000/api/v1}
+      INTERNAL_API_BASE_URL: ${INTERNAL_API_BASE_URL:-http://api:8000/api/v1}
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "const http = require('http'); const req = http.get('http://127.0.0.1:3000/', (res) => process.exit(res.statusCode >= 200 && res.statusCode < 400 ? 0 : 1)); req.on('error', () => process.exit(1)); req.setTimeout(3000, () => { req.destroy(); process.exit(1); });",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+volumes:
+  pgdata:

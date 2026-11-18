@@ -1,0 +1,298 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  detect:
+    name: Detect Workspace Modules
+    runs-on: ubuntu-latest
+    outputs:
+      backend_present: ${{ steps.paths.outputs.backend_present }}
+      frontend_present: ${{ steps.paths.outputs.frontend_present }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check backend and frontend presence
+        id: paths
+        run: |
+          set -euo pipefail
+          if [ -d backend ] && { [ -f backend/pyproject.toml ] || [ -f backend/requirements.txt ]; }; then
+            echo "backend_present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "backend_present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping backend-ci: backend/pyproject.toml or backend/requirements.txt not present yet (pending BE-001)."
+          fi
+
+          if [ -d frontend ] && [ -f frontend/package.json ]; then
+            echo "frontend_present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "frontend_present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping frontend-ci: frontend/package.json not present yet (pending FE-001)."
+          fi
+
+  ops-validate:
+    name: Validate Compose, Docker & Env Config
+    needs: detect
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML
+        run: python -m pip install --no-cache-dir pyyaml
+
+      - name: Validate YAML syntax and .env.example coverage
+        run: |
+          python - <<'PY'
+          import pathlib
+          import subprocess
+          import sys
+          import yaml
+
+          # 1. YAML syntax checks
+          for rel_path in ("compose.yaml", ".github/workflows/ci.yml"):
+              path = pathlib.Path(rel_path)
+              data = yaml.safe_load(path.read_text(encoding="utf-8"))
+              if not isinstance(data, dict):
+                  raise SystemExit(f"Expected YAML mapping in {rel_path}")
+              print(f"YAML valid: {rel_path}")
+
+          # 2. Verify only minimal baseline Compose services exist
+          compose_data = yaml.safe_load(pathlib.Path("compose.yaml").read_text(encoding="utf-8"))
+          services = set(compose_data.get("services", {}).keys())
+          expected_services = {"db", "migrate", "api", "web"}
+          if services != expected_services:
+              raise SystemExit(f"Compose services mismatch: got {sorted(services)}, expected {sorted(expected_services)}")
+          print(f"Compose baseline services verified: {sorted(services)}")
+
+          # 3. Verify .env is not tracked in git
+          tracked = subprocess.run(
+              ["git", "ls-files", "--error-unmatch", ".env"],
+              capture_output=True,
+              text=True,
+          )
+          if tracked.returncode == 0:
+              raise SystemExit("ERROR: .env file must never be tracked in Git")
+
+          # 4. Verify .env.example required variables and placeholder safety
+          required_vars = [
+              "POSTGRES_USER",
+              "POSTGRES_PASSWORD",
+              "POSTGRES_DB",
+              "DATABASE_URL",
+              "ENVIRONMENT",
+              "COOKIE_SECURE",
+              "ALLOWED_ORIGINS",
+              "CSRF_HMAC_SECRET",
+              "GUEST_ORDER_HMAC_SECRET",
+              "PAYMENT_WEBHOOK_SECRET",
+              "PAYMENT_SANDBOX_MODE",
+              "SESSION_TTL_HOURS",
+              "FREE_SHIPPING_THRESHOLD_CENTS",
+              "STANDARD_SHIPPING_CENTS",
+              "TAX_RATE_BPS",
+              "NEXT_PUBLIC_API_BASE_URL",
+              "INTERNAL_API_BASE_URL",
+          ]
+          env_values = {}
+          for raw_line in pathlib.Path(".env.example").read_text(encoding="utf-8").splitlines():
+              line = raw_line.strip()
+              if not line or line.startswith("#") or "=" not in line:
+                  continue
+              key, val = line.split("=", 1)
+              env_values[key.strip()] = val.strip()
+
+          missing = [var for var in required_vars if not env_values.get(var)]
+          if missing:
+              raise SystemExit(f"Missing or empty variables in .env.example: {missing}")
+
+          for secret_var in ("POSTGRES_PASSWORD", "CSRF_HMAC_SECRET", "GUEST_ORDER_HMAC_SECRET", "PAYMENT_WEBHOOK_SECRET"):
+              if not env_values[secret_var].startswith("CHANGE_ME_DEV_ONLY_"):
+                  raise SystemExit(f"{secret_var} in .env.example must use a CHANGE_ME_DEV_ONLY_ placeholder")
+
+          print(f".env.example coverage verified ({len(required_vars)} required variables present)")
+          PY
+
+      - name: Validate Compose configuration with .env.example
+        run: |
+          docker compose --env-file .env.example config --quiet
+          echo "docker compose config passed."
+
+      - name: Build backend Docker image (when backend exists)
+        if: needs.detect.outputs.backend_present == 'true'
+        run: docker build --file infra/docker/backend.Dockerfile ./backend
+
+      - name: Build frontend Docker image (when frontend exists)
+        if: needs.detect.outputs.frontend_present == 'true'
+        run: |
+          docker build \
+            --file infra/docker/frontend.Dockerfile \
+            --build-arg NEXT_PUBLIC_API_BASE_URL=http://localhost:8000/api/v1 \
+            ./frontend
+
+  backend-ci:
+    name: Backend Lint, Typecheck, Migrations & Tests
+    needs: detect
+    if: needs.detect.outputs.backend_present == 'true'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ecom_test
+          POSTGRES_PASSWORD: ecom_test_password
+          POSTGRES_DB: ecom_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U ecom_test -d ecom_test"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      ENVIRONMENT: test
+      DATABASE_URL: postgresql+psycopg://ecom_test:ecom_test_password@localhost:5432/ecom_test
+      COOKIE_SECURE: "false"
+      ALLOWED_ORIGINS: http://localhost:3000
+      CSRF_HMAC_SECRET: ci_test_only_csrf_hmac_secret_min_32_characters_01
+      GUEST_ORDER_HMAC_SECRET: ci_test_only_guest_order_hmac_secret_min_32_chars_02
+      PAYMENT_WEBHOOK_SECRET: ci_test_only_payment_webhook_secret_min_32_chars_03
+      PAYMENT_SANDBOX_MODE: "true"
+      SESSION_TTL_HOURS: "168"
+      FREE_SHIPPING_THRESHOLD_CENTS: "10000"
+      STANDARD_SHIPPING_CENTS: "1000"
+      TAX_RATE_BPS: "800"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install backend dependencies and tooling
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+            if [ -f requirements-dev.txt ]; then
+              pip install -r requirements-dev.txt
+            fi
+          elif [ -f pyproject.toml ]; then
+            pip install -e ".[dev]" || pip install -e .
+          fi
+          pip install ruff mypy pytest
+
+      - name: Run Ruff lint
+        working-directory: backend
+        run: ruff check .
+
+      - name: Run Mypy typecheck
+        working-directory: backend
+        run: mypy app
+
+      - name: Verify single linear Alembic migration head
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          HEADS_OUTPUT="$(alembic heads)"
+          echo "$HEADS_OUTPUT"
+          HEAD_COUNT="$(printf '%s\n' "$HEADS_OUTPUT" | grep -cE '^[0-9a-fA-F]+' || true)"
+          if [ "$HEAD_COUNT" -ne 1 ]; then
+            echo "ERROR: Expected exactly 1 Alembic head revision, found $HEAD_COUNT." >&2
+            exit 1
+          fi
+
+      - name: Run Alembic migrations against PostgreSQL 16
+        working-directory: backend
+        run: alembic upgrade head
+
+      - name: Run pytest suite (when tests exist)
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          if [ -d tests ] && [ -n "$(find tests -type f \( -name 'test_*.py' -o -name '*_test.py' \) 2>/dev/null)" ]; then
+            pytest
+          else
+            echo "::notice::No pytest files detected in backend/tests yet (pending QA-001)."
+          fi
+
+  frontend-ci:
+    name: Frontend Lint, Typecheck, Build & Tests
+    needs: detect
+    if: needs.detect.outputs.frontend_present == 'true'
+    runs-on: ubuntu-latest
+    env:
+      CI: "true"
+      NEXT_TELEMETRY_DISABLED: "1"
+      NEXT_PUBLIC_API_BASE_URL: http://localhost:8000/api/v1
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: |
+          set -euo pipefail
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Run ESLint
+        working-directory: frontend
+        run: npm run lint
+
+      - name: Run TypeScript typecheck
+        working-directory: frontend
+        run: npx tsc --noEmit
+
+      - name: Run Next.js production build
+        working-directory: frontend
+        run: npm run build
+
+      - name: Run frontend unit tests (when tests exist)
+        working-directory: frontend
+        run: |
+          set -euo pipefail
+          if [ -d tests ] && [ -n "$(find tests -type f \( -name '*.test.*' -o -name '*.spec.*' \) 2>/dev/null)" ]; then
+            npm test
+          else
+            echo "::notice::No unit test files detected in frontend/tests yet (pending QA-002)."
+          fi
+
+      - name: Run Playwright E2E tests (when specs exist)
+        working-directory: frontend
+        run: |
+          set -euo pipefail
+          if [ -d e2e ] && [ -n "$(find e2e -type f \( -name '*.spec.ts' -o -name '*.spec.tsx' \) 2>/dev/null)" ]; then
+            npx playwright install --with-deps chromium
+            npx playwright test
+          else
+            echo "::notice::No Playwright E2E specs detected in frontend/e2e yet (pending QA-002)."
+          fi
