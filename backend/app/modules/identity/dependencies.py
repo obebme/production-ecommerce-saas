@@ -138,12 +138,12 @@ def get_optional_user_fail_closed(
     return auth.user if auth is not None else None
 
 
-def require_csrf(
+def _enforce_csrf_header(
     request: Request,
-    auth: Annotated[AuthContext, Depends(get_auth_context)],
-    settings: Annotated[Settings, Depends(get_app_settings)],
+    auth: AuthContext,
+    settings: Settings,
 ) -> AuthContext:
-    """Require a valid X-CSRF-Token matching the authenticated session."""
+    """Validate X-CSRF-Token against the active authenticated session."""
     provided_token = request.headers.get("X-CSRF-Token")
     if not verify_csrf_token(
         provided_token,
@@ -156,6 +156,32 @@ def require_csrf(
             message="Invalid or missing CSRF token.",
         )
     return auth
+
+
+def get_optional_auth_context_with_csrf(
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_app_settings)],
+) -> AuthContext | None:
+    """Resolve optional auth context on dual-auth mutating routes with CSRF enforcement.
+
+    If an ecom_session cookie is present, fails closed on invalid/disabled session and
+    requires a valid X-CSRF-Token header. When no ecom_session cookie is present, returns None
+    so global Origin/Referer validation guards guest cookie mutations.
+    """
+    auth = _resolve_auth_context_from_cookie(request, db, settings)
+    if auth is None:
+        return None
+    return _enforce_csrf_header(request, auth, settings)
+
+
+def require_csrf(
+    request: Request,
+    auth: Annotated[AuthContext, Depends(get_auth_context)],
+    settings: Annotated[Settings, Depends(get_app_settings)],
+) -> AuthContext:
+    """Require a valid X-CSRF-Token matching the authenticated session."""
+    return _enforce_csrf_header(request, auth, settings)
 
 
 def require_roles(*roles: str) -> Callable[..., User]:

@@ -24,6 +24,8 @@ _request_id_ctx: ContextVar[str | None] = ContextVar("request_id", default=None)
 
 SESSION_COOKIE_NAME = "ecom_session"
 CSRF_COOKIE_NAME = "ecom_csrf"
+GUEST_CART_COOKIE_NAME = "ecom_guest_cart"
+GUEST_ORDERS_COOKIE_NAME = "ecom_guest_orders"
 
 
 def generate_request_id() -> str:
@@ -142,6 +144,13 @@ class ConflictError(AppError):
 
     status_code = 409
     default_code = "CONFLICT"
+
+
+class PayloadTooLargeError(AppError):
+    """413 Payload Too Large."""
+
+    status_code = 413
+    default_code = "PAYLOAD_TOO_LARGE"
 
 
 class ValidationAppError(AppError):

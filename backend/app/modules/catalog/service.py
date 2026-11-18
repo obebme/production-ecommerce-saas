@@ -586,7 +586,10 @@ def update_category(
         # Lock categories in ID order so concurrent reparents cannot form 2-cycles.
         locked_categories = list(
             db.scalars(
-                select(Category).order_by(Category.id.asc()).with_for_update()
+                select(Category)
+                .order_by(Category.id.asc())
+                .with_for_update()
+                .execution_options(populate_existing=True)
             ).all()
         )
         categories_by_id = {cat.id: cat for cat in locked_categories}
@@ -618,7 +621,10 @@ def update_category(
             cursor = parent_map.get(cursor)
     else:
         category = db.scalar(
-            select(Category).where(Category.id == category_id).with_for_update()
+            select(Category)
+            .where(Category.id == category_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
         if category is None:
             raise NotFoundError(
@@ -904,7 +910,10 @@ def update_admin_product(
 ) -> AdminProductDetailDTO:
     """Update product fields/images/status while enforcing active-variant invariant and auditing."""
     locked_product = db.scalar(
-        select(Product).where(Product.id == product_id).with_for_update()
+        select(Product)
+        .where(Product.id == product_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
     )
     if locked_product is None:
         raise NotFoundError(
@@ -1013,7 +1022,10 @@ def archive_admin_product(
 ) -> AdminProductDetailDTO:
     """Soft-archive a product by setting status = 'ARCHIVED' and recording an audit log."""
     locked_product = db.scalar(
-        select(Product).where(Product.id == product_id).with_for_update()
+        select(Product)
+        .where(Product.id == product_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
     )
     if locked_product is None:
         raise NotFoundError(

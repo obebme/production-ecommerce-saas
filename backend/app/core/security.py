@@ -68,10 +68,21 @@ def hash_token(raw: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _hmac_sha256_hex(secret: str, message: bytes) -> str:
+    """Compute lowercase hex HMAC-SHA256 digest."""
+    return hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
+
+
+def _verify_ascii_hmac_hex(provided: str | None, expected_hex: str) -> bool:
+    """Verify an ASCII hex digest against an expected lowercase hex digest in constant time."""
+    if not provided or not provided.isascii():
+        return False
+    return hmac.compare_digest(provided.encode("ascii"), expected_hex.encode("ascii"))
+
+
 def derive_csrf_token(session_id: uuid.UUID | str, csrf_version: int, secret: str) -> str:
     """Derive deterministic per-session CSRF token via HMAC-SHA256."""
-    message = f"{session_id}:{csrf_version}".encode()
-    return hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
+    return _hmac_sha256_hex(secret, f"{session_id}:{csrf_version}".encode())
 
 
 def verify_csrf_token(
@@ -81,10 +92,59 @@ def verify_csrf_token(
     secret: str,
 ) -> bool:
     """Verify a provided X-CSRF-Token against the session's derived HMAC token."""
-    if not provided_token or not provided_token.isascii():
-        return False
     expected = derive_csrf_token(session_id, csrf_version, secret)
-    return hmac.compare_digest(provided_token.encode("ascii"), expected.encode("ascii"))
+    return _verify_ascii_hmac_hex(provided_token, expected)
+
+
+def derive_guest_order_token(
+    order_id: uuid.UUID | str,
+    order_number: str,
+    guest_token_version: int,
+    secret: str,
+) -> str:
+    """Derive deterministic guest order access token via HMAC-SHA256."""
+    return _hmac_sha256_hex(
+        secret,
+        f"{order_id}:{order_number}:{guest_token_version}".encode(),
+    )
+
+
+def verify_guest_order_token(
+    provided_token: str | None,
+    order_id: uuid.UUID | str,
+    order_number: str,
+    guest_token_version: int,
+    secret: str,
+) -> bool:
+    """Verify a guest order token against the derived HMAC token in constant time."""
+    expected = derive_guest_order_token(order_id, order_number, guest_token_version, secret)
+    return _verify_ascii_hmac_hex(provided_token, expected)
+
+
+def compute_webhook_signature_hex(timestamp: int, raw_body: bytes, secret: str) -> str:
+    """Compute lowercase hex HMAC-SHA256 signature over '<timestamp>.<raw_body>'."""
+    signed_payload = f"{timestamp}.".encode("ascii") + raw_body
+    return _hmac_sha256_hex(secret, signed_payload)
+
+
+def sign_webhook_payload(timestamp: int, raw_body: bytes, secret: str) -> str:
+    """Format a webhook X-Webhook-Signature header value ('v1=<hex>')."""
+    return f"v1={compute_webhook_signature_hex(timestamp, raw_body, secret)}"
+
+
+def verify_webhook_signature(
+    provided_signature: str | None,
+    timestamp: int,
+    raw_body: bytes,
+    secret: str,
+) -> bool:
+    """Verify a 'v1=<hex>' webhook signature in constant time."""
+    if not provided_signature or not provided_signature.isascii():
+        return False
+    if not provided_signature.startswith("v1="):
+        return False
+    expected = compute_webhook_signature_hex(timestamp, raw_body, secret)
+    return _verify_ascii_hmac_hex(provided_signature[3:], expected)
 
 
 def parse_client_ip(raw_host: str | None) -> str | None:
@@ -301,3 +361,62 @@ def enforce_rate_limit(
             details={"retry_after_seconds": decision.retry_after_seconds},
             headers={"Retry-After": str(decision.retry_after_seconds)},
         )
+
+
+class GuestPendingOrderTracker:
+    """Bounded thread-safe tracker mapping client IP keys to candidate guest order IDs."""
+
+    def __init__(self, *, max_keys: int = 10000, max_orders_per_key: int = 32) -> None:
+        self._max_keys = max_keys
+        self._max_orders_per_key = max_orders_per_key
+        self._lock = threading.Lock()
+        self._buckets: OrderedDict[str, list[uuid.UUID]] = OrderedDict()
+
+    def record(self, key: str, order_id: uuid.UUID) -> None:
+        """Record a newly placed PENDING_PAYMENT guest order ID for an IP key."""
+        with self._lock:
+            order_ids = self._buckets.get(key)
+            if order_ids is None:
+                while len(self._buckets) >= self._max_keys:
+                    self._buckets.popitem(last=False)
+                self._buckets[key] = [order_id]
+            else:
+                if order_id not in order_ids:
+                    order_ids.append(order_id)
+                if len(order_ids) > self._max_orders_per_key:
+                    del order_ids[: len(order_ids) - self._max_orders_per_key]
+                self._buckets.move_to_end(key)
+
+    def get_ids(self, key: str) -> list[uuid.UUID]:
+        """Return candidate guest order IDs recorded for an IP key."""
+        with self._lock:
+            order_ids = self._buckets.get(key)
+            return list(order_ids) if order_ids is not None else []
+
+    def retain_active(self, key: str, active_ids: set[uuid.UUID]) -> None:
+        """Prune tracked order IDs that are no longer active PENDING_PAYMENT in the database."""
+        with self._lock:
+            order_ids = self._buckets.get(key)
+            if order_ids is None:
+                return
+            remaining = [oid for oid in order_ids if oid in active_ids]
+            if remaining:
+                self._buckets[key] = remaining
+            else:
+                del self._buckets[key]
+
+    def reset(self) -> None:
+        """Clear all tracked guest order IDs (for tests)."""
+        with self._lock:
+            self._buckets.clear()
+
+
+default_guest_pending_tracker = GuestPendingOrderTracker()
+
+
+def get_guest_pending_tracker(request: Request) -> GuestPendingOrderTracker:
+    """Resolve the active GuestPendingOrderTracker from app.state or fallback singleton."""
+    tracker = getattr(request.app.state, "guest_pending_tracker", None)
+    if isinstance(tracker, GuestPendingOrderTracker):
+        return tracker
+    return default_guest_pending_tracker

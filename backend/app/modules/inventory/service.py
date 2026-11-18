@@ -125,6 +125,7 @@ def reclaim_expired_reservations_for_variants(
             .where(PaymentIntent.order_id.in_(candidate_order_ids))
             .order_by(PaymentIntent.id.asc())
             .with_for_update(skip_locked=True)
+            .execution_options(populate_existing=True)
         ).all()
     )
     intents_by_order: dict[uuid.UUID, list[PaymentIntent]] = {
@@ -155,6 +156,7 @@ def reclaim_expired_reservations_for_variants(
             )
             .order_by(Order.id.asc())
             .with_for_update(skip_locked=True)
+            .execution_options(populate_existing=True)
         ).all()
     )
     eligible_orders: dict[uuid.UUID, Order] = {
@@ -175,6 +177,7 @@ def reclaim_expired_reservations_for_variants(
             )
             .order_by(InventoryReservation.id.asc())
             .with_for_update()
+            .execution_options(populate_existing=True)
         ).all()
     )
     reservations_by_order: dict[uuid.UUID, list[InventoryReservation]] = {}
@@ -209,6 +212,7 @@ def reclaim_expired_reservations_for_variants(
             .where(InventoryStock.variant_id.in_(global_variant_ids))
             .order_by(InventoryStock.variant_id.asc())
             .with_for_update()
+            .execution_options(populate_existing=True)
         ).all()
     )
     stocks_by_variant = {stock.variant_id: stock for stock in stocks}
@@ -295,7 +299,11 @@ def get_variant_availability(db: Session, variant_id: uuid.UUID) -> VariantAvail
     if reclaimed > 0:
         db.commit()
 
-    stock = db.scalar(select(InventoryStock).where(InventoryStock.variant_id == variant_id))
+    stock = db.scalar(
+        select(InventoryStock)
+        .where(InventoryStock.variant_id == variant_id)
+        .execution_options(populate_existing=True)
+    )
     if not variant.is_active:
         return VariantAvailabilityDTO(
             variant_id=variant.id,
@@ -429,12 +437,16 @@ def update_variant(
 
     # Lock parent Product before ProductVariant -> InventoryStock to prevent TOCTOU races.
     parent_product = db.scalar(
-        select(Product).where(Product.id == variant_product_id).with_for_update()
+        select(Product)
+        .where(Product.id == variant_product_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
     )
     variant = db.scalar(
         select(ProductVariant)
         .where(ProductVariant.id == variant_id)
         .with_for_update()
+        .execution_options(populate_existing=True)
     )
     if parent_product is None or variant is None:
         raise NotFoundError(
@@ -447,6 +459,7 @@ def update_variant(
         .where(InventoryStock.variant_id == variant_id)
         .order_by(InventoryStock.variant_id.asc())
         .with_for_update()
+        .execution_options(populate_existing=True)
     )
     before_state = _variant_snapshot(variant, stock)
     fields = payload.model_fields_set
@@ -680,6 +693,7 @@ def adjust_inventory_stock(
         .where(InventoryStock.variant_id == variant_id)
         .order_by(InventoryStock.variant_id.asc())
         .with_for_update()
+        .execution_options(populate_existing=True)
     )
     if stock is None:
         raise NotFoundError(

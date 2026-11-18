@@ -20,11 +20,18 @@ from app.core.errors import (
     ServiceUnavailableError,
     register_exception_handlers,
 )
-from app.core.security import RateLimiterProtocol, SlidingWindowRateLimiter
+from app.core.security import (
+    GuestPendingOrderTracker,
+    RateLimiterProtocol,
+    SlidingWindowRateLimiter,
+)
+from app.modules.cart.router import router as cart_router
 from app.modules.catalog.router import router as catalog_router
 from app.modules.identity.dependencies import require_valid_origin
 from app.modules.identity.router import router as identity_router
 from app.modules.inventory.router import router as inventory_router
+from app.modules.orders.router import router as orders_router
+from app.modules.payments.router import router as payments_router
 
 
 class HealthResponse(BaseModel):
@@ -107,6 +114,7 @@ def create_app(
     if settings is not None:
         fastapi_app.state.settings = settings
     fastapi_app.state.rate_limiter = rate_limiter or SlidingWindowRateLimiter()
+    fastapi_app.state.guest_pending_tracker = GuestPendingOrderTracker()
 
     # Middlewares wrap in reverse registration order: RequestIDMiddleware is outermost.
     if settings is not None:
@@ -155,6 +163,9 @@ def create_app(
     api_v1.include_router(identity_router)
     api_v1.include_router(catalog_router)
     api_v1.include_router(inventory_router)
+    api_v1.include_router(cart_router)
+    api_v1.include_router(orders_router)
+    api_v1.include_router(payments_router)
     fastapi_app.include_router(api_v1)
 
     return fastapi_app
