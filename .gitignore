@@ -1,0 +1,47 @@
+# Python / FastAPI
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+build/
+
+# Node / Next.js / Playwright
+node_modules/
+.next/
+out/
+playwright-report/
+test-results/
+blob-report/
+playwright/.cache/
+*.tsbuildinfo
+next-env.d.ts
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Databases & local data
+*.sqlite
+*.sqlite3
+*.db
+
+# IDE / OS / Logs
+.DS_Store
+Thumbs.db
+*.log
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
