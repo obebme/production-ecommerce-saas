@@ -3,7 +3,7 @@
 - **Task ID**: `BE-001` (`backend/**`)
 - **Auditor**: `security` subagent ([ed6d61aa-f9e5-46c7-bb52-dcc74bc74bc7](conversation://ed6d61aa-f9e5-46c7-bb52-dcc74bc74bc7))
 - **Recorded By**: Orchestrator (per read-only security agent policy)
-- **Notice**: Static code and configuration review plus SQLite/TestClient regression checks; live PostgreSQL 16 and Docker runtime verification remain unverified until executed against a running PostgreSQL/Docker host. Not formal security certification.
+- **Notice**: Static code and configuration review, `SQLite StaticPool + TestClient` regression checks (`90 passed`), and follow-up **QA-PG-001** live Alembic `upgrade head` / `downgrade base` + schema verification (`127 passed, 0 skipped in 28.88s`) on an isolated disposable **PostgreSQL 18.6** instance under least-privilege role `ecom_test_role`. Exact target **PostgreSQL 16** (`postgres:16-alpine`) Docker Compose container runtime verification remains unverified until Docker Desktop Linux engine / CI PostgreSQL 16 runs. Not formal security certification.
 
 ---
 

@@ -1320,6 +1320,22 @@ def test_live_postgresql_be002_constraints_jsonb_partial_index_and_concurrency()
 
     try:
         with pg_session_factory() as setup_db:
+            # 0. Least-privilege PostgreSQL role & server version check
+            server_version = str(
+                setup_db.execute(text("SELECT current_setting('server_version')")).scalar_one()
+            )
+            assert server_version
+            print(f"\n[QA-PG-001] PostgreSQL server_version={server_version}")
+            role_row = setup_db.execute(
+                text(
+                    "SELECT rolsuper, rolcreatedb, rolcreaterole "
+                    "FROM pg_roles WHERE rolname = current_user"
+                )
+            ).one()
+            assert role_row[0] is False, "DB test role must not have rolsuper"
+            assert role_row[1] is False, "DB test role must not have rolcreatedb"
+            assert role_row[2] is False, "DB test role must not have rolcreaterole"
+
             admin_email = f"pg-admin-{uuid.uuid4().hex[:8]}@example.com"
             admin_user = User(
                 email=admin_email,
@@ -1438,6 +1454,54 @@ def test_live_postgresql_be002_constraints_jsonb_partial_index_and_concurrency()
                 )
             assert "ck_inventory_stocks_reserved_lte_on_hand" in str(exc_res_gt_hand.value)
 
+            with pytest.raises(IntegrityError) as exc_neg_thresh, setup_db.begin_nested():
+                setup_db.execute(
+                    text(
+                        "UPDATE inventory_stocks SET low_stock_threshold = -1 "
+                        "WHERE variant_id = :vid"
+                    ),
+                    {"vid": variant.id},
+                )
+            assert "ck_inventory_stocks_low_stock_threshold_non_negative" in str(
+                exc_neg_thresh.value
+            )
+
+            with pytest.raises(IntegrityError) as exc_neg_price, setup_db.begin_nested():
+                setup_db.execute(
+                    text("UPDATE product_variants SET price_cents = -1 WHERE id = :vid"),
+                    {"vid": variant.id},
+                )
+            assert "ck_product_variants_price_non_negative" in str(exc_neg_price.value)
+
+            with pytest.raises(IntegrityError) as exc_cmp_price, setup_db.begin_nested():
+                setup_db.execute(
+                    text(
+                        "UPDATE product_variants SET compare_at_price_cents = 100 "
+                        "WHERE id = :vid"
+                    ),
+                    {"vid": variant.id},
+                )
+            assert "ck_product_variants_compare_price_valid" in str(exc_cmp_price.value)
+
+            with pytest.raises(IntegrityError) as exc_self_cat, setup_db.begin_nested():
+                setup_db.execute(
+                    text("UPDATE categories SET parent_id = id WHERE id = :cid"),
+                    {"cid": cat.id},
+                )
+            assert "ck_categories_parent_not_self" in str(exc_self_cat.value)
+
+            with pytest.raises(IntegrityError) as exc_bad_reason, setup_db.begin_nested():
+                setup_db.execute(
+                    text(
+                        "INSERT INTO inventory_ledger_entries "
+                        "(variant_id, reason, delta_on_hand, delta_reserved, "
+                        "on_hand_after, reserved_after) "
+                        "VALUES (:vid, 'INVALID_REASON', 1, 0, 21, 0)"
+                    ),
+                    {"vid": variant.id},
+                )
+            assert "ck_inventory_ledger_entries_reason_valid" in str(exc_bad_reason.value)
+
             # 3. Verify uq_product_primary_image partial unique index
             with pytest.raises(IntegrityError) as exc_dup_primary, setup_db.begin_nested():
                 setup_db.add(
@@ -1480,8 +1544,8 @@ def test_live_postgresql_be002_constraints_jsonb_partial_index_and_concurrency()
                 items=[(prod, variant, 5, datetime.now(UTC) - timedelta(minutes=5))],
             )
 
-        # Login admin and verify PATCH image replacement + capture session/CSRF for workers
-        with TestClient(pg_app) as pg_client:
+        # Login admin and verify PATCH image replacement, INET audit log, and HTTP edge cases
+        with TestClient(pg_app, client=("203.0.113.42", 50000)) as pg_client:
             login_resp = pg_client.post(
                 "/api/v1/auth/login",
                 json={"email": admin_email, "password": DEFAULT_TEST_PASSWORD},
@@ -1508,6 +1572,35 @@ def test_live_postgresql_be002_constraints_jsonb_partial_index_and_concurrency()
                 headers={"Origin": DEFAULT_ORIGIN, "X-CSRF-Token": csrf_token},
             )
             assert replace_img.status_code == 200, replace_img.text
+
+            # Live PostgreSQL MEDIUM-1 & MEDIUM-2 HTTP regression checks
+            nul_slug_resp = pg_client.get("/api/v1/products/item%00")
+            assert nul_slug_resp.status_code == 404
+            assert nul_slug_resp.json()["error"]["code"] == "PRODUCT_NOT_FOUND"
+
+            page_max_resp = pg_client.get("/api/v1/products", params={"page": 1_000_000})
+            assert page_max_resp.status_code == 200
+            assert page_max_resp.json()["items"] == []
+            assert page_max_resp.json()["has_next"] is False
+
+            page_over_resp = pg_client.get("/api/v1/products", params={"page": 1_000_001})
+            assert page_over_resp.status_code == 422
+            assert page_over_resp.json()["error"]["code"] == "VALIDATION_ERROR"
+
+        # Verify PostgreSQL INET column persistence in audit_logs
+        with pg_session_factory() as audit_db:
+            inet_row = audit_db.execute(
+                text(
+                    "SELECT pg_typeof(ip_address)::text, host(ip_address), action, resource_type "
+                    "FROM audit_logs "
+                    "WHERE resource_id = :pid AND action = 'PRODUCT_UPDATED'"
+                ),
+                {"pid": str(prod.id)},
+            ).one()
+            assert inet_row[0] == "inet"
+            assert inet_row[1] == "203.0.113.42"
+            assert inet_row[2] == "PRODUCT_UPDATED"
+            assert inet_row[3] == "product"
 
         # 4. Verify FOR UPDATE SKIP LOCKED skips locked order cleanly without blocking
         with pg_session_factory() as lock_db, pg_session_factory() as probe_db:
@@ -1578,6 +1671,157 @@ def test_live_postgresql_be002_constraints_jsonb_partial_index_and_concurrency()
                 )
             )
             assert ledger_count == 6  # 1 INITIAL_SEED + 1 RELEASE + 4 MANUAL_ADJUSTMENT
+
+        # 6. Multi-order overlapping-variant concurrent reclamation + PAID safety (HIGH-1)
+        with pg_session_factory() as multi_db:
+            mv_variants: list[ProductVariant] = []
+            for idx in range(1, 4):
+                mv = ProductVariant(
+                    product_id=prod.id,
+                    sku=f"PG-MV{idx}-{uuid.uuid4().hex[:6]}",
+                    title=f"Multi Variant {idx}",
+                    attributes_json={"idx": idx},
+                    price_cents=4000 + idx * 100,
+                    currency="USD",
+                    is_active=True,
+                )
+                multi_db.add(mv)
+                multi_db.flush()
+                multi_db.add(
+                    InventoryStock(
+                        variant_id=mv.id,
+                        on_hand=40,
+                        reserved=0,
+                        low_stock_threshold=5,
+                        version=1,
+                    )
+                )
+                multi_db.add(
+                    InventoryLedgerEntry(
+                        variant_id=mv.id,
+                        actor_user_id=admin_user.id,
+                        reason="INITIAL_SEED",
+                        delta_on_hand=40,
+                        delta_reserved=0,
+                        on_hand_after=40,
+                        reserved_after=0,
+                        note=f"MV{idx} seed",
+                    )
+                )
+                mv_variants.append(mv)
+            multi_db.commit()
+            mv1, mv2, mv3 = mv_variants
+
+            past_exp = datetime.now(UTC) - timedelta(minutes=10)
+            mo_1, mo_1_res, _ = _seed_order_with_reservations(
+                multi_db,
+                order_number=f"ORD-PGM1-{uuid.uuid4().hex[:6]}",
+                items=[(prod, mv1, 2, past_exp), (prod, mv2, 3, past_exp)],
+            )
+            mo_2, mo_2_res, _ = _seed_order_with_reservations(
+                multi_db,
+                order_number=f"ORD-PGM2-{uuid.uuid4().hex[:6]}",
+                items=[(prod, mv2, 4, past_exp), (prod, mv3, 5, past_exp)],
+            )
+            mo_3, mo_3_res, _ = _seed_order_with_reservations(
+                multi_db,
+                order_number=f"ORD-PGM3-{uuid.uuid4().hex[:6]}",
+                items=[(prod, mv1, 6, past_exp), (prod, mv3, 1, past_exp)],
+            )
+            mo_paid, mo_paid_res, _ = _seed_order_with_reservations(
+                multi_db,
+                order_number=f"ORD-PGPD-{uuid.uuid4().hex[:6]}",
+                status="PENDING_PAYMENT",
+                payment_status="PAID",
+                items=[(prod, mv1, 2, past_exp)],
+            )
+            multi_db.execute(
+                text("UPDATE inventory_stocks SET reserved = 10 WHERE variant_id = :vid"),
+                {"vid": mv1.id},
+            )
+            multi_db.execute(
+                text("UPDATE inventory_stocks SET reserved = 7 WHERE variant_id = :vid"),
+                {"vid": mv2.id},
+            )
+            multi_db.execute(
+                text("UPDATE inventory_stocks SET reserved = 6 WHERE variant_id = :vid"),
+                {"vid": mv3.id},
+            )
+            multi_db.commit()
+
+        multi_barrier = threading.Barrier(6)
+
+        def _multi_reclaim_worker(vid: uuid.UUID) -> int:
+            multi_barrier.wait(timeout=10)
+            with pg_session_factory() as w_db:
+                reclaimed = reclaim_expired_reservations_for_variants(w_db, [vid])
+                if reclaimed > 0:
+                    w_db.commit()
+                return reclaimed
+
+        def _multi_adjust_worker(vid: uuid.UUID, delta: int) -> int:
+            multi_barrier.wait(timeout=10)
+            with TestClient(pg_app) as w_client:
+                w_client.cookies.set(SESSION_COOKIE_NAME, session_cookie)
+                w_client.cookies.set(CSRF_COOKIE_NAME, csrf_cookie)
+                resp = w_client.post(
+                    f"/api/v1/admin/inventory/{vid}/adjust",
+                    json={"delta_on_hand": delta, "note": f"Concurrent mv delta {delta}"},
+                    headers={"Origin": DEFAULT_ORIGIN, "X-CSRF-Token": csrf_token},
+                )
+                return int(resp.status_code)
+
+        mv_deltas = [(mv1.id, 5), (mv2.id, -3), (mv3.id, 4)]
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            r_futs = [pool.submit(_multi_reclaim_worker, mv.id) for mv in (mv1, mv2, mv3)]
+            a_futs = [pool.submit(_multi_adjust_worker, vid, d) for vid, d in mv_deltas]
+            mv_reclaimed_counts = [f.result(timeout=20) for f in r_futs]
+            mv_adjust_statuses = [f.result(timeout=20) for f in a_futs]
+
+        assert mv_adjust_statuses == [200, 200, 200]
+        assert sum(mv_reclaimed_counts) == 3
+
+        with pg_session_factory() as mv_verify_db:
+            for exp_o, exp_res_list in (
+                (mo_1, mo_1_res),
+                (mo_2, mo_2_res),
+                (mo_3, mo_3_res),
+            ):
+                reloaded_o = mv_verify_db.get(Order, exp_o.id)
+                assert reloaded_o is not None and reloaded_o.status == "CANCELLED"
+                assert reloaded_o.cancellation_reason == "RESERVATION_EXPIRED"
+                for res in exp_res_list:
+                    reloaded_r = mv_verify_db.get(InventoryReservation, res.id)
+                    assert reloaded_r is not None and reloaded_r.status == "EXPIRED"
+
+            reloaded_paid_o = mv_verify_db.get(Order, mo_paid.id)
+            assert reloaded_paid_o is not None
+            assert reloaded_paid_o.status == "PENDING_PAYMENT"
+            assert reloaded_paid_o.payment_status == "PAID"
+            reloaded_paid_r = mv_verify_db.get(InventoryReservation, mo_paid_res[0].id)
+            assert reloaded_paid_r is not None and reloaded_paid_r.status == "ACTIVE"
+
+            expected_mv_state = {
+                mv1.id: (45, 2, 4, 4),
+                mv2.id: (37, 0, 4, 4),
+                mv3.id: (44, 0, 4, 4),
+            }
+            for vid, (exp_hand, exp_res, exp_ver, exp_ledger) in expected_mv_state.items():
+                st = mv_verify_db.get(InventoryStock, vid)
+                assert st is not None
+                assert st.on_hand == exp_hand
+                assert st.reserved == exp_res
+                assert st.version == exp_ver
+                l_count = len(
+                    list(
+                        mv_verify_db.scalars(
+                            select(InventoryLedgerEntry).where(
+                                InventoryLedgerEntry.variant_id == vid
+                            )
+                        ).all()
+                    )
+                )
+                assert l_count == exp_ledger
     finally:
         pg_engine.dispose()
         get_engine(pg_settings).dispose()

@@ -11,6 +11,7 @@ Only the Orchestrator allocates owners and changes task status. Keep this concis
 | QA-BE-001 | BE-001 pytest unit & integration verification | qa | backend/tests/** | BE-001 | pytest -v: 90 passed, 1 skipped (live PG TEST_DATABASE_URL unavailable) in 10.97s on SQLite StaticPool + TestClient outside sandbox | verified |
 | BE-002 | Product catalog, categories, variants, and inventory management | backend | backend/** (except backend/tests/**) | BE-001 | ruff check . (0), mypy app (0 issues / 31 files), alembic heads (0001_initial_schema) + offline SQL, docs/security/BE-002-security-review.md (live PG/Docker runtime unverified pending TEST_DATABASE_URL/daemon) | verified |
 | QA-BE-002 | BE-002 catalog, variant, and inventory pytest verification | qa | backend/tests/**, docs/qa/** | BE-002 | pytest -v: 125 passed, 2 skipped (35 passed, 1 skipped in BE-002 suites; live PG TEST_DATABASE_URL unset) in 20.02s on SQLite StaticPool + TestClient outside sandbox | verified |
+| QA-PG-001 | Live PostgreSQL migration, constraint, and concurrency verification | qa | backend/tests/**, docs/qa/** | BE-002, QA-BE-002 | pytest -v: 127 passed, 0 skipped in 28.88s on isolated disposable PostgreSQL 18.6 cluster (least-privilege ecom_test_role, port 53983) + docs/qa/QA-PG-001-postgresql-verification.md (exact PG 16 Docker container parity pending daemon/CI) | verified |
 
 Statuses: proposed -> ready -> in_progress -> review -> verified / blocked. Do not move to verified without evidence.
 
