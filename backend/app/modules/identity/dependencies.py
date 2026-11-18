@@ -172,6 +172,22 @@ def require_roles(*roles: str) -> Callable[..., User]:
     return _role_guard
 
 
+def require_roles_with_csrf(*roles: str) -> Callable[..., AuthContext]:
+    """Dependency factory enforcing BOTH X-CSRF-Token validation and live user role membership."""
+
+    def _role_csrf_guard(
+        auth: Annotated[AuthContext, Depends(require_csrf)],
+    ) -> AuthContext:
+        if auth.user.role not in roles:
+            raise ForbiddenError(
+                code="FORBIDDEN_ROLE",
+                message="You do not have permission to perform this action.",
+            )
+        return auth
+
+    return _role_csrf_guard
+
+
 def revoke_all_user_sessions(db: Session, user_id: uuid.UUID) -> int:
     """Revoke all active auth_sessions for a user within the caller's transaction."""
     now = datetime.now(UTC)

@@ -21,8 +21,10 @@ from app.core.errors import (
     register_exception_handlers,
 )
 from app.core.security import RateLimiterProtocol, SlidingWindowRateLimiter
+from app.modules.catalog.router import router as catalog_router
 from app.modules.identity.dependencies import require_valid_origin
 from app.modules.identity.router import router as identity_router
+from app.modules.inventory.router import router as inventory_router
 
 
 class HealthResponse(BaseModel):
@@ -151,6 +153,8 @@ def create_app(
         )
 
     api_v1.include_router(identity_router)
+    api_v1.include_router(catalog_router)
+    api_v1.include_router(inventory_router)
     fastapi_app.include_router(api_v1)
 
     return fastapi_app

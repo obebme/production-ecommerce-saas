@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+MAX_PAGINATION_PAGE = 1_000_000
+
 
 class PaginationParams(BaseModel):
     """Standard pagination query bounds matching OpenAPI contracts."""
 
-    page: int = Field(default=1, ge=1)
+    page: int = Field(default=1, ge=1, le=MAX_PAGINATION_PAGE)
     page_size: int = Field(default=20, ge=1, le=100)
 
     @property
