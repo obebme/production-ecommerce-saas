@@ -8,6 +8,7 @@ import {
   LayoutDashboard,
   LogOut,
   Menu,
+  Package,
   Search,
   ShoppingBag,
   User as UserIcon,
@@ -258,6 +259,12 @@ export function StorefrontHeader() {
                     My Account
                   </Link>
                 </DropdownMenuItem>
+                <DropdownMenuItem asChild>
+                  <Link href="/orders">
+                    <Package className="h-4 w-4" aria-hidden="true" />
+                    My Orders
+                  </Link>
+                </DropdownMenuItem>
                 {isStaffOrAdmin ? (
                   <DropdownMenuItem asChild>
                     <Link href="/admin">
@@ -398,6 +405,13 @@ export function StorefrontHeader() {
                       className="block py-1.5 text-sm font-medium text-foreground hover:text-accent"
                     >
                       My Account
+                    </Link>
+                    <Link
+                      href="/orders"
+                      onClick={() => setMobileMenuOpen(false)}
+                      className="block py-1.5 text-sm font-medium text-foreground hover:text-accent"
+                    >
+                      My Orders
                     </Link>
                     {isStaffOrAdmin ? (
                       <Link

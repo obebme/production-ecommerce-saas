@@ -4,17 +4,26 @@ import type {
   AdminInventoryItemDTO,
   AdminProductSummaryDTO,
   AuthSessionResponse,
+  CancelOrderRequest,
   CartDTO,
   CategoryListResponse,
+  CheckoutOrderResponseDTO,
+  CreateCheckoutOrderRequest,
+  CreatePaymentIntentRequest,
   ErrorEnvelope,
   HealthDTO,
   LoginRequest,
+  OrderDetailDTO,
+  OrderListItemDTO,
   PaginatedResponse,
+  PaymentIntentResponse,
   ProductDetailDTO,
   ProductListQuery,
   ProductStatus,
   ProductSummaryDTO,
   RegisterRequest,
+  SimulateSandboxPaymentRequest,
+  SimulateSandboxPaymentResponse,
   StockStatusFilter,
   UpdateCartItemRequest,
   UpdateProfileRequest,
@@ -307,8 +316,12 @@ async function apiRequest<T>(
 
     if (!options.skipAuthInvalidationHook) {
       if (apiError.status === 401 && apiError.code === "AUTH_SESSION_EXPIRED") {
-        memoryCsrfToken = null;
-        authInvalidationListener?.("session_expired");
+        const isAnonymousAuthRequired =
+          !getEffectiveCsrfToken() && apiError.message === "Authentication required.";
+        if (!isAnonymousAuthRequired) {
+          memoryCsrfToken = null;
+          authInvalidationListener?.("session_expired");
+        }
       } else if (apiError.status === 403 && apiError.code === "AUTH_ACCOUNT_DISABLED") {
         memoryCsrfToken = null;
         authInvalidationListener?.("account_disabled");
@@ -477,6 +490,105 @@ export const cartApi = {
     return apiRequest<CartDTO>("/cart/merge", {
       method: "POST",
     });
+  },
+};
+
+function buildOrderHeaders(
+  guestToken?: string,
+  extra?: Record<string, string>
+): Record<string, string> | undefined {
+  const headers: Record<string, string> = { ...extra };
+  const trimmedGuestToken = guestToken?.trim();
+  if (trimmedGuestToken) {
+    headers["X-Guest-Order-Token"] = trimmedGuestToken;
+  }
+  return Object.keys(headers).length > 0 ? headers : undefined;
+}
+
+export const checkoutApi = {
+  createOrder(
+    payload: CreateCheckoutOrderRequest,
+    idempotencyKey: string
+  ): Promise<CheckoutOrderResponseDTO> {
+    return apiRequest<CheckoutOrderResponseDTO>("/checkout/orders", {
+      method: "POST",
+      body: payload,
+      headers: {
+        "Idempotency-Key": idempotencyKey,
+      },
+    });
+  },
+};
+
+export const ordersApi = {
+  listOrders(
+    params: { page?: number; page_size?: number } = {},
+    signal?: AbortSignal
+  ): Promise<PaginatedResponse<OrderListItemDTO>> {
+    const qs = buildQueryString(params);
+    return apiRequest<PaginatedResponse<OrderListItemDTO>>(`/orders${qs}`, {
+      signal,
+    });
+  },
+
+  getOrder(
+    orderNumber: string,
+    guestToken?: string,
+    signal?: AbortSignal
+  ): Promise<OrderDetailDTO> {
+    return apiRequest<OrderDetailDTO>(
+      `/orders/${encodeURIComponent(orderNumber)}`,
+      {
+        headers: buildOrderHeaders(guestToken),
+        signal,
+      }
+    );
+  },
+
+  cancelOrder(
+    orderNumber: string,
+    payload?: CancelOrderRequest,
+    guestToken?: string
+  ): Promise<OrderDetailDTO> {
+    return apiRequest<OrderDetailDTO>(
+      `/orders/${encodeURIComponent(orderNumber)}/cancel`,
+      {
+        method: "POST",
+        body: payload,
+        headers: buildOrderHeaders(guestToken),
+      }
+    );
+  },
+};
+
+export const paymentsApi = {
+  createIntent(
+    payload: CreatePaymentIntentRequest,
+    idempotencyKey: string,
+    guestToken?: string
+  ): Promise<PaymentIntentResponse> {
+    return apiRequest<PaymentIntentResponse>("/payments/intents", {
+      method: "POST",
+      body: payload,
+      headers: buildOrderHeaders(guestToken, {
+        "Idempotency-Key": idempotencyKey,
+      }),
+    });
+  },
+
+  simulateSandbox(
+    providerIntentId: string,
+    payload: SimulateSandboxPaymentRequest,
+    guestToken?: string
+  ): Promise<SimulateSandboxPaymentResponse> {
+    return apiRequest<SimulateSandboxPaymentResponse>(
+      `/payments/sandbox/${encodeURIComponent(providerIntentId)}/simulate`,
+      {
+        method: "POST",
+        body: payload,
+        headers: buildOrderHeaders(guestToken),
+      }
+    );
   },
 };
 

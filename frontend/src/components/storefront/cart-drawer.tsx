@@ -4,24 +4,18 @@ import * as React from "react";
 import Link from "next/link";
 import { AlertTriangle, Minus, Plus, ShoppingBag, Trash2 } from "lucide-react";
 import { ApiError } from "@/lib/api/client";
-import {
-  FREE_SHIPPING_THRESHOLD_CENTS,
-  formatCents,
-} from "@/lib/format";
+import { formatCents } from "@/lib/format";
 import { useAuth } from "@/providers/auth-provider";
 import { useCart } from "@/providers/cart-provider";
 import { ProductImage } from "@/components/shared/product-image";
+import {
+  classifyCartItem,
+  ClearCartDialog,
+  FreeShippingProgress,
+} from "@/components/storefront/cart-helpers";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
 import {
   Sheet,
   SheetContent,
@@ -57,11 +51,6 @@ export function CartDrawer() {
   const itemCount = cart?.item_count ?? 0;
   const subtotalCents = cart?.subtotal_cents ?? 0;
   const currency = cart?.currency ?? "USD";
-  const remainingForFreeShipping = Math.max(0, FREE_SHIPPING_THRESHOLD_CENTS - subtotalCents);
-  const progressRatio = Math.min(
-    100,
-    Math.round((subtotalCents / FREE_SHIPPING_THRESHOLD_CENTS) * 100)
-  );
   const hasUnavailableItems = items.some((item) => !item.is_available);
 
   const handleQuantityChange = async (itemId: string, nextQty: number) => {
@@ -154,33 +143,11 @@ export function CartDrawer() {
 
             {/* Free Shipping Progress */}
             {!sessionExpired && itemCount > 0 ? (
-              <div className="mb-5 rounded-md border border-border bg-muted/60 p-3">
-                {remainingForFreeShipping > 0 ? (
-                  <>
-                    <p className="text-xs font-medium text-foreground tabular-nums">
-                      Add {formatCents(remainingForFreeShipping, currency)} more for free standard
-                      shipping
-                    </p>
-                    <div
-                      role="progressbar"
-                      aria-label="Free standard shipping progress"
-                      aria-valuemin={0}
-                      aria-valuemax={FREE_SHIPPING_THRESHOLD_CENTS}
-                      aria-valuenow={subtotalCents}
-                      className="mt-2 h-2 w-full overflow-hidden rounded-full bg-secondary"
-                    >
-                      <div
-                        className="h-full bg-accent transition-all"
-                        style={{ width: `${progressRatio}%` }}
-                      />
-                    </div>
-                  </>
-                ) : (
-                  <p className="text-xs font-medium text-success tabular-nums">
-                    Complimentary standard shipping unlocked ($0.00)
-                  </p>
-                )}
-              </div>
+              <FreeShippingProgress
+                subtotalCents={subtotalCents}
+                currency={currency}
+                className="mb-5 rounded-md border border-border bg-muted/60 p-3"
+              />
             ) : null}
 
             {/* Cart Body */}
@@ -214,17 +181,9 @@ export function CartDrawer() {
               <ul className="space-y-4">
                 {items.map((item) => {
                   const isPending = pendingItemIds.has(item.id);
-                  const isOutOfStock = !item.in_stock || item.available_quantity === 0;
-                  const exceedsAvailable =
-                    item.in_stock &&
-                    item.available_quantity > 0 &&
-                    item.quantity > item.available_quantity;
-                  const isDeactivated =
-                    !item.is_available &&
-                    item.in_stock &&
-                    item.quantity <= item.available_quantity;
+                  const { isOutOfStock, exceedsAvailable, isDeactivated, maxAllowed } =
+                    classifyCartItem(item);
                   const updatedUnitPrice = priceNotices[item.variant_id];
-                  const maxAllowed = Math.min(99, item.available_quantity);
 
                   return (
                     <li
@@ -410,11 +369,25 @@ export function CartDrawer() {
               ) : null}
 
               <div className="space-y-2">
-                <Button size="lg" className="w-full" disabled>
-                  Proceed to Checkout
-                </Button>
-                <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
-                  <span>Checkout & full bag page open in the next release (FE-002).</span>
+                {hasUnavailableItems || items.length === 0 ? (
+                  <Button size="lg" className="w-full" disabled>
+                    Proceed to Checkout
+                  </Button>
+                ) : (
+                  <Button size="lg" className="w-full" asChild>
+                    <Link href="/checkout" onClick={closeDrawer}>
+                      Proceed to Checkout
+                    </Link>
+                  </Button>
+                )}
+                <div className="flex items-center justify-between gap-2 pt-1 text-xs">
+                  <Link
+                    href="/cart"
+                    onClick={closeDrawer}
+                    className="font-medium text-accent underline-offset-4 hover:underline"
+                  >
+                    View Full Cart
+                  </Link>
                   <button
                     type="button"
                     onClick={() => setConfirmClearOpen(true)}
@@ -429,33 +402,13 @@ export function CartDrawer() {
         </SheetContent>
       </Sheet>
 
-      <Dialog open={confirmClearOpen} onOpenChange={setConfirmClearOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Clear shopping bag?</DialogTitle>
-            <DialogDescription>
-              This removes all {itemCount} {itemCount === 1 ? "item" : "items"} from your shopping
-              bag.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => setConfirmClearOpen(false)}
-              disabled={isClearing}
-            >
-              Keep items
-            </Button>
-            <Button
-              variant="destructive"
-              onClick={() => void handleConfirmClear()}
-              disabled={isClearing}
-            >
-              {isClearing ? "Clearing..." : "Clear Bag"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <ClearCartDialog
+        open={confirmClearOpen}
+        onOpenChange={setConfirmClearOpen}
+        itemCount={itemCount}
+        isClearing={isClearing}
+        onConfirm={() => void handleConfirmClear()}
+      />
     </>
   );
 }

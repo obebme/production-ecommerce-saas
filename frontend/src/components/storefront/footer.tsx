@@ -62,6 +62,16 @@ export function StorefrontFooter() {
               </Link>
             </li>
             <li>
+              <Link href="/orders" className="text-foreground transition-colors hover:text-accent">
+                My Orders
+              </Link>
+            </li>
+            <li>
+              <Link href="/cart" className="text-muted-foreground transition-colors hover:text-accent">
+                Shopping Bag
+              </Link>
+            </li>
+            <li>
               <Link href="/login" className="text-muted-foreground transition-colors hover:text-accent">
                 Sign In
               </Link>

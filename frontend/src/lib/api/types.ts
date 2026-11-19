@@ -278,3 +278,187 @@ export interface AdminInventoryItemDTO {
   low_stock: boolean;
   updated_at: string;
 }
+
+/* --- Module 5 & 6: Checkout, Orders & Payments DTOs (BE-003) --- */
+
+export type OrderStatus =
+  | "PENDING_PAYMENT"
+  | "CONFIRMED"
+  | "PROCESSING"
+  | "SHIPPED"
+  | "COMPLETED"
+  | "CANCELLED"
+  | "REFUNDED";
+
+export type PaymentStatus =
+  | "REQUIRES_PAYMENT"
+  | "PAID"
+  | "FAILED"
+  | "REFUNDED"
+  | "CANCELLED";
+
+export type FulfillmentStatus =
+  | "UNFULFILLED"
+  | "ALLOCATED"
+  | "SHIPPED"
+  | "DELIVERED"
+  | "CANCELLED"
+  | "RETURNED";
+
+export type PaymentIntentStatus =
+  | "REQUIRES_ACTION"
+  | "PROCESSING"
+  | "SUCCEEDED"
+  | "FAILED"
+  | "CANCELLED"
+  | "REFUNDED";
+
+export type SandboxSimulateOutcome = "succeeded" | "failed";
+
+export interface AddressDTO {
+  full_name: string;
+  line1: string;
+  line2?: string | null;
+  city: string;
+  state: string;
+  postal_code: string;
+  country: string;
+  phone: string;
+}
+
+export interface CreateCheckoutOrderRequest {
+  customer_email: string;
+  shipping_address: AddressDTO;
+  billing_same_as_shipping: boolean;
+  billing_address?: AddressDTO | null;
+}
+
+export interface CancelOrderRequest {
+  reason?: string | null;
+}
+
+export interface CreatePaymentIntentRequest {
+  order_number: string;
+}
+
+export interface SimulateSandboxPaymentRequest {
+  outcome: SandboxSimulateOutcome;
+  failure_code?: string | null;
+}
+
+export interface OrderItemDTO {
+  id: string;
+  product_id: string;
+  variant_id: string;
+  sku_snapshot: string;
+  product_title_snapshot: string;
+  variant_title_snapshot: string;
+  attributes_snapshot: Record<string, unknown>;
+  unit_price_cents: number;
+  quantity: number;
+  line_total_cents: number;
+}
+
+export interface OrderEventDTO {
+  id: string;
+  actor_user_id: string | null;
+  event_type: string;
+  from_status: string | null;
+  to_status: string;
+  metadata: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface PaymentIntentDTO {
+  id: string;
+  provider: string;
+  provider_intent_id: string;
+  amount_cents: number;
+  currency: string;
+  status: PaymentIntentStatus;
+  failure_code: string | null;
+  failure_message: string | null;
+  created_at: string;
+}
+
+export interface OrderCheckoutSummaryDTO {
+  id: string;
+  order_number: string;
+  status: OrderStatus;
+  payment_status: PaymentStatus;
+  fulfillment_status: FulfillmentStatus;
+  customer_email: string;
+  currency: string;
+  subtotal_cents: number;
+  discount_cents: number;
+  shipping_cents: number;
+  tax_cents: number;
+  total_cents: number;
+  items: OrderItemDTO[];
+  placed_at: string;
+  paid_at: string | null;
+}
+
+export interface CheckoutOrderResponseDTO {
+  order: OrderCheckoutSummaryDTO;
+  payment_intent: PaymentIntentDTO;
+  reservation_expires_at: string;
+  guest_access_token: string | null;
+}
+
+export interface OrderListItemDTO {
+  id: string;
+  order_number: string;
+  status: OrderStatus;
+  payment_status: PaymentStatus;
+  fulfillment_status: FulfillmentStatus;
+  currency: string;
+  subtotal_cents: number;
+  discount_cents: number;
+  shipping_cents: number;
+  tax_cents: number;
+  total_cents: number;
+  item_count: number;
+  placed_at: string;
+  paid_at: string | null;
+  reservation_expires_at: string | null;
+}
+
+export interface OrderDetailDTO {
+  id: string;
+  order_number: string;
+  user_id: string | null;
+  status: OrderStatus;
+  payment_status: PaymentStatus;
+  fulfillment_status: FulfillmentStatus;
+  customer_email: string;
+  currency: string;
+  subtotal_cents: number;
+  discount_cents: number;
+  shipping_cents: number;
+  tax_cents: number;
+  total_cents: number;
+  shipping_address: AddressDTO;
+  billing_address: AddressDTO;
+  items: OrderItemDTO[];
+  payment_intent: PaymentIntentDTO | null;
+  reservation_expires_at: string | null;
+  events: OrderEventDTO[];
+  placed_at: string;
+  paid_at: string | null;
+  shipped_at: string | null;
+  completed_at: string | null;
+  cancelled_at: string | null;
+  cancellation_reason: string | null;
+}
+
+export interface PaymentIntentResponse {
+  payment_intent: PaymentIntentDTO;
+}
+
+export interface SimulateSandboxPaymentResponse {
+  event_id: string;
+  webhook_status: string;
+  order_status: string;
+  payment_status: string;
+}

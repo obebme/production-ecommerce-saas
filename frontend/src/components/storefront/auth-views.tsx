@@ -3,7 +3,15 @@
 import * as React from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { AlertCircle, CheckCircle2, Eye, EyeOff, LayoutDashboard, LogOut } from "lucide-react";
+import {
+  AlertCircle,
+  CheckCircle2,
+  Eye,
+  EyeOff,
+  LayoutDashboard,
+  LogOut,
+  Package,
+} from "lucide-react";
 import { ApiError, extractValidationErrors } from "@/lib/api/client";
 import { formatUtcTimestamp, sanitizeReturnTo } from "@/lib/format";
 import { useAuth } from "@/providers/auth-provider";
@@ -577,6 +585,12 @@ export function AccountView() {
         </CardHeader>
         <CardContent className="flex flex-wrap items-center gap-3">
           <Button variant="outline" asChild>
+            <Link href="/orders">
+              <Package className="h-4 w-4" aria-hidden="true" />
+              My Orders
+            </Link>
+          </Button>
+          <Button variant="outline" asChild>
             <Link href="/products">Browse Catalog</Link>
           </Button>
           {isStaffOrAdmin ? (
@@ -587,9 +601,6 @@ export function AccountView() {
               </Link>
             </Button>
           ) : null}
-          <p className="w-full pt-2 text-xs text-muted-foreground">
-            Customer order history and self-service receipt tracking connect in FE-002.
-          </p>
         </CardContent>
       </Card>
     </div>
