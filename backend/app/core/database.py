@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 from collections.abc import Generator
+from datetime import UTC, datetime
 from functools import lru_cache
+from typing import Literal
 
 from fastapi import Request
-from sqlalchemy import MetaData, create_engine, text
+from sqlalchemy import ColumnElement, MetaData, String, case, cast, create_engine, func, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, InstrumentedAttribute, Session, sessionmaker
 
 from app.core.config import Settings, get_app_settings, get_settings
 
@@ -100,3 +102,74 @@ def check_db_connection(db: Session) -> bool:
         return True
     except SQLAlchemyError:
         return False
+
+
+def _to_utc_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+TimestampColumn = (
+    InstrumentedAttribute[datetime]
+    | InstrumentedAttribute[datetime | None]
+    | ColumnElement[datetime]
+    | ColumnElement[datetime | None]
+)
+
+
+def _ts_compare(
+    db: Session,
+    column: TimestampColumn,
+    op: Literal["gte", "lte", "lt"],
+    bound: datetime,
+) -> ColumnElement[bool]:
+    """Compare a TIMESTAMPTZ column against a UTC datetime safely on PostgreSQL and SQLite."""
+    utc_bound = _to_utc_datetime(bound)
+    if db.get_bind().dialect.name == "sqlite":
+        # SQLite CURRENT_TIMESTAMP/func.now() omits fractional seconds ('YYYY-MM-DD HH:MM:SS'),
+        # while SQLAlchemy DateTime binds '.ffffff'. Normalize 19-char rows to '.000000'.
+        col_str = cast(column, String)
+        sqlite_expr = case(
+            (func.length(col_str) == 19, col_str + ".000000"),
+            else_=col_str,
+        )
+        bound_str = utc_bound.strftime("%Y-%m-%d %H:%M:%S.%f")
+        if op == "gte":
+            return sqlite_expr >= bound_str
+        if op == "lte":
+            return sqlite_expr <= bound_str
+        return sqlite_expr < bound_str
+
+    if op == "gte":
+        return column >= utc_bound
+    if op == "lte":
+        return column <= utc_bound
+    return column < utc_bound
+
+
+def ts_gte(
+    db: Session,
+    column: TimestampColumn,
+    bound: datetime,
+) -> ColumnElement[bool]:
+    """Dialect-safe column >= bound UTC timestamp predicate."""
+    return _ts_compare(db, column, "gte", bound)
+
+
+def ts_lte(
+    db: Session,
+    column: TimestampColumn,
+    bound: datetime,
+) -> ColumnElement[bool]:
+    """Dialect-safe column <= bound UTC timestamp predicate."""
+    return _ts_compare(db, column, "lte", bound)
+
+
+def ts_lt(
+    db: Session,
+    column: TimestampColumn,
+    bound: datetime,
+) -> ColumnElement[bool]:
+    """Dialect-safe column < bound UTC timestamp predicate."""
+    return _ts_compare(db, column, "lt", bound)

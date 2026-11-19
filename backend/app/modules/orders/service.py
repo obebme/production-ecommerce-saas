@@ -199,7 +199,8 @@ def _acquire_advisory_xact_lock(db: Session, scoped_key: str) -> None:
         )
 
 
-def _to_order_item_dto(item: OrderItem) -> OrderItemDTO:
+def to_order_item_dto(item: OrderItem) -> OrderItemDTO:
+    """Map an OrderItem ORM row to OrderItemDTO."""
     return OrderItemDTO(
         id=item.id,
         product_id=item.product_id,
@@ -214,7 +215,8 @@ def _to_order_item_dto(item: OrderItem) -> OrderItemDTO:
     )
 
 
-def _to_order_event_dto(event: OrderEvent) -> OrderEventDTO:
+def to_order_event_dto(event: OrderEvent) -> OrderEventDTO:
+    """Map an OrderEvent ORM row to OrderEventDTO."""
     return OrderEventDTO(
         id=event.id,
         actor_user_id=event.actor_user_id,
@@ -224,6 +226,10 @@ def _to_order_event_dto(event: OrderEvent) -> OrderEventDTO:
         metadata=dict(event.metadata_json),
         created_at=event.created_at,
     )
+
+
+_to_order_item_dto = to_order_item_dto
+_to_order_event_dto = to_order_event_dto
 
 
 def _load_order_items(db: Session, order_id: uuid.UUID) -> list[OrderItem]:
