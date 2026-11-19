@@ -1,10 +1,10 @@
 import type { Metadata } from "next";
-import { AdminCategoriesStarterView } from "@/components/admin/admin-starter-views";
+import { AdminCategoriesView } from "@/components/admin/admin-categories-view";
 
 export const metadata: Metadata = {
   title: "Admin Categories",
 };
 
 export default function AdminCategoriesPage() {
-  return <AdminCategoriesStarterView />;
+  return <AdminCategoriesView />;
 }

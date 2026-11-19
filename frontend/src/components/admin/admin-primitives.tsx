@@ -46,7 +46,7 @@ export function KpiCard({
 }: {
   title: string;
   value: React.ReactNode;
-  subtitle?: string;
+  subtitle?: React.ReactNode;
   isLoading?: boolean;
   badge?: React.ReactNode;
   className?: string;

@@ -56,6 +56,7 @@ const ADMINISTRATION_NAV: AdminNavItem[] = [
 const SEGMENT_LABELS: Record<string, string> = {
   admin: "Admin",
   products: "Products",
+  new: "New Product",
   categories: "Categories",
   inventory: "Inventory",
   orders: "Orders",

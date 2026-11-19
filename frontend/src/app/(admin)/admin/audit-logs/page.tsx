@@ -1,10 +1,10 @@
 import type { Metadata } from "next";
-import { AdminAuditLogsStarterView } from "@/components/admin/admin-starter-views";
+import { AdminAuditLogsView } from "@/components/admin/admin-audit-logs-view";
 
 export const metadata: Metadata = {
   title: "Admin Audit Logs",
 };
 
 export default function AdminAuditLogsPage() {
-  return <AdminAuditLogsStarterView />;
+  return <AdminAuditLogsView />;
 }

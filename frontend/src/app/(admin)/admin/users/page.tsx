@@ -1,10 +1,10 @@
 import type { Metadata } from "next";
-import { AdminUsersStarterView } from "@/components/admin/admin-starter-views";
+import { AdminUsersView } from "@/components/admin/admin-users-view";
 
 export const metadata: Metadata = {
   title: "Admin Users & Roles",
 };
 
 export default function AdminUsersPage() {
-  return <AdminUsersStarterView />;
+  return <AdminUsersView />;
 }

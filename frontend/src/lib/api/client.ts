@@ -1,32 +1,61 @@
 import type {
   AddCartItemRequest,
+  AdminCategoryDTO,
   AdminCategoryListResponse,
   AdminInventoryItemDTO,
+  AdminOrderDetailDTO,
+  AdminOrderListItemDTO,
+  AdminProductDetailDTO,
   AdminProductSummaryDTO,
+  AdminUserDTO,
+  AdminUserMutationResponse,
+  AdminVariantDTO,
+  AnalyticsSummaryResponse,
+  AnalyticsTimeseriesResponse,
+  AuditLogEntryDTO,
   AuthSessionResponse,
   CancelOrderRequest,
   CartDTO,
   CategoryListResponse,
   CheckoutOrderResponseDTO,
+  CreateCategoryRequest,
   CreateCheckoutOrderRequest,
   CreatePaymentIntentRequest,
+  CreateProductRequest,
+  CreateVariantRequest,
   ErrorEnvelope,
+  FulfillOrderRequest,
+  FulfillmentStatus,
   HealthDTO,
+  InventoryHealthResponse,
+  InventoryLedgerEntryDTO,
   LoginRequest,
   OrderDetailDTO,
   OrderListItemDTO,
+  OrderStatus,
   PaginatedResponse,
   PaymentIntentResponse,
+  PaymentStatus,
   ProductDetailDTO,
   ProductListQuery,
   ProductStatus,
   ProductSummaryDTO,
+  RefundOrderRequest,
   RegisterRequest,
   SimulateSandboxPaymentRequest,
   SimulateSandboxPaymentResponse,
+  StockAdjustmentRequest,
   StockStatusFilter,
+  TopProductSortBy,
+  TopProductsResponse,
   UpdateCartItemRequest,
+  UpdateCategoryRequest,
+  UpdateProductRequest,
   UpdateProfileRequest,
+  UpdateUserRoleRequest,
+  UpdateUserStatusRequest,
+  UpdateVariantRequest,
+  UserRole,
   UserUpdateResponse,
   ValidationFieldError,
   VariantAvailabilityDTO,
@@ -592,15 +621,38 @@ export const paymentsApi = {
   },
 };
 
-/* --- Starter BE-002 Admin Read Endpoints for RBAC Dashboard Shell --- */
+/* --- Administrative APIs (BE-002 / BE-004 / FE-003) --- */
 
 export const adminCatalogApi = {
   listCategories(signal?: AbortSignal): Promise<AdminCategoryListResponse> {
     return apiRequest<AdminCategoryListResponse>("/admin/categories", { signal });
   },
 
+  createCategory(payload: CreateCategoryRequest): Promise<AdminCategoryDTO> {
+    return apiRequest<AdminCategoryDTO>("/admin/categories", {
+      method: "POST",
+      body: payload,
+    });
+  },
+
+  updateCategory(categoryId: string, payload: UpdateCategoryRequest): Promise<AdminCategoryDTO> {
+    return apiRequest<AdminCategoryDTO>(
+      `/admin/categories/${encodeURIComponent(categoryId)}`,
+      {
+        method: "PATCH",
+        body: payload,
+      }
+    );
+  },
+
   listProducts(
-    params: { q?: string; status?: ProductStatus; category_id?: string; page?: number; page_size?: number } = {},
+    params: {
+      q?: string;
+      status?: ProductStatus;
+      category_id?: string;
+      page?: number;
+      page_size?: number;
+    } = {},
     signal?: AbortSignal
   ): Promise<PaginatedResponse<AdminProductSummaryDTO>> {
     const qs = buildQueryString(params);
@@ -608,15 +660,285 @@ export const adminCatalogApi = {
       signal,
     });
   },
+
+  getProduct(productId: string, signal?: AbortSignal): Promise<AdminProductDetailDTO> {
+    return apiRequest<AdminProductDetailDTO>(
+      `/admin/products/${encodeURIComponent(productId)}`,
+      { signal }
+    );
+  },
+
+  createProduct(payload: CreateProductRequest): Promise<AdminProductDetailDTO> {
+    return apiRequest<AdminProductDetailDTO>("/admin/products", {
+      method: "POST",
+      body: payload,
+    });
+  },
+
+  updateProduct(
+    productId: string,
+    payload: UpdateProductRequest
+  ): Promise<AdminProductDetailDTO> {
+    return apiRequest<AdminProductDetailDTO>(
+      `/admin/products/${encodeURIComponent(productId)}`,
+      {
+        method: "PATCH",
+        body: payload,
+      }
+    );
+  },
+
+  archiveProduct(productId: string): Promise<AdminProductDetailDTO> {
+    return apiRequest<AdminProductDetailDTO>(
+      `/admin/products/${encodeURIComponent(productId)}`,
+      {
+        method: "DELETE",
+      }
+    );
+  },
+
+  createVariant(
+    productId: string,
+    payload: CreateVariantRequest
+  ): Promise<AdminVariantDTO> {
+    return apiRequest<AdminVariantDTO>(
+      `/admin/products/${encodeURIComponent(productId)}/variants`,
+      {
+        method: "POST",
+        body: payload,
+      }
+    );
+  },
+
+  updateVariant(
+    variantId: string,
+    payload: UpdateVariantRequest
+  ): Promise<AdminVariantDTO> {
+    return apiRequest<AdminVariantDTO>(
+      `/admin/variants/${encodeURIComponent(variantId)}`,
+      {
+        method: "PATCH",
+        body: payload,
+      }
+    );
+  },
 };
 
 export const adminInventoryApi = {
   listInventory(
-    params: { q?: string; stock_status?: StockStatusFilter; page?: number; page_size?: number } = {},
+    params: {
+      q?: string;
+      stock_status?: StockStatusFilter;
+      page?: number;
+      page_size?: number;
+    } = {},
     signal?: AbortSignal
   ): Promise<PaginatedResponse<AdminInventoryItemDTO>> {
     const qs = buildQueryString(params);
     return apiRequest<PaginatedResponse<AdminInventoryItemDTO>>(`/admin/inventory${qs}`, {
+      signal,
+    });
+  },
+
+  adjustStock(
+    variantId: string,
+    payload: StockAdjustmentRequest
+  ): Promise<AdminInventoryItemDTO> {
+    return apiRequest<AdminInventoryItemDTO>(
+      `/admin/inventory/${encodeURIComponent(variantId)}/adjust`,
+      {
+        method: "POST",
+        body: payload,
+      }
+    );
+  },
+
+  listLedger(
+    variantId: string,
+    params: { page?: number; page_size?: number } = {},
+    signal?: AbortSignal
+  ): Promise<PaginatedResponse<InventoryLedgerEntryDTO>> {
+    const qs = buildQueryString(params);
+    return apiRequest<PaginatedResponse<InventoryLedgerEntryDTO>>(
+      `/admin/inventory/${encodeURIComponent(variantId)}/ledger${qs}`,
+      { signal }
+    );
+  },
+};
+
+export const adminOrdersApi = {
+  listOrders(
+    params: {
+      status?: OrderStatus;
+      payment_status?: PaymentStatus;
+      fulfillment_status?: FulfillmentStatus;
+      q?: string;
+      from_ts?: string;
+      to_ts?: string;
+      page?: number;
+      page_size?: number;
+    } = {},
+    signal?: AbortSignal
+  ): Promise<PaginatedResponse<AdminOrderListItemDTO>> {
+    const qs = buildQueryString(params);
+    return apiRequest<PaginatedResponse<AdminOrderListItemDTO>>(`/admin/orders${qs}`, {
+      signal,
+    });
+  },
+
+  getOrder(orderNumber: string, signal?: AbortSignal): Promise<AdminOrderDetailDTO> {
+    return apiRequest<AdminOrderDetailDTO>(
+      `/admin/orders/${encodeURIComponent(orderNumber)}`,
+      { signal }
+    );
+  },
+
+  fulfillOrder(
+    orderNumber: string,
+    payload: FulfillOrderRequest
+  ): Promise<AdminOrderDetailDTO> {
+    return apiRequest<AdminOrderDetailDTO>(
+      `/admin/orders/${encodeURIComponent(orderNumber)}/fulfill`,
+      {
+        method: "POST",
+        body: payload,
+      }
+    );
+  },
+
+  cancelOrder(
+    orderNumber: string,
+    payload?: CancelOrderRequest
+  ): Promise<AdminOrderDetailDTO> {
+    return apiRequest<AdminOrderDetailDTO>(
+      `/admin/orders/${encodeURIComponent(orderNumber)}/cancel`,
+      {
+        method: "POST",
+        body: payload,
+      }
+    );
+  },
+
+  refundOrder(
+    orderNumber: string,
+    payload: RefundOrderRequest
+  ): Promise<AdminOrderDetailDTO> {
+    return apiRequest<AdminOrderDetailDTO>(
+      `/admin/orders/${encodeURIComponent(orderNumber)}/refund`,
+      {
+        method: "POST",
+        body: payload,
+      }
+    );
+  },
+};
+
+export const adminUsersApi = {
+  listUsers(
+    params: {
+      role?: UserRole;
+      is_active?: boolean;
+      q?: string;
+      page?: number;
+      page_size?: number;
+    } = {},
+    signal?: AbortSignal
+  ): Promise<PaginatedResponse<AdminUserDTO>> {
+    const qs = buildQueryString(params);
+    return apiRequest<PaginatedResponse<AdminUserDTO>>(`/admin/users${qs}`, {
+      signal,
+    });
+  },
+
+  updateRole(
+    userId: string,
+    payload: UpdateUserRoleRequest
+  ): Promise<AdminUserMutationResponse> {
+    return apiRequest<AdminUserMutationResponse>(
+      `/admin/users/${encodeURIComponent(userId)}/role`,
+      {
+        method: "PATCH",
+        body: payload,
+      }
+    );
+  },
+
+  updateStatus(
+    userId: string,
+    payload: UpdateUserStatusRequest
+  ): Promise<AdminUserMutationResponse> {
+    return apiRequest<AdminUserMutationResponse>(
+      `/admin/users/${encodeURIComponent(userId)}/status`,
+      {
+        method: "PATCH",
+        body: payload,
+      }
+    );
+  },
+};
+
+export const adminAuditApi = {
+  listAuditLogs(
+    params: {
+      resource_type?: string;
+      actor_user_id?: string;
+      action?: string;
+      from_ts?: string;
+      to_ts?: string;
+      page?: number;
+      page_size?: number;
+    } = {},
+    signal?: AbortSignal
+  ): Promise<PaginatedResponse<AuditLogEntryDTO>> {
+    const qs = buildQueryString(params);
+    return apiRequest<PaginatedResponse<AuditLogEntryDTO>>(`/admin/audit-logs${qs}`, {
+      signal,
+    });
+  },
+};
+
+export const adminAnalyticsApi = {
+  getSummary(
+    params: { from?: string; to?: string } = {},
+    signal?: AbortSignal
+  ): Promise<AnalyticsSummaryResponse> {
+    const qs = buildQueryString(params);
+    return apiRequest<AnalyticsSummaryResponse>(`/admin/analytics/summary${qs}`, {
+      signal,
+    });
+  },
+
+  getTimeseries(
+    params: { from?: string; to?: string } = {},
+    signal?: AbortSignal
+  ): Promise<AnalyticsTimeseriesResponse> {
+    const qs = buildQueryString(params);
+    return apiRequest<AnalyticsTimeseriesResponse>(`/admin/analytics/timeseries${qs}`, {
+      signal,
+    });
+  },
+
+  getTopProducts(
+    params: {
+      from?: string;
+      to?: string;
+      sort_by?: TopProductSortBy;
+      limit?: number;
+    } = {},
+    signal?: AbortSignal
+  ): Promise<TopProductsResponse> {
+    const qs = buildQueryString(params);
+    return apiRequest<TopProductsResponse>(`/admin/analytics/top-products${qs}`, {
+      signal,
+    });
+  },
+
+  getInventoryHealth(
+    params: { page?: number; page_size?: number } = {},
+    signal?: AbortSignal
+  ): Promise<InventoryHealthResponse> {
+    const qs = buildQueryString(params);
+    return apiRequest<InventoryHealthResponse>(`/admin/analytics/inventory-health${qs}`, {
       signal,
     });
   },

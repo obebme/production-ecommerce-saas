@@ -462,3 +462,250 @@ export interface SimulateSandboxPaymentResponse {
   order_status: string;
   payment_status: string;
 }
+
+/* --- FE-003 Administrative Catalog, Inventory, Orders, Users, Audit & Analytics DTOs --- */
+
+export interface CreateCategoryRequest {
+  parent_id?: string | null;
+  name: string;
+  slug: string;
+  description?: string | null;
+  is_active?: boolean;
+  sort_order?: number;
+}
+
+export interface UpdateCategoryRequest {
+  parent_id?: string | null;
+  name?: string;
+  slug?: string;
+  description?: string | null;
+  is_active?: boolean;
+  sort_order?: number;
+}
+
+export interface ProductImageInput {
+  url: string;
+  alt_text?: string;
+  sort_order?: number;
+  is_primary?: boolean;
+}
+
+export interface CreateProductRequest {
+  category_id: string;
+  title: string;
+  slug: string;
+  description?: string;
+  status?: ProductStatus;
+  images?: ProductImageInput[];
+}
+
+export interface UpdateProductRequest {
+  category_id?: string;
+  title?: string;
+  slug?: string;
+  description?: string;
+  status?: ProductStatus;
+  images?: ProductImageInput[];
+}
+
+export interface CreateVariantRequest {
+  sku: string;
+  title: string;
+  attributes?: Record<string, unknown>;
+  price_cents: number;
+  compare_at_price_cents?: number | null;
+  currency?: string;
+  is_active?: boolean;
+  initial_on_hand?: number;
+  low_stock_threshold?: number;
+}
+
+export interface UpdateVariantRequest {
+  sku?: string;
+  title?: string;
+  attributes?: Record<string, unknown>;
+  price_cents?: number;
+  compare_at_price_cents?: number | null;
+  currency?: string;
+  is_active?: boolean;
+  low_stock_threshold?: number;
+}
+
+export interface StockAdjustmentRequest {
+  delta_on_hand: number;
+  note: string;
+}
+
+export interface InventoryLedgerEntryDTO {
+  id: string;
+  variant_id: string;
+  order_id: string | null;
+  order_number: string | null;
+  actor_user_id: string | null;
+  actor_email: string | null;
+  reason: string;
+  delta_on_hand: number;
+  delta_reserved: number;
+  on_hand_after: number;
+  reserved_after: number;
+  note: string | null;
+  created_at: string;
+}
+
+export type ReservationStatus = "ACTIVE" | "COMMITTED" | "RELEASED" | "EXPIRED";
+export type FulfillOrderAction = "START_PROCESSING" | "SHIP" | "COMPLETE";
+
+export interface AdminOrderListItemDTO {
+  id: string;
+  order_number: string;
+  user_id: string | null;
+  customer_email: string;
+  status: OrderStatus;
+  payment_status: PaymentStatus;
+  fulfillment_status: FulfillmentStatus;
+  currency: string;
+  subtotal_cents: number;
+  discount_cents: number;
+  shipping_cents: number;
+  tax_cents: number;
+  total_cents: number;
+  item_count: number;
+  placed_at: string;
+  paid_at: string | null;
+  shipped_at: string | null;
+  completed_at: string | null;
+  cancelled_at: string | null;
+}
+
+export interface AdminOrderReservationDTO {
+  id: string;
+  order_id: string;
+  variant_id: string;
+  quantity: number;
+  status: ReservationStatus;
+  expires_at: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AdminOrderDetailDTO extends OrderDetailDTO {
+  payment_intents: PaymentIntentDTO[];
+  reservations: AdminOrderReservationDTO[];
+  updated_at: string;
+}
+
+export interface FulfillOrderRequest {
+  action: FulfillOrderAction;
+  tracking_number?: string | null;
+  carrier?: string | null;
+  note?: string | null;
+}
+
+export interface RefundOrderRequest {
+  reason?: string | null;
+  restock?: boolean;
+}
+
+export interface AdminUserDTO {
+  id: string;
+  email: string;
+  full_name: string;
+  role: UserRole;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface UpdateUserRoleRequest {
+  role: UserRole;
+}
+
+export interface UpdateUserStatusRequest {
+  is_active: boolean;
+}
+
+export interface AdminUserMutationResponse {
+  user: AdminUserDTO;
+  revoked_sessions_count: number;
+}
+
+export interface AuditLogEntryDTO {
+  id: string;
+  actor_user_id: string | null;
+  actor_email: string | null;
+  actor_full_name: string | null;
+  action: string;
+  resource_type: string;
+  resource_id: string;
+  before_state: Record<string, unknown> | null;
+  after_state: Record<string, unknown> | null;
+  ip_address: string | null;
+  created_at: string;
+}
+
+export type TopProductSortBy = "revenue" | "units";
+
+export interface AnalyticsSummaryResponse {
+  from_date: string;
+  to_date: string;
+  gross_revenue_cents: number;
+  refunded_revenue_cents: number;
+  net_revenue_cents: number;
+  paid_orders_count: number;
+  average_order_value_cents: number;
+  orders_by_status: Record<OrderStatus, number>;
+}
+
+export interface TimeseriesPointDTO {
+  date: string;
+  net_revenue_cents: number;
+  paid_orders_count: number;
+}
+
+export interface AnalyticsTimeseriesResponse {
+  from_date: string;
+  to_date: string;
+  points: TimeseriesPointDTO[];
+}
+
+export interface TopProductDTO {
+  variant_id: string;
+  product_id: string;
+  sku_snapshot: string;
+  product_title_snapshot: string;
+  variant_title_snapshot: string;
+  units_sold: number;
+  revenue_cents: number;
+}
+
+export interface TopProductsResponse {
+  from_date: string;
+  to_date: string;
+  items: TopProductDTO[];
+}
+
+export interface InventoryHealthSummaryDTO {
+  active_skus_count: number;
+  out_of_stock_count: number;
+  low_stock_count: number;
+  total_reserved_units: number;
+}
+
+export interface InventoryHealthAlertDTO {
+  variant_id: string;
+  product_id: string;
+  sku: string;
+  product_title: string;
+  variant_title: string;
+  on_hand: number;
+  reserved: number;
+  available_quantity: number;
+  low_stock_threshold: number;
+  in_stock: boolean;
+  low_stock: boolean;
+}
+
+export interface InventoryHealthResponse {
+  summary: InventoryHealthSummaryDTO;
+  alerts: PaginatedResponse<InventoryHealthAlertDTO>;
+}

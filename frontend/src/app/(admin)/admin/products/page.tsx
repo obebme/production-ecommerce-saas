@@ -1,10 +1,10 @@
 import type { Metadata } from "next";
-import { AdminProductsStarterView } from "@/components/admin/admin-dashboard-view";
+import { AdminProductsView } from "@/components/admin/admin-products-view";
 
 export const metadata: Metadata = {
   title: "Admin Products",
 };
 
 export default function AdminProductsPage() {
-  return <AdminProductsStarterView />;
+  return <AdminProductsView />;
 }
