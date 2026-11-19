@@ -25,6 +25,8 @@ from app.core.security import (
     RateLimiterProtocol,
     SlidingWindowRateLimiter,
 )
+from app.modules.admin.router import router as admin_router
+from app.modules.analytics.router import router as analytics_router
 from app.modules.cart.router import router as cart_router
 from app.modules.catalog.router import router as catalog_router
 from app.modules.identity.dependencies import require_valid_origin
@@ -166,6 +168,8 @@ def create_app(
     api_v1.include_router(cart_router)
     api_v1.include_router(orders_router)
     api_v1.include_router(payments_router)
+    api_v1.include_router(admin_router)
+    api_v1.include_router(analytics_router)
     fastapi_app.include_router(api_v1)
 
     return fastapi_app
