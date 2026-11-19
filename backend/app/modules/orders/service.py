@@ -27,6 +27,7 @@ from app.core.errors import (
     UnauthorizedError,
     ValidationAppError,
 )
+from app.core.order_events import append_order_event
 from app.core.pagination import PaginatedResponse, PaginationParams
 from app.core.security import (
     GuestPendingOrderTracker,
@@ -851,18 +852,18 @@ def create_checkout_order(
             )
         )
 
-    db.add(
-        OrderEvent(
-            order_id=order.id,
-            actor_user_id=actor_user_id,
-            event_type="ORDER_PLACED",
-            from_status=None,
-            to_status="PENDING_PAYMENT",
-            metadata_json={
-                "item_count": sum(item.quantity for item in cart_items),
-                "total_cents": total_cents,
-            },
-        )
+    append_order_event(
+        db,
+        order_id=order.id,
+        actor_user_id=actor_user_id,
+        event_type="ORDER_PLACED",
+        from_status=None,
+        to_status="PENDING_PAYMENT",
+        metadata_json={
+            "item_count": sum(item.quantity for item in cart_items),
+            "total_cents": total_cents,
+        },
+        now=checkout_now,
     )
 
     locked_cart.status = "CONVERTED"
@@ -1256,6 +1257,58 @@ def get_order_detail(
     return _load_order_detail_dto(db, order)
 
 
+def lock_order_and_payment_intents_for_update(
+    db: Session,
+    *,
+    order_id: uuid.UUID,
+    max_attempts: int = 2,
+) -> tuple[Order, list[PaymentIntent]]:
+    """Acquire PaymentIntent -> Order FOR UPDATE locks, retrying on concurrent new intents."""
+    for attempt in range(max_attempts):
+        intents = list(
+            db.scalars(
+                select(PaymentIntent)
+                .where(PaymentIntent.order_id == order_id)
+                .order_by(PaymentIntent.id.asc())
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            ).all()
+        )
+        locked_order = db.scalar(
+            select(Order)
+            .where(Order.id == order_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if locked_order is None:
+            db.rollback()
+            raise NotFoundError(
+                code="ORDER_NOT_FOUND",
+                message="Order not found.",
+            )
+
+        locked_intent_ids = {intent.id for intent in intents}
+        current_intent_ids = set(
+            db.scalars(
+                select(PaymentIntent.id).where(PaymentIntent.order_id == locked_order.id)
+            ).all()
+        )
+        if current_intent_ids - locked_intent_ids:
+            db.rollback()
+            if attempt + 1 < max_attempts:
+                continue
+            raise ConflictError(
+                code="INVALID_ORDER_STATE_TRANSITION",
+                message="Order payment state updated concurrently; please retry.",
+            )
+        return locked_order, intents
+
+    raise ConflictError(
+        code="INVALID_ORDER_STATE_TRANSITION",
+        message="Order payment state updated concurrently; please retry.",
+    )
+
+
 def cancel_customer_order(
     db: Session,
     *,
@@ -1279,13 +1332,15 @@ def cancel_customer_order(
         rate_limiter=rate_limiter,
         client_ip_key=client_ip_key,
     )
+    order_id = order.id
+    actor_user_id = auth.user.id if auth is not None else None
 
     if order.status == "PENDING_PAYMENT":
         pre_variants = list(
             db.scalars(
                 select(InventoryReservation.variant_id)
                 .where(
-                    InventoryReservation.order_id == order.id,
+                    InventoryReservation.order_id == order_id,
                     InventoryReservation.status == "ACTIVE",
                 )
                 .distinct()
@@ -1295,22 +1350,10 @@ def cancel_customer_order(
             db.commit()
 
     # Universal lock hierarchy: PaymentIntent -> Order -> InventoryReservation -> InventoryStock.
-    intents = list(
-        db.scalars(
-            select(PaymentIntent)
-            .where(PaymentIntent.order_id == order.id)
-            .order_by(PaymentIntent.id.asc())
-            .with_for_update()
-            .execution_options(populate_existing=True)
-        ).all()
+    locked_order, intents = lock_order_and_payment_intents_for_update(
+        db,
+        order_id=order_id,
     )
-    locked_order = db.scalar(
-        select(Order)
-        .where(Order.id == order.id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )
-    assert locked_order is not None
 
     reservations = list(
         db.scalars(
@@ -1365,7 +1408,6 @@ def cancel_customer_order(
         )
 
     cancel_reason = reason or "CUSTOMER_CANCELLED"
-    actor_user_id = auth.user.id if auth is not None else None
 
     for intent in intents:
         if intent.status in ("REQUIRES_ACTION", "PROCESSING", "FAILED"):
@@ -1399,15 +1441,15 @@ def cancel_customer_order(
             )
         )
 
-    db.add(
-        OrderEvent(
-            order_id=locked_order.id,
-            actor_user_id=actor_user_id,
-            event_type="ORDER_CANCELLED",
-            from_status="PENDING_PAYMENT",
-            to_status="CANCELLED",
-            metadata_json={"reason": cancel_reason},
-        )
+    append_order_event(
+        db,
+        order_id=locked_order.id,
+        actor_user_id=actor_user_id,
+        event_type="ORDER_CANCELLED",
+        from_status="PENDING_PAYMENT",
+        to_status="CANCELLED",
+        metadata_json={"reason": cancel_reason},
+        now=now,
     )
     db.commit()
     return _load_order_detail_dto(db, locked_order)
@@ -1431,15 +1473,15 @@ def _expire_locked_order_inline(
     order.cancelled_at = now
     order.cancellation_reason = "RESERVATION_EXPIRED"
 
-    db.add(
-        OrderEvent(
-            order_id=order.id,
-            actor_user_id=None,
-            event_type="ORDER_CANCELLED",
-            from_status="PENDING_PAYMENT",
-            to_status="CANCELLED",
-            metadata_json={"reason": "RESERVATION_EXPIRED"},
-        )
+    append_order_event(
+        db,
+        order_id=order.id,
+        actor_user_id=None,
+        event_type="ORDER_CANCELLED",
+        from_status="PENDING_PAYMENT",
+        to_status="CANCELLED",
+        metadata_json={"reason": "RESERVATION_EXPIRED"},
+        now=now,
     )
 
     for res in sorted(active_reservations, key=lambda r: (r.variant_id, str(r.id))):
@@ -1480,18 +1522,18 @@ def mark_order_paid(
     if order.payment_status == "PAID":
         if intent.status != "SUCCEEDED":
             intent.status = "REFUNDED"
-            db.add(
-                OrderEvent(
-                    order_id=order.id,
-                    actor_user_id=None,
-                    event_type="DUPLICATE_PAYMENT_REFUNDED",
-                    from_status=order.status,
-                    to_status=order.status,
-                    metadata_json={
-                        "provider_intent_id": intent.provider_intent_id,
-                        "event_id": event_id,
-                    },
-                )
+            append_order_event(
+                db,
+                order_id=order.id,
+                actor_user_id=None,
+                event_type="DUPLICATE_PAYMENT_REFUNDED",
+                from_status=order.status,
+                to_status=order.status,
+                metadata_json={
+                    "provider_intent_id": intent.provider_intent_id,
+                    "event_id": event_id,
+                },
+                now=now,
             )
         return
 
@@ -1528,18 +1570,18 @@ def mark_order_paid(
                 )
             )
 
-        db.add(
-            OrderEvent(
-                order_id=order.id,
-                actor_user_id=None,
-                event_type="PAYMENT_SUCCEEDED",
-                from_status="PENDING_PAYMENT",
-                to_status="CONFIRMED",
-                metadata_json={
-                    "provider_intent_id": intent.provider_intent_id,
-                    "event_id": event_id,
-                },
-            )
+        append_order_event(
+            db,
+            order_id=order.id,
+            actor_user_id=None,
+            event_type="PAYMENT_SUCCEEDED",
+            from_status="PENDING_PAYMENT",
+            to_status="CONFIRMED",
+            metadata_json={
+                "provider_intent_id": intent.provider_intent_id,
+                "event_id": event_id,
+            },
+            now=now,
         )
         return
 
@@ -1598,19 +1640,19 @@ def mark_order_paid(
                         )
                     )
 
-                db.add(
-                    OrderEvent(
-                        order_id=order.id,
-                        actor_user_id=None,
-                        event_type="PAYMENT_SUCCEEDED",
-                        from_status="CANCELLED",
-                        to_status="CONFIRMED",
-                        metadata_json={
-                            "provider_intent_id": intent.provider_intent_id,
-                            "event_id": event_id,
-                            "reacquired_after_expiry": True,
-                        },
-                    )
+                append_order_event(
+                    db,
+                    order_id=order.id,
+                    actor_user_id=None,
+                    event_type="PAYMENT_SUCCEEDED",
+                    from_status="CANCELLED",
+                    to_status="CONFIRMED",
+                    metadata_json={
+                        "provider_intent_id": intent.provider_intent_id,
+                        "event_id": event_id,
+                        "reacquired_after_expiry": True,
+                    },
+                    now=now,
                 )
                 return
 
@@ -1619,18 +1661,18 @@ def mark_order_paid(
             order.payment_status = "REFUNDED"
             order.fulfillment_status = "CANCELLED"
             order.paid_at = now
-            db.add(
-                OrderEvent(
-                    order_id=order.id,
-                    actor_user_id=None,
-                    event_type="PAYMENT_SUCCEEDED_OUT_OF_STOCK",
-                    from_status="CANCELLED",
-                    to_status="REFUNDED",
-                    metadata_json={
-                        "provider_intent_id": intent.provider_intent_id,
-                        "event_id": event_id,
-                    },
-                )
+            append_order_event(
+                db,
+                order_id=order.id,
+                actor_user_id=None,
+                event_type="PAYMENT_SUCCEEDED_OUT_OF_STOCK",
+                from_status="CANCELLED",
+                to_status="REFUNDED",
+                metadata_json={
+                    "provider_intent_id": intent.provider_intent_id,
+                    "event_id": event_id,
+                },
+                now=now,
             )
             return
 
@@ -1640,35 +1682,35 @@ def mark_order_paid(
         order.payment_status = "REFUNDED"
         order.fulfillment_status = "CANCELLED"
         order.paid_at = now
-        db.add(
-            OrderEvent(
-                order_id=order.id,
-                actor_user_id=None,
-                event_type="PAYMENT_SUCCEEDED_AFTER_CANCEL",
-                from_status="CANCELLED",
-                to_status="REFUNDED",
-                metadata_json={
-                    "provider_intent_id": intent.provider_intent_id,
-                    "event_id": event_id,
-                },
-            )
+        append_order_event(
+            db,
+            order_id=order.id,
+            actor_user_id=None,
+            event_type="PAYMENT_SUCCEEDED_AFTER_CANCEL",
+            from_status="CANCELLED",
+            to_status="REFUNDED",
+            metadata_json={
+                "provider_intent_id": intent.provider_intent_id,
+                "event_id": event_id,
+            },
+            now=now,
         )
         return
 
     if intent.status not in ("SUCCEEDED", "REFUNDED"):
         intent.status = "REFUNDED"
-        db.add(
-            OrderEvent(
-                order_id=order.id,
-                actor_user_id=None,
-                event_type="DUPLICATE_PAYMENT_REFUNDED",
-                from_status=order.status,
-                to_status=order.status,
-                metadata_json={
-                    "provider_intent_id": intent.provider_intent_id,
-                    "event_id": event_id,
-                },
-            )
+        append_order_event(
+            db,
+            order_id=order.id,
+            actor_user_id=None,
+            event_type="DUPLICATE_PAYMENT_REFUNDED",
+            from_status=order.status,
+            to_status=order.status,
+            metadata_json={
+                "provider_intent_id": intent.provider_intent_id,
+                "event_id": event_id,
+            },
+            now=now,
         )
 
 
@@ -1690,20 +1732,19 @@ def mark_order_payment_failed(
     intent.failure_message = failure_message
     order.payment_status = "FAILED"
 
-    db.add(
-        OrderEvent(
-            order_id=order.id,
-            actor_user_id=None,
-            event_type="PAYMENT_FAILED",
-            from_status="PENDING_PAYMENT",
-            to_status="PENDING_PAYMENT",
-            metadata_json={
-                "provider_intent_id": intent.provider_intent_id,
-                "event_id": event_id,
-                "failure_code": failure_code,
-                "failure_message": failure_message,
-            },
-        )
+    append_order_event(
+        db,
+        order_id=order.id,
+        actor_user_id=None,
+        event_type="PAYMENT_FAILED",
+        from_status="PENDING_PAYMENT",
+        to_status="PENDING_PAYMENT",
+        metadata_json={
+            "provider_intent_id": intent.provider_intent_id,
+            "event_id": event_id,
+            "failure_code": failure_code,
+            "failure_message": failure_message,
+        },
     )
 
 
@@ -1733,19 +1774,18 @@ def mark_order_refunded(
         or intent.status != "SUCCEEDED"
     ):
         intent.status = "REFUNDED"
-        db.add(
-            OrderEvent(
-                order_id=order.id,
-                actor_user_id=None,
-                event_type="PAYMENT_INTENT_REFUNDED",
-                from_status=order.status,
-                to_status=order.status,
-                metadata_json={
-                    "provider_intent_id": intent.provider_intent_id,
-                    "event_id": event_id,
-                    "reason": "non_winning_or_unpaid_intent_refunded",
-                },
-            )
+        append_order_event(
+            db,
+            order_id=order.id,
+            actor_user_id=None,
+            event_type="PAYMENT_INTENT_REFUNDED",
+            from_status=order.status,
+            to_status=order.status,
+            metadata_json={
+                "provider_intent_id": intent.provider_intent_id,
+                "event_id": event_id,
+                "reason": "non_winning_or_unpaid_intent_refunded",
+            },
         )
         return
 
@@ -1783,16 +1823,15 @@ def mark_order_refunded(
             )
         )
 
-    db.add(
-        OrderEvent(
-            order_id=order.id,
-            actor_user_id=None,
-            event_type="PAYMENT_REFUNDED",
-            from_status=from_status,
-            to_status="REFUNDED",
-            metadata_json={
-                "provider_intent_id": intent.provider_intent_id,
-                "event_id": event_id,
-            },
-        )
+    append_order_event(
+        db,
+        order_id=order.id,
+        actor_user_id=None,
+        event_type="PAYMENT_REFUNDED",
+        from_status=from_status,
+        to_status="REFUNDED",
+        metadata_json={
+            "provider_intent_id": intent.provider_intent_id,
+            "event_id": event_id,
+        },
     )

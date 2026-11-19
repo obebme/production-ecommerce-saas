@@ -31,8 +31,8 @@ router = APIRouter(prefix="/admin/analytics", tags=["analytics"])
 def get_analytics_summary(
     _actor: Annotated[User, Depends(require_roles("staff", "admin"))],
     db: Annotated[Session, Depends(get_db)],
-    from_param: Annotated[str | None, Query(alias="from")] = None,
-    to_param: Annotated[str | None, Query(alias="to")] = None,
+    from_param: Annotated[str | None, Query(alias="from", max_length=64)] = None,
+    to_param: Annotated[str | None, Query(alias="to", max_length=64)] = None,
 ) -> AnalyticsSummaryResponse:
     """Return UTC sales KPI summary and order status breakdown."""
     return service.get_analytics_summary(
@@ -50,8 +50,8 @@ def get_analytics_summary(
 def get_analytics_timeseries(
     _actor: Annotated[User, Depends(require_roles("staff", "admin"))],
     db: Annotated[Session, Depends(get_db)],
-    from_param: Annotated[str | None, Query(alias="from")] = None,
-    to_param: Annotated[str | None, Query(alias="to")] = None,
+    from_param: Annotated[str | None, Query(alias="from", max_length=64)] = None,
+    to_param: Annotated[str | None, Query(alias="to", max_length=64)] = None,
 ) -> AnalyticsTimeseriesResponse:
     """Return continuous zero-filled daily UTC net revenue and paid order counts."""
     return service.get_analytics_timeseries(
@@ -69,8 +69,8 @@ def get_analytics_timeseries(
 def get_analytics_top_products(
     _actor: Annotated[User, Depends(require_roles("staff", "admin"))],
     db: Annotated[Session, Depends(get_db)],
-    from_param: Annotated[str | None, Query(alias="from")] = None,
-    to_param: Annotated[str | None, Query(alias="to")] = None,
+    from_param: Annotated[str | None, Query(alias="from", max_length=64)] = None,
+    to_param: Annotated[str | None, Query(alias="to", max_length=64)] = None,
     sort_by: Annotated[TopProductSortBy, Query()] = "revenue",
     limit: Annotated[int, Query(ge=1, le=50)] = 10,
 ) -> TopProductsResponse:

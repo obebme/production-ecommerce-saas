@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.core.audit import record_audit_log
 from app.core.errors import ConflictError, NotFoundError, ValidationAppError
+from app.core.order_events import append_order_event
 from app.core.pagination import PaginatedResponse, PaginationParams, escape_like_query
 from app.models.catalog import Category, Product
 from app.models.identity import User
@@ -22,7 +23,7 @@ from app.models.inventory import (
     InventoryStock,
     ProductVariant,
 )
-from app.models.order import Order, OrderEvent
+from app.models.order import Order
 from app.models.payment import PaymentIntent
 from app.modules.catalog.schemas import AdminVariantDTO, ProductStatus, ensure_utc_datetime
 from app.modules.catalog.service import (
@@ -231,15 +232,15 @@ def reclaim_expired_reservations_for_variants(
         order.cancelled_at = current_time
         order.cancellation_reason = "RESERVATION_EXPIRED"
 
-        db.add(
-            OrderEvent(
-                order_id=order.id,
-                actor_user_id=None,
-                event_type="ORDER_CANCELLED",
-                from_status="PENDING_PAYMENT",
-                to_status="CANCELLED",
-                metadata_json={"reason": "RESERVATION_EXPIRED"},
-            )
+        append_order_event(
+            db,
+            order_id=order.id,
+            actor_user_id=None,
+            event_type="ORDER_CANCELLED",
+            from_status="PENDING_PAYMENT",
+            to_status="CANCELLED",
+            metadata_json={"reason": "RESERVATION_EXPIRED"},
+            now=current_time,
         )
 
         order_reservations_sorted = sorted(

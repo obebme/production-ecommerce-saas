@@ -17,6 +17,7 @@ from app.core.errors import (
     NotFoundError,
     ValidationAppError,
 )
+from app.core.order_events import append_order_event
 from app.core.pagination import PaginatedResponse, PaginationParams, escape_like_query
 from app.models.identity import AuditLog, User
 from app.models.inventory import InventoryLedgerEntry, InventoryReservation, InventoryStock
@@ -45,11 +46,14 @@ from app.modules.orders.schemas import (
 )
 from app.modules.orders.service import (
     SANDBOX_PROVIDER,
+    lock_order_and_payment_intents_for_update,
     normalize_valid_order_number_or_none,
     to_order_event_dto,
     to_order_item_dto,
 )
 from app.modules.payments.schemas import PaymentIntentDTO
+
+_INT32_MAX = 2_147_483_647
 
 
 class PaymentRefundGateway(Protocol):
@@ -412,15 +416,15 @@ def fulfill_admin_order(
                 message="Only CONFIRMED orders can start processing.",
             )
         order.status = "PROCESSING"
-        db.add(
-            OrderEvent(
-                order_id=order.id,
-                actor_user_id=actor_user_id,
-                event_type="ORDER_PROCESSING_STARTED",
-                from_status=prior_status,
-                to_status="PROCESSING",
-                metadata_json={"note": payload.note},
-            )
+        append_order_event(
+            db,
+            order_id=order.id,
+            actor_user_id=actor_user_id,
+            event_type="ORDER_PROCESSING_STARTED",
+            from_status=prior_status,
+            to_status="PROCESSING",
+            metadata_json={"note": payload.note},
+            now=now,
         )
     elif payload.action == "SHIP":
         if prior_status not in ("CONFIRMED", "PROCESSING"):
@@ -432,19 +436,19 @@ def fulfill_admin_order(
         order.status = "SHIPPED"
         order.fulfillment_status = "SHIPPED"
         order.shipped_at = now
-        db.add(
-            OrderEvent(
-                order_id=order.id,
-                actor_user_id=actor_user_id,
-                event_type="ORDER_SHIPPED",
-                from_status=prior_status,
-                to_status="SHIPPED",
-                metadata_json={
-                    "carrier": payload.carrier,
-                    "tracking_number": payload.tracking_number,
-                    "note": payload.note,
-                },
-            )
+        append_order_event(
+            db,
+            order_id=order.id,
+            actor_user_id=actor_user_id,
+            event_type="ORDER_SHIPPED",
+            from_status=prior_status,
+            to_status="SHIPPED",
+            metadata_json={
+                "carrier": payload.carrier,
+                "tracking_number": payload.tracking_number,
+                "note": payload.note,
+            },
+            now=now,
         )
     elif payload.action == "COMPLETE":
         if prior_status != "SHIPPED":
@@ -456,15 +460,15 @@ def fulfill_admin_order(
         order.status = "COMPLETED"
         order.fulfillment_status = "DELIVERED"
         order.completed_at = now
-        db.add(
-            OrderEvent(
-                order_id=order.id,
-                actor_user_id=actor_user_id,
-                event_type="ORDER_COMPLETED",
-                from_status=prior_status,
-                to_status="COMPLETED",
-                metadata_json={"note": payload.note},
-            )
+        append_order_event(
+            db,
+            order_id=order.id,
+            actor_user_id=actor_user_id,
+            event_type="ORDER_COMPLETED",
+            from_status=prior_status,
+            to_status="COMPLETED",
+            metadata_json={"note": payload.note},
+            now=now,
         )
 
     after_state = {
@@ -513,27 +517,10 @@ def cancel_admin_order(
         )
 
     # Universal lock order: PaymentIntent -> Order -> InventoryReservation -> InventoryStock.
-    intents = list(
-        db.scalars(
-            select(PaymentIntent)
-            .where(PaymentIntent.order_id == order_id)
-            .order_by(PaymentIntent.id.asc())
-            .with_for_update()
-            .execution_options(populate_existing=True)
-        ).all()
+    locked_order, intents = lock_order_and_payment_intents_for_update(
+        db,
+        order_id=order_id,
     )
-    locked_order = db.scalar(
-        select(Order)
-        .where(Order.id == order_id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )
-    if locked_order is None:
-        db.rollback()
-        raise NotFoundError(
-            code="ORDER_NOT_FOUND",
-            message="Order not found.",
-        )
 
     reservations = list(
         db.scalars(
@@ -605,15 +592,15 @@ def cancel_admin_order(
             )
         )
 
-    db.add(
-        OrderEvent(
-            order_id=locked_order.id,
-            actor_user_id=actor_user_id,
-            event_type="ORDER_CANCELLED",
-            from_status="PENDING_PAYMENT",
-            to_status="CANCELLED",
-            metadata_json={"reason": cancel_reason},
-        )
+    append_order_event(
+        db,
+        order_id=locked_order.id,
+        actor_user_id=actor_user_id,
+        event_type="ORDER_CANCELLED",
+        from_status="PENDING_PAYMENT",
+        to_status="CANCELLED",
+        metadata_json={"reason": cancel_reason},
+        now=now,
     )
     record_audit_log(
         db,
@@ -655,27 +642,10 @@ def refund_admin_order(
         )
 
     # Universal lock order: PaymentIntent -> Order -> InventoryReservation -> InventoryStock.
-    intents = list(
-        db.scalars(
-            select(PaymentIntent)
-            .where(PaymentIntent.order_id == order_id)
-            .order_by(PaymentIntent.id.asc())
-            .with_for_update()
-            .execution_options(populate_existing=True)
-        ).all()
+    locked_order, intents = lock_order_and_payment_intents_for_update(
+        db,
+        order_id=order_id,
     )
-    locked_order = db.scalar(
-        select(Order)
-        .where(Order.id == order_id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )
-    if locked_order is None:
-        db.rollback()
-        raise NotFoundError(
-            code="ORDER_NOT_FOUND",
-            message="Order not found.",
-        )
 
     reservations = list(
         db.scalars(
@@ -727,6 +697,22 @@ def refund_admin_order(
             ),
         )
 
+    qty_by_variant: dict[uuid.UUID, int] = {}
+    if payload.restock:
+        for item in order_items:
+            qty_by_variant[item.variant_id] = (
+                qty_by_variant.get(item.variant_id, 0) + item.quantity
+            )
+        for variant_id in sorted(qty_by_variant.keys()):
+            qty = qty_by_variant[variant_id]
+            stock = stocks_by_variant.get(variant_id)
+            if stock is not None and stock.on_hand + qty > _INT32_MAX:
+                db.rollback()
+                raise ValidationAppError(
+                    code="INVALID_STOCK_ADJUSTMENT",
+                    message="Restocked on_hand quantity exceeds maximum supported limit.",
+                )
+
     before_state = _order_audit_snapshot(locked_order)
     prior_status = locked_order.status
     prior_fulfillment = locked_order.fulfillment_status
@@ -756,12 +742,6 @@ def refund_admin_order(
     )
 
     if payload.restock:
-        qty_by_variant: dict[uuid.UUID, int] = {}
-        for item in order_items:
-            qty_by_variant[item.variant_id] = (
-                qty_by_variant.get(item.variant_id, 0) + item.quantity
-            )
-
         base_note = (
             f"Order {locked_order.order_number} refund restock: {payload.reason}"
             if payload.reason
@@ -789,19 +769,18 @@ def refund_admin_order(
                 )
             )
 
-    db.add(
-        OrderEvent(
-            order_id=locked_order.id,
-            actor_user_id=actor_user_id,
-            event_type="ORDER_REFUNDED",
-            from_status=prior_status,
-            to_status="REFUNDED",
-            metadata_json={
-                "reason": payload.reason,
-                "restock": payload.restock,
-                "refund_references": refund_references,
-            },
-        )
+    append_order_event(
+        db,
+        order_id=locked_order.id,
+        actor_user_id=actor_user_id,
+        event_type="ORDER_REFUNDED",
+        from_status=prior_status,
+        to_status="REFUNDED",
+        metadata_json={
+            "reason": payload.reason,
+            "restock": payload.restock,
+            "refund_references": refund_references,
+        },
     )
     record_audit_log(
         db,

@@ -33,6 +33,8 @@ from app.modules.orders.schemas import OrderStatus
 
 MAX_ANALYTICS_SPAN_DAYS = 366
 DEFAULT_ANALYTICS_DAYS = 30
+_MIN_ANALYTICS_DATE = date(1970, 1, 1)
+_MAX_ANALYTICS_DATE = date(9998, 12, 31)
 _DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 CANONICAL_ORDER_STATUSES: tuple[OrderStatus, ...] = (
@@ -56,6 +58,17 @@ class AnalyticsWindow:
     end_exclusive: datetime
 
 
+def _validate_analytics_date(bound_date: date) -> None:
+    if bound_date < _MIN_ANALYTICS_DATE or bound_date > _MAX_ANALYTICS_DATE:
+        raise BadRequestError(
+            code="INVALID_DATE_RANGE",
+            message=(
+                f"Date must be between {_MIN_ANALYTICS_DATE.isoformat()} "
+                f"and {_MAX_ANALYTICS_DATE.isoformat()} UTC."
+            ),
+        )
+
+
 def _parse_analytics_bound(raw: str, *, is_end: bool) -> tuple[datetime, date, bool]:
     if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in raw):
         raise BadRequestError(
@@ -71,6 +84,7 @@ def _parse_analytics_bound(raw: str, *, is_end: bool) -> tuple[datetime, date, b
                 code="INVALID_DATE_RANGE",
                 message=f"Invalid UTC date '{cleaned}'. Expected YYYY-MM-DD.",
             ) from exc
+        _validate_analytics_date(parsed_date)
         if is_end:
             dt = datetime(
                 parsed_date.year,
@@ -109,11 +123,18 @@ def _parse_analytics_bound(raw: str, *, is_end: bool) -> tuple[datetime, date, b
             message="Invalid ISO-8601 date/datetime parameter.",
         ) from exc
 
-    utc_dt = (
-        parsed_dt.replace(tzinfo=UTC)
-        if parsed_dt.tzinfo is None
-        else parsed_dt.astimezone(UTC)
-    )
+    try:
+        utc_dt = (
+            parsed_dt.replace(tzinfo=UTC)
+            if parsed_dt.tzinfo is None
+            else parsed_dt.astimezone(UTC)
+        )
+    except OverflowError as exc:
+        raise BadRequestError(
+            code="INVALID_DATE_RANGE",
+            message="Date/datetime parameter is out of supported UTC calendar bounds.",
+        ) from exc
+    _validate_analytics_date(utc_dt.date())
     return utc_dt, utc_dt.date(), False
 
 
@@ -152,7 +173,13 @@ def parse_analytics_window(
     if cleaned_from is not None:
         start_dt, from_date, from_is_date = _parse_analytics_bound(cleaned_from, is_end=False)
     else:
-        from_date = to_date - timedelta(days=DEFAULT_ANALYTICS_DAYS - 1)
+        try:
+            from_date = to_date - timedelta(days=DEFAULT_ANALYTICS_DAYS - 1)
+        except OverflowError as exc:
+            raise BadRequestError(
+                code="INVALID_DATE_RANGE",
+                message="Date range is out of supported UTC calendar bounds.",
+            ) from exc
         start_dt = datetime(from_date.year, from_date.month, from_date.day, tzinfo=UTC)
         from_is_date = True
 
@@ -175,11 +202,17 @@ def parse_analytics_window(
                 message=f"Date range cannot exceed {MAX_ANALYTICS_SPAN_DAYS} days.",
             )
 
-    end_exclusive = (
-        datetime(to_date.year, to_date.month, to_date.day, tzinfo=UTC) + timedelta(days=1)
-        if to_is_date
-        else to_dt_inclusive + timedelta(microseconds=1)
-    )
+    try:
+        end_exclusive = (
+            datetime(to_date.year, to_date.month, to_date.day, tzinfo=UTC) + timedelta(days=1)
+            if to_is_date
+            else to_dt_inclusive + timedelta(microseconds=1)
+        )
+    except OverflowError as exc:
+        raise BadRequestError(
+            code="INVALID_DATE_RANGE",
+            message="Date range is out of supported UTC calendar bounds.",
+        ) from exc
     return AnalyticsWindow(
         from_date=from_date,
         to_date=to_date,
@@ -309,6 +342,8 @@ def get_analytics_timeseries(
                 paid_orders_count=cnt,
             )
         )
+        if cursor >= window.to_date:
+            break
         cursor += timedelta(days=1)
 
     return AnalyticsTimeseriesResponse(
