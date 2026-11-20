@@ -31,14 +31,14 @@ jobs:
             echo "backend_present=true" >> "$GITHUB_OUTPUT"
           else
             echo "backend_present=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Skipping backend-ci: backend/pyproject.toml or backend/requirements.txt not present yet (pending BE-001)."
+            echo "::notice::Skipping backend-ci: backend/pyproject.toml or backend/requirements.txt not present."
           fi
 
           if [ -d frontend ] && [ -f frontend/package.json ]; then
             echo "frontend_present=true" >> "$GITHUB_OUTPUT"
           else
             echo "frontend_present=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Skipping frontend-ci: frontend/package.json not present yet (pending FE-001)."
+            echo "::notice::Skipping frontend-ci: frontend/package.json not present."
           fi
 
   ops-validate:
@@ -62,7 +62,6 @@ jobs:
           python - <<'PY'
           import pathlib
           import subprocess
-          import sys
           import yaml
 
           # 1. YAML syntax checks
@@ -155,19 +154,20 @@ jobs:
       postgres:
         image: postgres:16-alpine
         env:
-          POSTGRES_USER: ecom_test
-          POSTGRES_PASSWORD: ecom_test_password
-          POSTGRES_DB: ecom_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci_pg_superuser_password
+          POSTGRES_DB: postgres
         ports:
           - 5432:5432
         options: >-
-          --health-cmd="pg_isready -U ecom_test -d ecom_test"
+          --health-cmd="pg_isready -U postgres -d postgres"
           --health-interval=5s
           --health-timeout=5s
           --health-retries=10
     env:
       ENVIRONMENT: test
       DATABASE_URL: postgresql+psycopg://ecom_test:ecom_test_password@localhost:5432/ecom_test
+      TEST_DATABASE_URL: postgresql+psycopg://ecom_test:ecom_test_password@localhost:5432/ecom_test
       COOKIE_SECURE: "false"
       ALLOWED_ORIGINS: http://localhost:3000
       CSRF_HMAC_SECRET: ci_test_only_csrf_hmac_secret_min_32_characters_01
@@ -200,7 +200,36 @@ jobs:
           elif [ -f pyproject.toml ]; then
             pip install -e ".[dev]" || pip install -e .
           fi
-          pip install ruff mypy pytest
+          pip install ruff mypy pytest httpx
+
+      - name: Provision least-privilege PostgreSQL test role and database
+        run: |
+          python - <<'PY'
+          import psycopg
+
+          with psycopg.connect(
+              "postgresql://postgres:ci_pg_superuser_password@localhost:5432/postgres",
+              autocommit=True,
+          ) as conn:
+              with conn.cursor() as cur:
+                  cur.execute(
+                      "DO $$ BEGIN "
+                      "IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ecom_test') THEN "
+                      "CREATE ROLE ecom_test WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE "
+                      "NOINHERIT NOREPLICATION PASSWORD 'ecom_test_password'; "
+                      "END IF; END $$;"
+                  )
+                  cur.execute("SELECT 1 FROM pg_database WHERE datname = 'ecom_test'")
+                  if cur.fetchone() is None:
+                      cur.execute("CREATE DATABASE ecom_test OWNER ecom_test ENCODING 'UTF8'")
+          with psycopg.connect(
+              "postgresql://postgres:ci_pg_superuser_password@localhost:5432/ecom_test",
+              autocommit=True,
+          ) as conn:
+              with conn.cursor() as cur:
+                  cur.execute("GRANT ALL ON SCHEMA public TO ecom_test")
+          print("Provisioned least-privilege role 'ecom_test' and database 'ecom_test'.")
+          PY
 
       - name: Run Ruff lint
         working-directory: backend
@@ -208,7 +237,7 @@ jobs:
 
       - name: Run Mypy typecheck
         working-directory: backend
-        run: mypy app
+        run: mypy app tests/run_disposable_pg_pytest.py tests/test_admin_and_analytics.py
 
       - name: Verify single linear Alembic migration head
         working-directory: backend
@@ -226,18 +255,12 @@ jobs:
         working-directory: backend
         run: alembic upgrade head
 
-      - name: Run pytest suite (when tests exist)
+      - name: Run pytest suite (including live PostgreSQL 16 tests)
         working-directory: backend
-        run: |
-          set -euo pipefail
-          if [ -d tests ] && [ -n "$(find tests -type f \( -name 'test_*.py' -o -name '*_test.py' \) 2>/dev/null)" ]; then
-            pytest
-          else
-            echo "::notice::No pytest files detected in backend/tests yet (pending QA-001)."
-          fi
+        run: pytest -v
 
   frontend-ci:
-    name: Frontend Lint, Typecheck, Build & Tests
+    name: Frontend Lint, Typecheck, Build & Unit Tests
     needs: detect
     if: needs.detect.outputs.frontend_present == 'true'
     runs-on: ubuntu-latest
@@ -249,10 +272,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js 20
+      - name: Setup Node.js 22
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
 
       - name: Install frontend dependencies
         working-directory: frontend
@@ -276,23 +299,240 @@ jobs:
         working-directory: frontend
         run: npm run build
 
-      - name: Run frontend unit tests (when tests exist)
+      - name: Run Vitest unit and component tests
         working-directory: frontend
+        run: npm test
+
+  e2e-ci:
+    name: Full-Stack Playwright E2E (PostgreSQL 16)
+    needs: [backend-ci, frontend-ci]
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci_pg_superuser_password
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d postgres"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      CI: "true"
+      ENVIRONMENT: test
+      DATABASE_URL: postgresql+psycopg://ecom_test:ecom_test_password@localhost:5432/ecom_test
+      COOKIE_SECURE: "false"
+      ALLOWED_ORIGINS: http://localhost:3000
+      PAYMENT_SANDBOX_MODE: "true"
+      SESSION_TTL_HOURS: "168"
+      FREE_SHIPPING_THRESHOLD_CENTS: "10000"
+      STANDARD_SHIPPING_CENTS: "1000"
+      TAX_RATE_BPS: "800"
+      NEXT_TELEMETRY_DISABLED: "1"
+      NEXT_PUBLIC_API_BASE_URL: http://localhost:8000/api/v1
+      INTERNAL_API_BASE_URL: http://127.0.0.1:8000/api/v1
+      NO_PROXY: 127.0.0.1,localhost
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Generate ephemeral CI test secrets and demo credentials
+        run: |
+          python - <<'PY'
+          import os
+          import secrets
+
+          env_pairs = {
+              "CSRF_HMAC_SECRET": secrets.token_urlsafe(32),
+              "GUEST_ORDER_HMAC_SECRET": secrets.token_urlsafe(32),
+              "PAYMENT_WEBHOOK_SECRET": secrets.token_urlsafe(32),
+              "DEMO_ADMIN_PASSWORD": f"E2eAdmin!{secrets.token_hex(8)}",
+              "DEMO_STAFF_PASSWORD": f"E2eStaff!{secrets.token_hex(8)}",
+              "DEMO_CUSTOMER_PASSWORD": f"E2eCust!{secrets.token_hex(8)}",
+          }
+          env_pairs["E2E_ADMIN_PASSWORD"] = env_pairs["DEMO_ADMIN_PASSWORD"]
+          env_pairs["E2E_STAFF_PASSWORD"] = env_pairs["DEMO_STAFF_PASSWORD"]
+          env_pairs["E2E_CUSTOMER_PASSWORD"] = env_pairs["DEMO_CUSTOMER_PASSWORD"]
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fh:
+              for key, value in env_pairs.items():
+                  print(f"::add-mask::{value}")
+                  fh.write(f"{key}={value}\n")
+          print("Generated masked ephemeral CI test secrets and demo passwords.")
+          PY
+
+      - name: Install backend dependencies
+        working-directory: backend
         run: |
           set -euo pipefail
-          if [ -d tests ] && [ -n "$(find tests -type f \( -name '*.test.*' -o -name '*.spec.*' \) 2>/dev/null)" ]; then
-            npm test
-          else
-            echo "::notice::No unit test files detected in frontend/tests yet (pending QA-002)."
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          elif [ -f pyproject.toml ]; then
+            pip install -e .
           fi
 
-      - name: Run Playwright E2E tests (when specs exist)
+      - name: Provision least-privilege PostgreSQL test role and database
+        run: |
+          python - <<'PY'
+          import psycopg
+
+          with psycopg.connect(
+              "postgresql://postgres:ci_pg_superuser_password@localhost:5432/postgres",
+              autocommit=True,
+          ) as conn:
+              with conn.cursor() as cur:
+                  cur.execute(
+                      "DO $$ BEGIN "
+                      "IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ecom_test') THEN "
+                      "CREATE ROLE ecom_test WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE "
+                      "NOINHERIT NOREPLICATION PASSWORD 'ecom_test_password'; "
+                      "END IF; END $$;"
+                  )
+                  cur.execute("SELECT 1 FROM pg_database WHERE datname = 'ecom_test'")
+                  if cur.fetchone() is None:
+                      cur.execute("CREATE DATABASE ecom_test OWNER ecom_test ENCODING 'UTF8'")
+          with psycopg.connect(
+              "postgresql://postgres:ci_pg_superuser_password@localhost:5432/ecom_test",
+              autocommit=True,
+          ) as conn:
+              with conn.cursor() as cur:
+                  cur.execute("GRANT ALL ON SCHEMA public TO ecom_test")
+          print("Provisioned least-privilege role 'ecom_test' and database 'ecom_test'.")
+          PY
+
+      - name: Run Alembic migrations against PostgreSQL 16
+        working-directory: backend
+        run: alembic upgrade head
+
+      - name: Seed demo catalog and demo users
+        working-directory: backend
+        run: python -m app.cli seed-demo --with-demo-users
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Install Playwright Chromium
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+
+      - name: Build Next.js standalone bundle
+        working-directory: frontend
+        run: npm run build
+
+      - name: Start FastAPI backend server
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          nohup uvicorn app.main:app --host 127.0.0.1 --port 8000 </dev/null >/tmp/e2e_uvicorn.log 2>&1 &
+          echo "$!" > /tmp/e2e_uvicorn.pid
+
+      - name: Wait for FastAPI health endpoint
+        run: |
+          set -euo pipefail
+          pid="$(cat /tmp/e2e_uvicorn.pid)"
+          for attempt in $(seq 1 30); do
+            if ! kill -0 "$pid" 2>/dev/null; then
+              echo "ERROR: uvicorn exited prematurely." >&2
+              tail -n 60 /tmp/e2e_uvicorn.log || true
+              exit 1
+            fi
+            if curl -fsS --max-time 3 http://127.0.0.1:8000/api/v1/health | grep -q '"status":"ok"'; then
+              echo "FastAPI health check passed on attempt $attempt."
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "ERROR: Timed out waiting for FastAPI health endpoint." >&2
+          tail -n 60 /tmp/e2e_uvicorn.log || true
+          exit 1
+
+      - name: Start Next.js standalone server
         working-directory: frontend
         run: |
           set -euo pipefail
-          if [ -d e2e ] && [ -n "$(find e2e -type f \( -name '*.spec.ts' -o -name '*.spec.tsx' \) 2>/dev/null)" ]; then
-            npx playwright install --with-deps chromium
-            npx playwright test
-          else
-            echo "::notice::No Playwright E2E specs detected in frontend/e2e yet (pending QA-002)."
+          mkdir -p .next/standalone/.next/static .next/standalone/public
+          cp -a .next/static/. .next/standalone/.next/static/
+          if [ -d public ] && [ -n "$(ls -A public)" ]; then
+            cp -a public/. .next/standalone/public/
           fi
+          HOSTNAME=127.0.0.1 \
+          PORT=3000 \
+          NODE_ENV=production \
+          INTERNAL_API_BASE_URL=http://127.0.0.1:8000/api/v1 \
+            nohup node .next/standalone/server.js </dev/null >/tmp/e2e_nextjs.log 2>&1 &
+          echo "$!" > /tmp/e2e_nextjs.pid
+
+      - name: Wait for Next.js frontend readiness
+        run: |
+          set -euo pipefail
+          pid="$(cat /tmp/e2e_nextjs.pid)"
+          for attempt in $(seq 1 30); do
+            if ! kill -0 "$pid" 2>/dev/null; then
+              echo "ERROR: Next.js standalone server exited prematurely." >&2
+              tail -n 60 /tmp/e2e_nextjs.log || true
+              exit 1
+            fi
+            if curl -fsS --max-time 3 -o /dev/null http://127.0.0.1:3000/; then
+              echo "Next.js readiness check passed on attempt $attempt."
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "ERROR: Timed out waiting for Next.js frontend readiness." >&2
+          tail -n 60 /tmp/e2e_nextjs.log || true
+          exit 1
+
+      - name: Run Playwright E2E suite
+        working-directory: frontend
+        env:
+          E2E_BASE_URL: http://localhost:3000
+        run: npx playwright test
+
+      - name: Upload Playwright failure traces and server logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-failure-diagnostics
+          if-no-files-found: ignore
+          path: |
+            frontend/test-results/
+            /tmp/e2e_uvicorn.log
+            /tmp/e2e_nextjs.log
+          retention-days: 7
+
+      - name: Stop E2E background servers
+        if: always()
+        run: |
+          for pid_file in /tmp/e2e_nextjs.pid /tmp/e2e_uvicorn.pid; do
+            if [ -f "$pid_file" ]; then
+              pid="$(cat "$pid_file" || true)"
+              if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                kill "$pid" 2>/dev/null || true
+                for _ in $(seq 1 10); do
+                  if ! kill -0 "$pid" 2>/dev/null; then
+                    break
+                  fi
+                  sleep 0.5
+                done
+                if kill -0 "$pid" 2>/dev/null; then
+                  kill -9 "$pid" 2>/dev/null || true
+                fi
+              fi
+            fi
+          done

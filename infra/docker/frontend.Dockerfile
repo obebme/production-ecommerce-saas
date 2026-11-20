@@ -1,12 +1,12 @@
 # ==============================================================================
-# Frontend Dockerfile — Next.js App Router (Node 20 Alpine)
+# Frontend Dockerfile — Next.js App Router (Node 22 Alpine)
 # Build context: ./frontend
 #
 # Supports both standard `next start` builds and `output: "standalone"`
 # Next.js configurations automatically without requiring curl in runtime.
 # ==============================================================================
 
-FROM node:20-alpine AS deps
+FROM node:22-alpine AS deps
 
 RUN apk add --no-cache libc6-compat
 WORKDIR /app
@@ -19,7 +19,7 @@ RUN if [ -f package-lock.json ]; then \
     fi
 
 
-FROM node:20-alpine AS builder
+FROM node:22-alpine AS builder
 
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
@@ -43,7 +43,7 @@ RUN mkdir -p public /tmp/runtime-app && \
     fi
 
 
-FROM node:20-alpine AS runner
+FROM node:22-alpine AS runner
 
 WORKDIR /app
 
