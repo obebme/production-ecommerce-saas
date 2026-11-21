@@ -2,7 +2,16 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { AlertCircle, ChevronRight, Minus, Plus, ShoppingBag } from "lucide-react";
+import {
+  AlertCircle,
+  Award,
+  ChevronRight,
+  Minus,
+  Plus,
+  RotateCcw,
+  ShoppingBag,
+  Truck,
+} from "lucide-react";
 import { ApiError, catalogApi, inventoryApi } from "@/lib/api/client";
 import type {
   ProductDetailDTO,
@@ -159,6 +168,8 @@ export function ProductDetailView({
   } | null>(null);
 
   const thumbnailRefs = React.useRef<(HTMLButtonElement | null)[]>([]);
+  const attributeRadioRefs = React.useRef<Record<string, (HTMLButtonElement | null)[]>>({});
+  const variantRadioRefs = React.useRef<(HTMLButtonElement | null)[]>([]);
   const hydratedSlugRef = React.useRef<string | null>(hasInitialProduct ? slug : null);
   const initialErrorSlugRef = React.useRef<string | null>(hasInitialError ? slug : null);
 
@@ -316,6 +327,29 @@ export function ProductDetailView({
     }
   };
 
+  const handleRadioGroupKeyDown = (
+    e: React.KeyboardEvent,
+    count: number,
+    idx: number,
+    onSelectIndex: (nextIdx: number) => void,
+    focusIndex: (nextIdx: number) => void
+  ) => {
+    if (count <= 1) {
+      return;
+    }
+    let nextIdx: number | null = null;
+    if (e.key === "ArrowRight" || e.key === "ArrowDown") {
+      nextIdx = (idx + 1) % count;
+    } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
+      nextIdx = (idx - 1 + count) % count;
+    }
+    if (nextIdx !== null) {
+      e.preventDefault();
+      onSelectIndex(nextIdx);
+      focusIndex(nextIdx);
+    }
+  };
+
   const handleAddToCart = async () => {
     if (!product || !selectedVariant || !liveAvailability?.inStock) {
       return;
@@ -470,49 +504,51 @@ export function ProductDetailView({
         {/* Gallery (55% -> 7/12) */}
         <div className="flex flex-col-reverse gap-4 lg:col-span-7 lg:flex-row">
           {sortedImages.length > 1 ? (
-            <div
-              role="list"
+            <ul
               aria-label="Product gallery thumbnails"
               className="flex gap-3 overflow-x-auto pb-1 lg:w-20 lg:flex-col lg:overflow-visible"
             >
               {sortedImages.map((img, idx) => {
                 const isSelected = idx === selectedImageIndex;
                 return (
-                  <button
-                    key={img.id}
-                    ref={(el) => {
-                      thumbnailRefs.current[idx] = el;
-                    }}
-                    type="button"
-                    aria-label={`View image ${idx + 1} of ${sortedImages.length}`}
-                    aria-current={isSelected ? "true" : undefined}
-                    onClick={() => setSelectedImageIndex(idx)}
-                    onKeyDown={(e) => handleThumbnailKeyDown(e, idx)}
-                    className={cn(
-                      "relative aspect-[4/5] w-16 shrink-0 overflow-hidden rounded-md border bg-muted transition-all lg:w-20",
-                      isSelected
-                        ? "border-accent ring-2 ring-accent ring-offset-2 ring-offset-background"
-                        : "border-border opacity-75 hover:opacity-100"
-                    )}
-                  >
-                    <ProductImage
-                      src={img.url}
-                      alt={img.alt_text || `${product.title} view ${idx + 1}`}
-                      fallbackLabel={product.title}
-                      sizes="80px"
-                    />
-                  </button>
+                  <li key={img.id} className="shrink-0">
+                    <button
+                      ref={(el) => {
+                        thumbnailRefs.current[idx] = el;
+                      }}
+                      type="button"
+                      aria-label={`View image ${idx + 1} of ${sortedImages.length}`}
+                      aria-current={isSelected ? "true" : undefined}
+                      onClick={() => setSelectedImageIndex(idx)}
+                      onKeyDown={(e) => handleThumbnailKeyDown(e, idx)}
+                      className={cn(
+                        "relative aspect-[4/5] w-16 overflow-hidden rounded-xl border bg-card transition-all lg:w-20",
+                        isSelected
+                          ? "border-accent ring-2 ring-accent ring-offset-2 ring-offset-background"
+                          : "border-border opacity-75 hover:opacity-100"
+                      )}
+                    >
+                      <ProductImage
+                        src={img.url}
+                        alt={img.alt_text || `${product.title} view ${idx + 1}`}
+                        fallbackLabel={product.title}
+                        sizes="80px"
+                        className="bg-transparent"
+                      />
+                    </button>
+                  </li>
                 );
               })}
-            </div>
+            </ul>
           ) : null}
 
-          <div className="relative aspect-[4/5] flex-1 overflow-hidden rounded-lg border border-border bg-muted">
+          <div className="relative aspect-[4/5] flex-1 overflow-hidden rounded-[20px] border border-border bg-card bg-[radial-gradient(circle_at_50%_30%,rgba(216,195,161,0.12),transparent_70%)]">
             <ProductImage
               src={activeImage?.url}
               alt={activeImage?.alt_text || product.title}
               fallbackLabel={product.title}
               sizes="(max-width: 1024px) 100vw, 55vw"
+              className="bg-transparent"
               priority
             />
           </div>
@@ -520,23 +556,41 @@ export function ProductDetailView({
 
         {/* Buy Box (45% -> 5/12) */}
         <div className="space-y-6 lg:col-span-5">
-          <div className="space-y-2 border-b border-border pb-6">
-            <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-              {product.category.name}
-            </p>
-            <h1 className="text-2xl font-semibold tracking-[-0.015em] text-foreground sm:text-3xl">
+          <div className="space-y-3 border-b border-border pb-6">
+            <div className="flex flex-wrap items-center gap-2">
+              <Badge variant="outline" className="rounded-full px-3 py-0.5 text-[11px] uppercase tracking-wider">
+                {product.category.name}
+              </Badge>
+              {liveAvailability ? (
+                !liveAvailability.inStock || liveAvailability.availableQuantity <= 0 ? (
+                  <Badge variant="destructive" className="rounded-full px-3 py-0.5">
+                    Out of Stock
+                  </Badge>
+                ) : liveAvailability.lowStock ? (
+                  <Badge variant="warning" className="rounded-full px-3 py-0.5">
+                    Low Stock
+                  </Badge>
+                ) : (
+                  <Badge variant="success" className="rounded-full px-3 py-0.5">
+                    In Stock
+                  </Badge>
+                )
+              ) : null}
+              {savingsPct !== null ? (
+                <Badge variant="accent" className="rounded-full px-3 py-0.5">
+                  -{savingsPct}%
+                </Badge>
+              ) : null}
+            </div>
+
+            <h1 className="text-2xl font-bold tracking-[-0.02em] text-foreground sm:text-3xl">
               {product.title}
             </h1>
-            {selectedVariant ? (
-              <p className="font-mono text-xs text-muted-foreground">
-                SKU: {selectedVariant.sku}
-              </p>
-            ) : null}
 
             {/* Price Display */}
             {selectedVariant ? (
-              <div className="flex flex-wrap items-baseline gap-3 pt-2">
-                <span className="text-2xl font-semibold text-foreground tabular-nums">
+              <div className="flex flex-wrap items-baseline gap-3 pt-1">
+                <span className="text-3xl font-bold text-foreground tabular-nums">
                   {formatCents(selectedVariant.price_cents, selectedVariant.currency)}
                 </span>
                 {selectedVariant.compare_at_price_cents != null &&
@@ -549,7 +603,9 @@ export function ProductDetailView({
                   </span>
                 ) : null}
                 {savingsPct !== null ? (
-                  <Badge variant="accent">Save {savingsPct}%</Badge>
+                  <Badge variant="accentSubtle" className="rounded-full">
+                    Save {savingsPct}%
+                  </Badge>
                 ) : null}
               </div>
             ) : null}
@@ -570,6 +626,8 @@ export function ProductDetailView({
                   const currentValue = selectedVariant
                     ? String(selectedVariant.attributes[group.key]).trim()
                     : "";
+                  const checkedIdx = group.values.findIndex((val) => val === currentValue);
+                  const focusableIdx = checkedIdx >= 0 ? checkedIdx : 0;
                   return (
                     <div key={group.key} className="space-y-2.5">
                       <div className="flex items-center justify-between text-sm">
@@ -581,7 +639,7 @@ export function ProductDetailView({
                         aria-label={group.label}
                         className="flex flex-wrap gap-2"
                       >
-                        {group.values.map((val) => {
+                        {group.values.map((val, idx) => {
                           const isChecked = val === currentValue;
                           // Determine if choosing this value alongside other active attributes maps to an out-of-stock variant
                           const exactVariant = activeVariants.find((v) => {
@@ -608,17 +666,35 @@ export function ProductDetailView({
                           return (
                             <button
                               key={val}
+                              ref={(el) => {
+                                if (!attributeRadioRefs.current[group.key]) {
+                                  attributeRadioRefs.current[group.key] = [];
+                                }
+                                attributeRadioRefs.current[group.key][idx] = el;
+                              }}
                               type="button"
                               role="radio"
                               aria-checked={isChecked}
+                              tabIndex={idx === focusableIdx ? 0 : -1}
                               onClick={() => handleAttributeSelect(group.key, val)}
+                              onKeyDown={(e) =>
+                                handleRadioGroupKeyDown(
+                                  e,
+                                  group.values.length,
+                                  idx,
+                                  (nextIdx) =>
+                                    handleAttributeSelect(group.key, group.values[nextIdx]),
+                                  (nextIdx) =>
+                                    attributeRadioRefs.current[group.key]?.[nextIdx]?.focus()
+                                )
+                              }
                               className={cn(
-                                "min-h-[44px] rounded-md border px-4 py-2 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background lg:min-h-[38px]",
+                                "min-h-[44px] rounded-full border px-4 py-2 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background lg:min-h-[38px]",
                                 isChecked
-                                  ? "border-primary bg-primary text-primary-foreground"
+                                  ? "border-accent bg-accent-subtle text-foreground ring-1 ring-accent"
                                   : isOutOfStock
                                     ? "border-dashed border-border-control bg-surface text-muted-foreground hover:border-foreground"
-                                    : "border-border-control bg-surface text-foreground hover:border-foreground"
+                                    : "border-border-control bg-surface text-foreground hover:border-accent/60"
                               )}
                             >
                               <span>{val}</span>
@@ -640,8 +716,12 @@ export function ProductDetailView({
                     aria-label="Option"
                     className="flex flex-wrap gap-2"
                   >
-                    {activeVariants.map((variant) => {
+                    {activeVariants.map((variant, idx) => {
                       const isChecked = variant.id === selectedVariant?.id;
+                      const checkedIdx = activeVariants.findIndex(
+                        (v) => v.id === selectedVariant?.id
+                      );
+                      const focusableIdx = checkedIdx >= 0 ? checkedIdx : 0;
                       const override = availabilityOverrides[variant.id];
                       const inStock = override
                         ? override.is_active && override.in_stock && override.available_quantity > 0
@@ -649,17 +729,30 @@ export function ProductDetailView({
                       return (
                         <button
                           key={variant.id}
+                          ref={(el) => {
+                            variantRadioRefs.current[idx] = el;
+                          }}
                           type="button"
                           role="radio"
                           aria-checked={isChecked}
+                          tabIndex={idx === focusableIdx ? 0 : -1}
                           onClick={() => handleSelectVariant(variant.id)}
+                          onKeyDown={(e) =>
+                            handleRadioGroupKeyDown(
+                              e,
+                              activeVariants.length,
+                              idx,
+                              (nextIdx) => handleSelectVariant(activeVariants[nextIdx].id),
+                              (nextIdx) => variantRadioRefs.current[nextIdx]?.focus()
+                            )
+                          }
                           className={cn(
-                            "min-h-[44px] rounded-md border px-4 py-2 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background lg:min-h-[38px]",
+                            "min-h-[44px] rounded-full border px-4 py-2 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background lg:min-h-[38px]",
                             isChecked
-                              ? "border-primary bg-primary text-primary-foreground"
+                              ? "border-accent bg-accent-subtle text-foreground ring-1 ring-accent"
                               : !inStock
                                 ? "border-dashed border-border-control bg-surface text-muted-foreground hover:border-foreground"
-                                : "border-border-control bg-surface text-foreground hover:border-foreground"
+                                : "border-border-control bg-surface text-foreground hover:border-accent/60"
                           )}
                         >
                           <span>{variant.title}</span>
@@ -671,26 +764,41 @@ export function ProductDetailView({
                 </div>
               )}
 
-              {/* Live Stock Indicator */}
-              {liveAvailability ? (
-                <div aria-live="polite" className="flex items-center gap-2 pt-1">
-                  {!liveAvailability.inStock || liveAvailability.availableQuantity <= 0 ? (
-                    <Badge variant="destructive">Out of stock</Badge>
-                  ) : liveAvailability.lowStock ? (
-                    <Badge variant="warning" className="tabular-nums">
-                      Low stock — only {liveAvailability.availableQuantity} left
-                    </Badge>
-                  ) : (
-                    <span className="inline-flex items-center gap-2 text-sm font-medium text-success">
-                      <span
-                        className="h-2 w-2 rounded-full bg-success"
-                        aria-hidden="true"
-                      />
-                      In stock
-                    </span>
-                  )}
-                </div>
-              ) : null}
+              {/* Live Stock Indicator & SKU */}
+              <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+                {liveAvailability ? (
+                  <div aria-live="polite" className="flex items-center gap-2">
+                    {!liveAvailability.inStock || liveAvailability.availableQuantity <= 0 ? (
+                      <Badge variant="destructive" className="rounded-full">
+                        Out of stock
+                      </Badge>
+                    ) : liveAvailability.lowStock ? (
+                      <Badge variant="warning" className="rounded-full tabular-nums">
+                        Low stock — only {liveAvailability.availableQuantity} left
+                      </Badge>
+                    ) : (
+                      <span className="inline-flex items-center gap-2 text-sm font-medium text-success tabular-nums">
+                        <span
+                          className="h-2 w-2 rounded-full bg-success"
+                          aria-hidden="true"
+                        />
+                        <span>In stock</span>
+                        <span className="text-xs text-muted-foreground">
+                          ({liveAvailability.availableQuantity} available)
+                        </span>
+                      </span>
+                    )}
+                  </div>
+                ) : (
+                  <span />
+                )}
+
+                {selectedVariant ? (
+                  <p className="font-mono text-xs text-muted-foreground">
+                    SKU: {selectedVariant.sku}
+                  </p>
+                ) : null}
+              </div>
 
               {/* Add Feedback Alert */}
               {addFeedback?.type === "error" ? (
@@ -705,7 +813,9 @@ export function ProductDetailView({
                   <AlertDescription className="mt-1 space-y-2">
                     <p>{addFeedback.message}</p>
                     <Button size="sm" asChild>
-                      <Link href={`/login?returnTo=${encodeURIComponent(`/products/${product.slug}`)}`}>
+                      <Link
+                        href={`/login?returnTo=${encodeURIComponent(`/products/${encodeURIComponent(product.slug)}`)}`}
+                      >
                         Sign In to Continue
                       </Link>
                     </Button>
@@ -720,7 +830,7 @@ export function ProductDetailView({
 
               {/* Quantity Stepper + Add to Cart CTA */}
               <div className="flex flex-col gap-3 sm:flex-row">
-                <div className="inline-flex items-center justify-between rounded-md border border-border-control bg-surface sm:w-36">
+                <div className="inline-flex items-center justify-between rounded-lg border border-border-control bg-surface sm:w-36">
                   <button
                     type="button"
                     disabled={!liveAvailability?.inStock || isAdding || quantity <= 1}
@@ -751,7 +861,7 @@ export function ProductDetailView({
 
                 <Button
                   size="lg"
-                  className="flex-1"
+                  className="flex-1 rounded-lg font-semibold"
                   disabled={!liveAvailability?.inStock || isAdding}
                   aria-busy={isAdding || undefined}
                   onClick={() => void handleAddToCart()}
@@ -766,6 +876,22 @@ export function ProductDetailView({
               </div>
             </div>
           )}
+
+          {/* Compact Storefront Service Guarantees Panel */}
+          <div className="divide-y divide-border rounded-[12px] border border-border bg-card dark:bg-[#14171B]">
+            <div className="flex items-center gap-3 px-4 py-3 text-sm">
+              <Truck className="h-4 w-4 shrink-0 text-accent" aria-hidden="true" />
+              <span className="font-medium text-foreground">Free Shipping Over $100</span>
+            </div>
+            <div className="flex items-center gap-3 px-4 py-3 text-sm">
+              <Award className="h-4 w-4 shrink-0 text-accent" aria-hidden="true" />
+              <span className="font-medium text-foreground">24-Month Quality Guarantee</span>
+            </div>
+            <div className="flex items-center gap-3 px-4 py-3 text-sm">
+              <RotateCcw className="h-4 w-4 shrink-0 text-accent" aria-hidden="true" />
+              <span className="font-medium text-foreground">14-Day Easy Returns</span>
+            </div>
+          </div>
 
           {/* Product Editorial Description */}
           {product.description ? (

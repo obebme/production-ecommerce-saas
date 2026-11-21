@@ -357,7 +357,7 @@ function AddressFields({
             >
               <SelectValue placeholder="Select country" />
             </SelectTrigger>
-            <SelectContent>
+            <SelectContent className="storefront-theme">
               {ISO_COUNTRY_OPTIONS.map((opt) => (
                 <SelectItem key={opt.code} value={opt.code}>
                   {opt.label}

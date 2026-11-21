@@ -98,7 +98,7 @@ export function LoginView() {
         <CardHeader className="space-y-1.5">
           <CardTitle className="font-display text-2xl font-medium">Sign in</CardTitle>
           <CardDescription>
-            Access your Atelier account, saved bag, and order details.
+            Access your Vellora Store account, saved bag, and order details.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-5">
@@ -172,7 +172,7 @@ export function LoginView() {
           </form>
 
           <p className="text-center text-sm text-muted-foreground">
-            New to Atelier?{" "}
+            New to Vellora Store?{" "}
             <Link
               href={
                 rawReturnTo

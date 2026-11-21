@@ -463,8 +463,8 @@ const SEEDED_PRODUCT_SLUGS = [
   "wool-throw-blanket",
 ] as const;
 
-test.describe("REM-P2-M09: Storefront SSR, Dynamic Metadata, HTTP 404 & Asset Resolution", () => {
-  test("5. Raw HTTP SSR HTML, dynamic PDP <title>, real HTTP 404 & all 8 PNG assets load cleanly", async ({
+test.describe("REM-P2-M09 & FE-REDESIGN-001: Storefront SSR, Metadata, Theme, Assets & Mobile Nav", () => {
+  test("5. Raw HTTP SSR HTML, dynamic PDP <title>, theme toggle/persistence, hero & all 8 PNGs, HTTP 404 & mobile nav", async ({
     page,
   }) => {
     for (const route of ["/", "/products", "/products/linen-overshirt"] as const) {
@@ -473,7 +473,7 @@ test.describe("REM-P2-M09: Storefront SSR, Dynamic Metadata, HTTP 404 & Asset Re
       const html = await response.text();
       expect(html, `Expected SSR product content in ${route}`).toContain("Atelier Linen Overshirt");
       if (route === "/products/linen-overshirt") {
-        expect(html).toMatch(/<title>Atelier Linen Overshirt \| Atelier<\/title>/i);
+        expect(html).toMatch(/<title>Atelier Linen Overshirt \| Vellora Store<\/title>/i);
       }
     }
 
@@ -483,6 +483,50 @@ test.describe("REM-P2-M09: Storefront SSR, Dynamic Metadata, HTTP 404 & Asset Re
 
     const notFoundResponse = await page.request.get("/products/nonexistent-product-slug-404");
     expect(notFoundResponse.status()).toBe(404);
+
+    // Home (/): default dark mode, hero showcase PNG, and Light/Dark pill persistence
+    await page.goto("/");
+    await expect(page.locator("html")).toHaveClass(/\bdark\b/);
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+
+    const heroImg = page.locator('main img[src$="/assets/products/hero-showcase.png"]');
+    await expect(heroImg, "Expected rendered hero showcase image on /").toBeVisible();
+    await expect
+      .poll(
+        async () =>
+          heroImg.evaluate((el: HTMLImageElement) => el.complete && el.naturalWidth > 0),
+        { message: "Expected naturalWidth > 0 for /assets/products/hero-showcase.png" }
+      )
+      .toBe(true);
+    const heroAssetRes = await page.request.get("/assets/products/hero-showcase.png");
+    expect(heroAssetRes.status()).toBe(200);
+    expect(heroAssetRes.headers()["content-type"]).toContain("image/png");
+
+    const themeGroup = page.getByRole("group", { name: "Toggle color theme" });
+    await expect(themeGroup).toBeVisible();
+    await themeGroup.getByRole("button", { name: "Light theme" }).click();
+    await expect(page.locator("html")).not.toHaveClass(/\bdark\b/);
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+
+    await page.reload();
+    await expect(page.locator("html")).not.toHaveClass(/\bdark\b/);
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+
+    const themeStorageAudit = await page.evaluate(() => ({
+      localKeys: Object.keys(window.localStorage),
+      themeValue: window.localStorage.getItem("atelier-theme"),
+    }));
+    expect(themeStorageAudit.themeValue).toBe("light");
+    for (const key of themeStorageAudit.localKeys) {
+      expect(SAFE_LOCAL_STORAGE_KEYS.has(key)).toBe(true);
+    }
+
+    await page
+      .getByRole("group", { name: "Toggle color theme" })
+      .getByRole("button", { name: "Dark theme" })
+      .click();
+    await expect(page.locator("html")).toHaveClass(/\bdark\b/);
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
 
     await page.goto("/products");
     await expect(page.getByRole("heading", { level: 1, name: "Collection" })).toBeVisible();
@@ -511,5 +555,19 @@ test.describe("REM-P2-M09: Storefront SSR, Dynamic Metadata, HTTP 404 & Asset Re
     expect(notFoundPageResponse?.status()).toBe(404);
     await expect(page.locator("main")).toHaveCount(1);
     await expect(page.getByRole("heading", { level: 1, name: "Page not found" })).toBeVisible();
+
+    // Mobile viewport (390x844) on /: visible bottom nav links and zero horizontal overflow
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.goto("/");
+    const mobileNav = page.getByRole("navigation", { name: "Mobile bottom navigation" });
+    await expect(mobileNav).toBeVisible();
+    for (const label of ["Home", "Catalog", "Cart", "Account"] as const) {
+      await expect(mobileNav.getByRole("link", { name: label })).toBeVisible();
+    }
+    const mobileOverflow = await page.evaluate(() => ({
+      scrollWidth: document.documentElement.scrollWidth,
+      innerWidth: window.innerWidth,
+    }));
+    expect(mobileOverflow.scrollWidth).toBeLessThanOrEqual(mobileOverflow.innerWidth);
   });
 });

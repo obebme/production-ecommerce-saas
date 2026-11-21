@@ -13,7 +13,7 @@ export const dynamic = "force-dynamic";
 
 export const metadata: Metadata = {
   title: "Shop All Products",
-  description: "Filter and browse the active Atelier catalog with live variant availability.",
+  description: "Filter and browse the active Vellora Store catalog with live variant availability.",
 };
 
 function CatalogFallback() {

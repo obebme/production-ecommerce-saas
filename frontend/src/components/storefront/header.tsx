@@ -19,6 +19,7 @@ import type { CategoryPublicDTO } from "@/lib/api/types";
 import { useAuth } from "@/providers/auth-provider";
 import { useCart } from "@/providers/cart-provider";
 import { ThemeToggle } from "@/components/shared/theme-toggle";
+import { VelloraLogo } from "@/components/storefront/vellora-logo";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -105,9 +106,9 @@ export function StorefrontHeader() {
   };
 
   return (
-    <header className="sticky top-0 z-40 border-b border-border bg-background/95 backdrop-blur">
+    <header className="sticky top-0 z-40 border-b border-border bg-background/90 backdrop-blur-md">
       <div className="mx-auto flex h-16 max-w-[1440px] items-center justify-between gap-3 px-4 sm:px-6 lg:px-8">
-        {/* Left: Mobile Menu + Wordmark + Primary Desktop Nav */}
+        {/* Left: Mobile Menu + Vellora Logo + Primary Desktop Nav */}
         <div className="flex items-center gap-2 lg:gap-8">
           <Button
             variant="ghost"
@@ -121,17 +122,17 @@ export function StorefrontHeader() {
 
           <Link
             href="/"
-            className="font-display text-2xl font-medium tracking-tight text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring rounded-sm"
+            className="rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
-            Atelier
+            <VelloraLogo />
           </Link>
 
           <nav aria-label="Primary" className="hidden lg:flex lg:items-center lg:gap-6">
             <Link
               href="/products"
-              className="text-sm font-medium text-foreground transition-colors hover:text-accent"
+              className="text-sm font-medium text-foreground/90 transition-colors hover:text-accent"
             >
-              Shop All
+              Catalog
             </Link>
 
             {categories.length > 0 ? (
@@ -139,13 +140,16 @@ export function StorefrontHeader() {
                 <DropdownMenuTrigger asChild>
                   <button
                     type="button"
-                    className="inline-flex items-center gap-1 rounded-sm text-sm font-medium text-foreground transition-colors hover:text-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    className="inline-flex items-center gap-1 rounded-sm text-sm font-medium text-foreground/90 transition-colors hover:text-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   >
                     Categories
                     <ChevronDown className="h-3.5 w-3.5" aria-hidden="true" />
                   </button>
                 </DropdownMenuTrigger>
-                <DropdownMenuContent align="start" className="w-60 max-h-96 overflow-y-auto">
+                <DropdownMenuContent
+                  align="start"
+                  className="storefront-theme max-h-96 w-60 overflow-y-auto"
+                >
                   <DropdownMenuItem asChild>
                     <Link href="/products" className="font-medium">
                       All Categories
@@ -180,19 +184,33 @@ export function StorefrontHeader() {
                 </DropdownMenuContent>
               </DropdownMenu>
             ) : null}
+
+            <Link
+              href="/products?sort=newest"
+              className="text-sm font-medium text-foreground/90 transition-colors hover:text-accent"
+            >
+              New Arrivals
+            </Link>
+
+            <Link
+              href="/products?in_stock=true"
+              className="text-sm font-medium text-foreground/90 transition-colors hover:text-accent"
+            >
+              In Stock
+            </Link>
           </nav>
         </div>
 
-        {/* Center/Right: Search + Theme + Account + Cart */}
+        {/* Center/Right: Search + Theme Pill + Account + Cart */}
         <div className="flex items-center gap-1.5 sm:gap-2.5">
           <form
             onSubmit={handleSearchSubmit}
             role="search"
             aria-label="Search products"
-            className="relative hidden md:block md:w-56 lg:w-72"
+            className="relative hidden md:block md:w-52 lg:w-64 xl:w-72"
           >
             <Search
-              className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground"
+              className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground"
               aria-hidden="true"
             />
             <Input
@@ -200,9 +218,9 @@ export function StorefrontHeader() {
               value={searchValue}
               onChange={(e) => setSearchValue(e.target.value)}
               maxLength={100}
-              placeholder="Search products..."
+              placeholder="Search goods..."
               aria-label="Search products"
-              className="h-9 pl-9 pr-8 text-sm"
+              className="h-9 rounded-full border-border bg-surface pl-9 pr-8 text-sm"
             />
             {searchValue ? (
               <button
@@ -228,12 +246,12 @@ export function StorefrontHeader() {
           </Button>
 
           <div className="hidden sm:block">
-            <ThemeToggle />
+            <ThemeToggle variant="pill" />
           </div>
 
           {/* Account Controls */}
           {authLoading ? (
-            <Skeleton className="hidden h-9 w-24 sm:block" />
+            <Skeleton className="hidden h-9 w-24 rounded-full sm:block" />
           ) : user ? (
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
@@ -243,7 +261,7 @@ export function StorefrontHeader() {
                   <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" aria-hidden="true" />
                 </Button>
               </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="w-56">
+              <DropdownMenuContent align="end" className="storefront-theme w-56">
                 <DropdownMenuLabel className="font-normal">
                   <div className="flex flex-col space-y-0.5">
                     <span className="truncate text-sm font-semibold text-foreground">
@@ -288,7 +306,7 @@ export function StorefrontHeader() {
               <Button variant="ghost" size="sm" asChild>
                 <Link href="/login">Sign In</Link>
               </Button>
-              <Button variant="outline" size="sm" asChild>
+              <Button variant="outline" size="sm" asChild className="rounded-full">
                 <Link href="/register">Create Account</Link>
               </Button>
             </div>
@@ -300,12 +318,12 @@ export function StorefrontHeader() {
             size="default"
             onClick={openDrawer}
             aria-label={`Open cart, ${itemCount} ${itemCount === 1 ? "item" : "items"}`}
-            className="relative gap-2 px-2.5 sm:px-3"
+            className="relative gap-2 rounded-full px-2.5 sm:px-3"
           >
             <ShoppingBag className="h-5 w-5" aria-hidden="true" />
             <span
               aria-live="polite"
-              className="inline-flex min-w-[1.35rem] items-center justify-center rounded-full bg-primary px-1.5 py-0.5 text-xs font-semibold text-primary-foreground tabular-nums"
+              className="inline-flex min-w-[1.35rem] items-center justify-center rounded-full bg-accent px-1.5 py-0.5 text-xs font-semibold text-accent-foreground tabular-nums"
             >
               {itemCount}
             </span>
@@ -323,9 +341,9 @@ export function StorefrontHeader() {
               value={searchValue}
               onChange={(e) => setSearchValue(e.target.value)}
               maxLength={100}
-              placeholder="Search products..."
+              placeholder="Search goods..."
               aria-label="Search products"
-              className="flex-1"
+              className="flex-1 rounded-full"
             />
             <Button type="submit" size="default">
               Search
@@ -336,18 +354,34 @@ export function StorefrontHeader() {
 
       {/* Mobile Navigation Drawer */}
       <Sheet open={mobileMenuOpen} onOpenChange={setMobileMenuOpen}>
-        <SheetContent side="left" className="p-0">
+        <SheetContent side="left" className="storefront-theme p-0">
           <SheetHeader>
-            <SheetTitle className="font-display text-xl font-medium">Atelier</SheetTitle>
+            <SheetTitle>
+              <VelloraLogo />
+            </SheetTitle>
           </SheetHeader>
           <div className="flex-1 space-y-6 overflow-y-auto px-6 py-5">
-            <nav aria-label="Mobile navigation" className="space-y-4">
+            <nav aria-label="Mobile navigation" className="space-y-3">
               <Link
                 href="/products"
                 onClick={() => setMobileMenuOpen(false)}
                 className="block py-1.5 text-base font-medium text-foreground hover:text-accent"
               >
-                Shop All
+                Catalog
+              </Link>
+              <Link
+                href="/products?sort=newest"
+                onClick={() => setMobileMenuOpen(false)}
+                className="block py-1.5 text-base font-medium text-foreground hover:text-accent"
+              >
+                New Arrivals
+              </Link>
+              <Link
+                href="/products?in_stock=true"
+                onClick={() => setMobileMenuOpen(false)}
+                className="block py-1.5 text-base font-medium text-foreground hover:text-accent"
+              >
+                In Stock
               </Link>
 
               {categories.length > 0 ? (
@@ -398,7 +432,7 @@ export function StorefrontHeader() {
                 <div className="space-y-1">
                   <p className="text-sm font-semibold text-foreground">{user.full_name}</p>
                   <p className="text-xs text-muted-foreground">{user.email}</p>
-                  <div className="pt-2 space-y-1">
+                  <div className="space-y-1 pt-2">
                     <Link
                       href="/account"
                       onClick={() => setMobileMenuOpen(false)}

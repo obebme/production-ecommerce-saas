@@ -19,6 +19,7 @@ function applyThemeToDocument(theme: ThemeMode) {
     return;
   }
   const root = document.documentElement;
+  root.dataset.theme = theme;
   if (theme === "dark") {
     root.classList.add("dark");
   } else {
@@ -27,19 +28,14 @@ function applyThemeToDocument(theme: ThemeMode) {
 }
 
 export function ThemeProvider({ children }: { children: React.ReactNode }) {
-  const [theme, setThemeState] = React.useState<ThemeMode>("light");
+  const [theme, setThemeState] = React.useState<ThemeMode>("dark");
 
   React.useEffect(() => {
-    let resolved: ThemeMode = "light";
+    let resolved: ThemeMode = "dark";
     try {
       const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
       if (stored === "light" || stored === "dark") {
         resolved = stored;
-      } else if (
-        typeof window.matchMedia === "function" &&
-        window.matchMedia("(prefers-color-scheme: dark)").matches
-      ) {
-        resolved = "dark";
       }
     } catch {
       // Ignore storage access errors in restricted browser contexts

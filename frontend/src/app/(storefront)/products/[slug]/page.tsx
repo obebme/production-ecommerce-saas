@@ -49,7 +49,7 @@ export async function generateMetadata({
     const primaryImage = sortedImages.find((img) => img.is_primary) ?? sortedImages[0] ?? null;
     const safeImageUrl = sanitizeMediaUrl(primaryImage?.url);
     const description =
-      product.description || `${product.title} — ${product.category.name} at Atelier.`;
+      product.description || `${product.title} — ${product.category.name} at Vellora Store.`;
 
     return {
       title: product.title,

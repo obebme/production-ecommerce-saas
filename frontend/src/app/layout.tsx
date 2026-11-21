@@ -12,8 +12,8 @@ import { AuthProvider } from "@/providers/auth-provider";
 export const metadata: Metadata = {
   metadataBase: resolveSiteUrl(),
   title: {
-    default: "Atelier — Considered Everyday Goods",
-    template: "%s | Atelier",
+    default: "Vellora Store — Considered Everyday Goods",
+    template: "%s | Vellora Store",
   },
   description:
     "Curated apparel and everyday objects crafted with transparent materials and live inventory precision.",
@@ -25,7 +25,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" suppressHydrationWarning>
+    <html lang="en" className="dark" suppressHydrationWarning>
       <body className="min-h-screen bg-background font-sans text-foreground antialiased">
         <ThemeProvider>
           <ToastProvider>

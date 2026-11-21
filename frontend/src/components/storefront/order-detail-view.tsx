@@ -1262,7 +1262,7 @@ export function OrderDetailView({ orderNumber }: { orderNumber: string }) {
 
       {/* Self-Cancel Confirmation Dialog */}
       <Dialog open={cancelDialogOpen} onOpenChange={setCancelDialogOpen}>
-        <DialogContent>
+        <DialogContent className="storefront-theme">
           <DialogHeader>
             <DialogTitle>Cancel Order &amp; Release Reserved Stock?</DialogTitle>
             <DialogDescription>

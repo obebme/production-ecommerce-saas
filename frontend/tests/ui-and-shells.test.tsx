@@ -23,6 +23,7 @@ import { AdminRoleGuard } from "@/components/admin/admin-primitives";
 import { AdminShell } from "@/components/admin/admin-shell";
 import ProductDetailPage from "@/app/(storefront)/products/[slug]/page";
 import { ThemeProvider } from "@/components/shared/theme-provider";
+import { ThemeToggle } from "@/components/shared/theme-toggle";
 import {
   EmptyState,
   ErrorState,
@@ -31,6 +32,7 @@ import {
 } from "@/components/shared/state-feedback";
 import { LoginView } from "@/components/storefront/auth-views";
 import { StorefrontHeader } from "@/components/storefront/header";
+import { MobileBottomNav } from "@/components/storefront/mobile-bottom-nav";
 import { ProductCard } from "@/components/storefront/product-card";
 import { ProductDetailView } from "@/components/storefront/product-detail-view";
 import { ToastProvider } from "@/components/ui/toast";
@@ -454,8 +456,17 @@ describe("ProductDetailView", () => {
     expect(colorGroup).toBeInTheDocument();
     expect(sizeGroup).toBeInTheDocument();
 
-    // Switch to Size L -> updates SKU, price, savings, and Low stock badge
-    fireEvent.click(within(sizeGroup).getByRole("radio", { name: /^L/ }));
+    const sizeRadioM = within(sizeGroup).getByRole("radio", { name: /^M/ });
+    const sizeRadioL = within(sizeGroup).getByRole("radio", { name: /^L/ });
+    expect(sizeRadioM).toHaveAttribute("tabindex", "0");
+    expect(sizeRadioL).toHaveAttribute("tabindex", "-1");
+
+    // Keyboard ArrowRight roving focus & selection to Size L -> updates SKU, price, savings, and Low stock badge
+    sizeRadioM.focus();
+    fireEvent.keyDown(sizeRadioM, { key: "ArrowRight" });
+    expect(sizeRadioL).toHaveFocus();
+    expect(sizeRadioL).toHaveAttribute("tabindex", "0");
+    expect(sizeRadioM).toHaveAttribute("tabindex", "-1");
     expect(screen.getByText("SKU: TEE-CHR-L")).toBeInTheDocument();
     expect(screen.getByText("$49.00")).toBeInTheDocument();
     expect(screen.getByText("Save 18%")).toBeInTheDocument();
@@ -963,6 +974,7 @@ describe("StorefrontHeader", () => {
 
     renderWithAppProviders(<StorefrontHeader />);
 
+    expect(screen.getByRole("link", { name: "Vellora Store" })).toHaveAttribute("href", "/");
     await waitFor(() => {
       expect(screen.getByRole("button", { name: "Open cart, 3 items" })).toBeInTheDocument();
     });
@@ -1075,5 +1087,87 @@ describe("SEC-M09-03 & Not-Found landmarks", () => {
     render(<StorefrontNotFoundPage />);
     expect(screen.queryByRole("main")).not.toBeInTheDocument();
     expect(screen.getByRole("heading", { level: 1, name: "Page not found" })).toBeInTheDocument();
+  });
+});
+
+describe("FE-REDESIGN-001: ThemeProvider, ThemeToggle (pill) & MobileBottomNav", () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    mockPathname = "/";
+    window.localStorage.removeItem("atelier-theme");
+    document.documentElement.className = "";
+    delete document.documentElement.dataset.theme;
+    fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  afterEach(() => {
+    cleanup();
+    window.localStorage.removeItem("atelier-theme");
+    document.documentElement.className = "";
+    delete document.documentElement.dataset.theme;
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it("defaults ThemeProvider to dark mode (html.dark) and switches cleanly via ThemeToggle variant='pill'", () => {
+    render(
+      <ThemeProvider>
+        <ThemeToggle variant="pill" />
+      </ThemeProvider>
+    );
+
+    expect(document.documentElement).toHaveClass("dark");
+    expect(document.documentElement.dataset.theme).toBe("dark");
+    expect(window.localStorage.getItem("atelier-theme")).toBeNull();
+
+    const group = screen.getByRole("group", { name: "Toggle color theme" });
+    const lightBtn = within(group).getByRole("button", { name: "Light theme" });
+    const darkBtn = within(group).getByRole("button", { name: "Dark theme" });
+    expect(lightBtn).toHaveAttribute("aria-pressed", "false");
+    expect(darkBtn).toHaveAttribute("aria-pressed", "true");
+
+    // Switch to light mode
+    fireEvent.click(lightBtn);
+    expect(document.documentElement).not.toHaveClass("dark");
+    expect(document.documentElement.dataset.theme).toBe("light");
+    expect(window.localStorage.getItem("atelier-theme")).toBe("light");
+    expect(lightBtn).toHaveAttribute("aria-pressed", "true");
+    expect(darkBtn).toHaveAttribute("aria-pressed", "false");
+
+    // Switch back to dark mode
+    fireEvent.click(darkBtn);
+    expect(document.documentElement).toHaveClass("dark");
+    expect(document.documentElement.dataset.theme).toBe("dark");
+    expect(window.localStorage.getItem("atelier-theme")).toBe("dark");
+    expect(lightBtn).toHaveAttribute("aria-pressed", "false");
+    expect(darkBtn).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("renders MobileBottomNav with accessible Home, Catalog, Cart, and Account controls", async () => {
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/auth/me")) {
+        return errorResponse(401, "AUTH_REQUIRED", "Authentication required.");
+      }
+      if (url.endsWith("/cart")) {
+        return jsonResponse(makeEmptyCart());
+      }
+      return errorResponse(404, "NOT_FOUND", `Unexpected ${url}`);
+    });
+
+    renderWithAppProviders(<MobileBottomNav />);
+
+    const nav = screen.getByRole("navigation", { name: "Mobile bottom navigation" });
+    expect(within(nav).getByRole("link", { name: "Home" })).toHaveAttribute("href", "/");
+    expect(within(nav).getByRole("link", { name: "Home" })).toHaveAttribute("aria-current", "page");
+    expect(within(nav).getByRole("link", { name: "Catalog" })).toHaveAttribute("href", "/products");
+    expect(within(nav).getByRole("link", { name: "Cart" })).toHaveAttribute("href", "/cart");
+    expect(within(nav).getByRole("link", { name: "Account" })).toHaveAttribute("href", "/login");
+
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith("/cart"))).toBe(true);
+    });
   });
 });

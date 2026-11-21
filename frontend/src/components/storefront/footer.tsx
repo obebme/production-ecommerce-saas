@@ -4,6 +4,7 @@ import * as React from "react";
 import Link from "next/link";
 import { catalogApi, healthApi } from "@/lib/api/client";
 import type { CategoryPublicDTO, HealthDTO } from "@/lib/api/types";
+import { VelloraLogo } from "@/components/storefront/vellora-logo";
 import { Badge } from "@/components/ui/badge";
 
 export function StorefrontFooter() {
@@ -26,8 +27,21 @@ export function StorefrontFooter() {
   }, []);
 
   return (
-    <footer className="border-t border-border bg-surface text-foreground">
-      <div className="mx-auto grid max-w-[1440px] gap-10 px-4 py-12 sm:px-6 md:grid-cols-3 lg:px-8">
+    <footer className="border-t border-border bg-surface text-foreground dark:bg-[#14171B]">
+      <div className="mx-auto grid max-w-[1440px] gap-10 px-4 py-12 sm:px-6 md:grid-cols-4 lg:px-8">
+        <div className="space-y-3">
+          <Link
+            href="/"
+            className="inline-flex rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <VelloraLogo />
+          </Link>
+          <p className="max-w-xs text-xs leading-relaxed text-muted-foreground">
+            Considered everyday objects, natural textiles, and home essentials backed by live
+            studio inventory.
+          </p>
+        </div>
+
         <div className="space-y-3">
           <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
             Shop
@@ -109,14 +123,14 @@ export function StorefrontFooter() {
             </p>
           ) : (
             <p className="text-xs leading-relaxed text-muted-foreground">
-              Atelier Modular Commerce Platform. Server-authoritative pricing and inventory
+              Vellora Store Modular Commerce Platform. Server-authoritative pricing and inventory
               validation.
             </p>
           )}
         </div>
       </div>
       <div className="border-t border-border px-4 py-4 text-center text-xs text-muted-foreground sm:px-6 lg:px-8">
-        © {new Date().getFullYear()} Atelier. All prices in USD.
+        © {new Date().getFullYear()} Vellora Store. All prices in USD.
       </div>
     </footer>
   );

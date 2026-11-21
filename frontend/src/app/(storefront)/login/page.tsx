@@ -5,7 +5,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 
 export const metadata: Metadata = {
   title: "Sign In",
-  description: "Sign in to your Atelier account.",
+  description: "Sign in to your Vellora Store account.",
 };
 
 export default function LoginPage() {

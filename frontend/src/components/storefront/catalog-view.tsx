@@ -421,7 +421,10 @@ export function CatalogView({
     <div ref={gridTopRef} className="mx-auto max-w-[1440px] px-4 py-10 sm:px-6 lg:px-8">
       {/* Page Header */}
       <div className="mb-8 border-b border-border pb-6">
-        <h1 className="font-display text-3xl font-medium tracking-[-0.02em] text-foreground sm:text-4xl">
+        <p className="text-xs font-semibold uppercase tracking-[0.16em] text-accent">
+          Vellora Catalog
+        </p>
+        <h1 className="mt-1.5 text-3xl font-bold tracking-[-0.02em] text-foreground sm:text-4xl">
           {activeCategoryName ?? "Collection"}
         </h1>
         <p className="mt-2 text-sm text-muted-foreground">
@@ -438,7 +441,7 @@ export function CatalogView({
           aria-label="Product filters"
           className="hidden w-[260px] shrink-0 lg:block"
         >
-          <div className="sticky top-24 rounded-lg border border-border bg-surface p-5">
+          <div className="sticky top-24 rounded-[12px] border border-border bg-card p-5 dark:bg-[#14171B]">
             {renderFilterControls()}
           </div>
         </aside>
@@ -480,10 +483,10 @@ export function CatalogView({
                 value={sort}
                 onValueChange={(value) => updateUrlParams({ sort: value })}
               >
-                <SelectTrigger id="catalog-sort-select" className="w-[190px]">
+                <SelectTrigger id="catalog-sort-select" className="w-[190px] rounded-lg">
                   <SelectValue />
                 </SelectTrigger>
-                <SelectContent>
+                <SelectContent className="storefront-theme">
                   <SelectItem value="newest">Newest</SelectItem>
                   <SelectItem value="price_asc">Price: Low to High</SelectItem>
                   <SelectItem value="price_desc">Price: High to Low</SelectItem>
@@ -497,13 +500,16 @@ export function CatalogView({
           {activeFilterCount > 0 ? (
             <div className="flex flex-wrap items-center gap-2" aria-label="Active filters">
               {categorySlug ? (
-                <Badge variant="secondary" className="gap-1.5 py-1 pl-2.5 pr-1.5">
+                <Badge
+                  variant="accentSubtle"
+                  className="gap-1.5 rounded-full py-1 pl-3 pr-2"
+                >
                   <span>Category: {activeCategoryName}</span>
                   <button
                     type="button"
                     aria-label="Remove category filter"
                     onClick={() => updateUrlParams({ category_slug: undefined })}
-                    className="rounded-sm p-0.5 hover:bg-muted"
+                    className="rounded-full p-0.5 hover:bg-muted"
                   >
                     <X className="h-3 w-3" aria-hidden="true" />
                   </button>
@@ -511,13 +517,16 @@ export function CatalogView({
               ) : null}
 
               {searchQuery ? (
-                <Badge variant="secondary" className="gap-1.5 py-1 pl-2.5 pr-1.5">
+                <Badge
+                  variant="accentSubtle"
+                  className="gap-1.5 rounded-full py-1 pl-3 pr-2"
+                >
                   <span>Search: {searchQuery}</span>
                   <button
                     type="button"
                     aria-label="Remove search filter"
                     onClick={() => updateUrlParams({ q: undefined })}
-                    className="rounded-sm p-0.5 hover:bg-muted"
+                    className="rounded-full p-0.5 hover:bg-muted"
                   >
                     <X className="h-3 w-3" aria-hidden="true" />
                   </button>
@@ -525,7 +534,10 @@ export function CatalogView({
               ) : null}
 
               {minPriceCents !== undefined || maxPriceCents !== undefined ? (
-                <Badge variant="secondary" className="gap-1.5 py-1 pl-2.5 pr-1.5 tabular-nums">
+                <Badge
+                  variant="accentSubtle"
+                  className="gap-1.5 rounded-full py-1 pl-3 pr-2 tabular-nums"
+                >
                   <span>
                     Price: {minPriceCents !== undefined ? formatCents(minPriceCents) : "$0.00"} –{" "}
                     {maxPriceCents !== undefined ? formatCents(maxPriceCents) : "Any"}
@@ -539,7 +551,7 @@ export function CatalogView({
                         max_price_cents: undefined,
                       })
                     }
-                    className="rounded-sm p-0.5 hover:bg-muted"
+                    className="rounded-full p-0.5 hover:bg-muted"
                   >
                     <X className="h-3 w-3" aria-hidden="true" />
                   </button>
@@ -547,13 +559,16 @@ export function CatalogView({
               ) : null}
 
               {inStockOnly ? (
-                <Badge variant="secondary" className="gap-1.5 py-1 pl-2.5 pr-1.5">
+                <Badge
+                  variant="accentSubtle"
+                  className="gap-1.5 rounded-full py-1 pl-3 pr-2"
+                >
                   <span>In stock only</span>
                   <button
                     type="button"
                     aria-label="Remove in-stock filter"
                     onClick={() => updateUrlParams({ in_stock: undefined })}
-                    className="rounded-sm p-0.5 hover:bg-muted"
+                    className="rounded-full p-0.5 hover:bg-muted"
                   >
                     <X className="h-3 w-3" aria-hidden="true" />
                   </button>
@@ -630,7 +645,7 @@ export function CatalogView({
 
       {/* Mobile Filters Sheet */}
       <Sheet open={mobileFiltersOpen} onOpenChange={setMobileFiltersOpen}>
-        <SheetContent side="left" className="flex flex-col p-0">
+        <SheetContent side="left" className="storefront-theme flex flex-col p-0">
           <SheetHeader>
             <SheetTitle>Filter Products</SheetTitle>
           </SheetHeader>

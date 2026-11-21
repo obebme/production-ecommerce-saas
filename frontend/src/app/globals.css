@@ -173,6 +173,153 @@
   --shadow-lg: none;
 }
 
+/* Vellora Storefront — Light Mode */
+.storefront-theme {
+  --font-display: var(--font-sans);
+
+  --background: #F6F4EF;
+  --background-rgb: 246 244 239;
+  --foreground: #121417;
+  --foreground-rgb: 18 20 23;
+  --surface: #FFFFFF;
+  --surface-rgb: 255 255 255;
+  --surface-foreground: #121417;
+  --surface-foreground-rgb: 18 20 23;
+  --card: #FFFFFF;
+  --card-foreground: #121417;
+  --popover: #FFFFFF;
+  --popover-foreground: #121417;
+
+  --muted: #ECE8DF;
+  --muted-rgb: 236 232 223;
+  --muted-foreground: #57534E;
+  --muted-foreground-rgb: 87 83 78;
+
+  --primary: #181A1F;
+  --primary-rgb: 24 26 31;
+  --primary-foreground: #F6F4EF;
+  --primary-foreground-rgb: 246 244 239;
+
+  --secondary: #E7E2D8;
+  --secondary-rgb: 231 226 216;
+  --secondary-foreground: #121417;
+  --secondary-foreground-rgb: 18 20 23;
+
+  --accent: #755932;
+  --accent-rgb: 117 89 50;
+  --accent-foreground: #FFFFFF;
+  --accent-foreground-rgb: 255 255 255;
+  --accent-subtle: #EDE6D8;
+  --accent-subtle-rgb: 237 230 216;
+
+  --destructive: #B91C1C;
+  --destructive-rgb: 185 28 28;
+  --destructive-foreground: #FFFFFF;
+  --destructive-foreground-rgb: 255 255 255;
+  --destructive-subtle: #FEF2F2;
+  --destructive-subtle-rgb: 254 242 242;
+
+  --warning: #B45309;
+  --warning-rgb: 180 83 9;
+  --warning-foreground: #FFFFFF;
+  --warning-foreground-rgb: 255 255 255;
+  --warning-subtle: #FFFBEB;
+  --warning-subtle-rgb: 255 251 235;
+  --warning-subtle-foreground: #92400E;
+  --warning-subtle-foreground-rgb: 146 64 14;
+
+  --success: #15803D;
+  --success-rgb: 21 128 61;
+  --success-foreground: #FFFFFF;
+  --success-foreground-rgb: 255 255 255;
+  --success-subtle: #F0FDF4;
+  --success-subtle-rgb: 240 253 244;
+
+  --border: #DCD6CA;
+  --border-rgb: 220 214 202;
+  --border-control: #8A8377;
+  --border-control-rgb: 138 131 119;
+  --input: #8A8377;
+  --ring: #755932;
+  --ring-rgb: 117 89 50;
+}
+
+/* Vellora Storefront — Dark Mode (Default) */
+.dark .storefront-theme {
+  --font-display: var(--font-sans);
+
+  --background: #0B0D0F;
+  --background-rgb: 11 13 15;
+  --foreground: #F5F3EE;
+  --foreground-rgb: 245 243 238;
+  --surface: #1A1D21;
+  --surface-rgb: 26 29 33;
+  --surface-foreground: #F5F3EE;
+  --surface-foreground-rgb: 245 243 238;
+  --card: #1A1D21;
+  --card-foreground: #F5F3EE;
+  --popover: #1A1D21;
+  --popover-foreground: #F5F3EE;
+
+  --muted: #22262B;
+  --muted-rgb: 34 38 43;
+  --muted-foreground: #9DA3AB;
+  --muted-foreground-rgb: 157 163 171;
+
+  --primary: #D8C3A1;
+  --primary-rgb: 216 195 161;
+  --primary-foreground: #0B0D0F;
+  --primary-foreground-rgb: 11 13 15;
+
+  --secondary: #2A2E33;
+  --secondary-rgb: 42 46 51;
+  --secondary-foreground: #F5F3EE;
+  --secondary-foreground-rgb: 245 243 238;
+
+  --accent: #D8C3A1;
+  --accent-rgb: 216 195 161;
+  --accent-foreground: #0B0D0F;
+  --accent-foreground-rgb: 11 13 15;
+  --accent-subtle: #26231D;
+  --accent-subtle-rgb: 38 35 29;
+
+  --destructive: #E55C5C;
+  --destructive-rgb: 229 92 92;
+  --destructive-foreground: #0B0D0F;
+  --destructive-foreground-rgb: 11 13 15;
+  --destructive-subtle: #1F0F10;
+  --destructive-subtle-rgb: 31 15 16;
+
+  --warning: #FBBF24;
+  --warning-rgb: 251 191 36;
+  --warning-foreground: #1F1402;
+  --warning-foreground-rgb: 31 20 2;
+  --warning-subtle: #2A200B;
+  --warning-subtle-rgb: 42 32 11;
+  --warning-subtle-foreground: #FDE68A;
+  --warning-subtle-foreground-rgb: 253 230 138;
+
+  --success: #34D399;
+  --success-rgb: 52 211 153;
+  --success-foreground: #06281B;
+  --success-foreground-rgb: 6 40 27;
+  --success-subtle: #0F2920;
+  --success-subtle-rgb: 15 41 32;
+
+  --border: #2A2E33;
+  --border-rgb: 42 46 51;
+  --border-control: #6E7681;
+  --border-control-rgb: 110 118 129;
+  --input: #6E7681;
+  --ring: #D8C3A1;
+  --ring-rgb: 216 195 161;
+
+  --shadow-xs: 0 1px 2px 0 rgb(0 0 0 / 0.35);
+  --shadow-sm: 0 4px 12px -2px rgb(0 0 0 / 0.45);
+  --shadow-md: 0 12px 28px -4px rgb(0 0 0 / 0.55);
+  --shadow-lg: 0 20px 44px -8px rgb(0 0 0 / 0.65);
+}
+
 @layer base {
   * {
     border-color: var(--border);

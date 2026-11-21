@@ -23,6 +23,7 @@ import type {
   ProductSummaryDTO,
 } from "@/lib/api/types";
 import { ThemeProvider } from "@/components/shared/theme-provider";
+import { HomeView } from "@/components/storefront/home-view";
 import { ToastProvider } from "@/components/ui/toast";
 import { AuthProvider } from "@/providers/auth-provider";
 import { CartProvider } from "@/providers/cart-provider";
@@ -400,6 +401,86 @@ describe("REM-P2-M09: Storefront SSR, Metadata, 404 & Asset Integrity", () => {
       expect(listProductsSpy).not.toHaveBeenCalled();
       expect(listCategoriesSpy).not.toHaveBeenCalled();
     });
+
+    it("HomeView Featured Collection filter pills fetch via catalogApi.listProducts and restore SSR products on All", async () => {
+      const categories = makeCategories().slice(0, 4);
+      const initialProducts = [
+        makeProductSummary(),
+        makeProductSummary({
+          id: "prod-tote",
+          title: "Waxed Canvas Studio Tote",
+          slug: "canvas-tote",
+          category: { id: "cat-accessories", name: "Accessories", slug: "accessories" },
+          min_price_cents: 9500,
+          max_price_cents: 9500,
+        }),
+      ];
+      const apparelOnly = [makeProductSummary()];
+      const inStockOnly = [initialProducts[1]];
+
+      const listProductsSpy = vi
+        .spyOn(catalogApi, "listProducts")
+        .mockResolvedValueOnce({
+          items: apparelOnly,
+          total: 1,
+          page: 1,
+          page_size: 8,
+          has_next: false,
+        })
+        .mockResolvedValueOnce({
+          items: inStockOnly,
+          total: 1,
+          page: 1,
+          page_size: 8,
+          has_next: false,
+        });
+
+      render(<HomeView initialCategories={categories} initialProducts={initialProducts} />);
+
+      expect(listProductsSpy).not.toHaveBeenCalled();
+      expect(screen.getByText("Atelier Linen Overshirt")).toBeInTheDocument();
+      expect(screen.getByText("Waxed Canvas Studio Tote")).toBeInTheDocument();
+
+      const filterGroup = screen.getByRole("group", { name: "Filter featured collection" });
+      const allBtn = filterGroup.querySelector("button");
+      expect(allBtn).toHaveAttribute("aria-pressed", "true");
+
+      // Click category pill "Apparel" -> calls catalogApi.listProducts with category_slug
+      fireEvent.click(screen.getByRole("button", { name: "Apparel" }));
+      await waitFor(() => {
+        expect(listProductsSpy).toHaveBeenCalledTimes(1);
+      });
+      expect(listProductsSpy).toHaveBeenNthCalledWith(
+        1,
+        { category_slug: "apparel", sort: "newest", page: 1, page_size: 8 },
+        expect.any(AbortSignal)
+      );
+      await waitFor(() => {
+        expect(screen.queryByText("Waxed Canvas Studio Tote")).not.toBeInTheDocument();
+      });
+      expect(screen.getByText("Atelier Linen Overshirt")).toBeInTheDocument();
+
+      // Click "In Stock Only" -> calls catalogApi.listProducts with in_stock: true
+      fireEvent.click(screen.getByRole("button", { name: "In Stock Only" }));
+      await waitFor(() => {
+        expect(listProductsSpy).toHaveBeenCalledTimes(2);
+      });
+      expect(listProductsSpy).toHaveBeenNthCalledWith(
+        2,
+        { in_stock: true, sort: "newest", page: 1, page_size: 8 },
+        expect.any(AbortSignal)
+      );
+      await waitFor(() => {
+        expect(screen.getByText("Waxed Canvas Studio Tote")).toBeInTheDocument();
+      });
+      expect(screen.queryByText("Atelier Linen Overshirt")).not.toBeInTheDocument();
+
+      // Click "All" -> restores initial SSR products from cache without another fetch
+      fireEvent.click(screen.getByRole("button", { name: "All" }));
+      expect(listProductsSpy).toHaveBeenCalledTimes(2);
+      expect(screen.getByText("Atelier Linen Overshirt")).toBeInTheDocument();
+      expect(screen.getByText("Waxed Canvas Studio Tote")).toBeInTheDocument();
+    });
   });
 
   describe("ProductsPage SSR & interactive filtering", () => {
@@ -725,11 +806,15 @@ describe("REM-P2-M09: Storefront SSR, Metadata, 404 & Asset Integrity", () => {
   });
 
   describe("resolveSiteUrl & RootLayout metadataBase", () => {
-    it("defaults to http://localhost:3000 in local dev and exposes RootLayout metadata.metadataBase", () => {
+    it("defaults to http://localhost:3000 in local dev and exposes RootLayout metadata.metadataBase and Vellora Store title template", () => {
       const localUrl = resolveSiteUrl();
       expect(localUrl.origin).toBe("http://localhost:3000");
       expect(rootMetadata.metadataBase).toBeInstanceOf(URL);
       expect(rootMetadata.metadataBase?.origin).toBe("http://localhost:3000");
+      expect(rootMetadata.title).toEqual({
+        default: "Vellora Store — Considered Everyday Goods",
+        template: "%s | Vellora Store",
+      });
     });
 
     it("rejects unset, http://, and loopback URLs in staging/production and normalizes https:// origin", () => {
@@ -792,19 +877,19 @@ describe("REM-P2-M09: Storefront SSR, Metadata, 404 & Asset Integrity", () => {
       expect(guaranteesHeading).not.toBeNull();
       expect(guaranteesHeading).toHaveTextContent("Storefront guarantees");
       expect(
-        screen.getByRole("heading", { level: 3, name: "Complimentary shipping over $100" })
+        screen.getByRole("heading", { level: 3, name: "Free Shipping Over $100" })
       ).toBeInTheDocument();
       unmountHome();
     });
   });
 
   describe("Seeded product image assets on disk", () => {
-    it("verifies all 8 seeded PNG files exist and begin with valid PNG signature bytes", () => {
+    it("verifies hero-showcase.png and all 8 seeded PNG files exist and begin with valid PNG signature bytes", () => {
       const assetsDir = path.resolve(__dirname, "..", "public", "assets", "products");
       const pngSignature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 
-      for (const slug of SEEDED_PRODUCT_SLUGS) {
-        const filePath = path.join(assetsDir, `${slug}.png`);
+      for (const assetName of ["hero-showcase", ...SEEDED_PRODUCT_SLUGS]) {
+        const filePath = path.join(assetsDir, `${assetName}.png`);
         expect(fs.existsSync(filePath), `Missing product image: ${filePath}`).toBe(true);
         const bytes = fs.readFileSync(filePath);
         expect(bytes.length).toBeGreaterThan(100);

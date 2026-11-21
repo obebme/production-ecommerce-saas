@@ -93,7 +93,7 @@ export function ClearCartDialog({
 }) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
+      <DialogContent className="storefront-theme">
         <DialogHeader>
           <DialogTitle>Clear shopping bag?</DialogTitle>
           <DialogDescription>

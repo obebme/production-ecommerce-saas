@@ -6,7 +6,7 @@ export const dynamic = "force-dynamic";
 
 export const metadata: Metadata = {
   title: "Home",
-  description: "Explore Atelier seasonal apparel and considered everyday objects.",
+  description: "Explore Vellora Store seasonal apparel and considered everyday objects.",
 };
 
 export default async function HomePage() {

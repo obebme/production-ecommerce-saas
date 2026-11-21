@@ -96,7 +96,7 @@ export function CartDrawer() {
   return (
     <>
       <Sheet open={isDrawerOpen} onOpenChange={setDrawerOpen}>
-        <SheetContent side="right" className="flex h-full flex-col p-0">
+        <SheetContent side="right" className="storefront-theme flex h-full flex-col p-0">
           <SheetHeader className="pr-14">
             <SheetTitle className="flex items-center gap-2">
               <span>Shopping Bag</span>
