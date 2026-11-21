@@ -14,6 +14,9 @@ function isBottomNavHiddenRoute(pathname: string | null): boolean {
   if (!pathname) {
     return false;
   }
+  if (/^\/products\/[^/]+/.test(pathname)) {
+    return true;
+  }
   return HIDDEN_ROUTES.some(
     (route) => pathname === route || pathname.startsWith(`${route}/`)
   );

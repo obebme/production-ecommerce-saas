@@ -1171,7 +1171,7 @@ describe("FE-REDESIGN-001: ThemeProvider, ThemeToggle (pill) & MobileBottomNav",
     });
   });
 
-  it("renders MobileBottomNav on /, /products, /account, /orders and returns empty on /checkout, /cart, /login, /register", async () => {
+  it("renders MobileBottomNav on /, /products, /account, /orders and returns empty on /products/[slug], /checkout, /cart, /login, /register", async () => {
     fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.endsWith("/auth/me")) {
@@ -1201,7 +1201,14 @@ describe("FE-REDESIGN-001: ThemeProvider, ThemeToggle (pill) & MobileBottomNav",
       fetchMock.mockClear();
     }
 
-    for (const hiddenPath of ["/checkout", "/cart", "/login", "/register"] as const) {
+    for (const hiddenPath of [
+      "/products/linen-overshirt",
+      "/products/merino-crewneck",
+      "/checkout",
+      "/cart",
+      "/login",
+      "/register",
+    ] as const) {
       mockPathname = hiddenPath;
       const { unmount } = renderWithAppProviders(
         <div data-testid="mobile-nav-slot">

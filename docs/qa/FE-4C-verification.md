@@ -65,3 +65,39 @@ Post-run port check (`Get-NetTCPConnection -LocalPort 3000,8000,63421`) returned
 
 - **Defects found**: None (`0` failures across lint, typecheck, `94` Vitest tests, `next build`, and `5` live Chromium E2E tests post-`LOW-4C-01`).
 - **Recommended next step**: Proceed to `SEC-4C-REVIEW` sign-off / Orchestrator integration.
+
+---
+
+## 4. QA-4C-MOBILE-POLISH Verification
+
+Post-`FE-4C-MOBILE-POLISH` updates to `frontend/src/components/storefront/mobile-bottom-nav.tsx` and `frontend/src/components/storefront/home-view.tsx`, QA updated unit/SSR and live mobile E2E coverage and re-ran the full frontend verification suite in `e:\fullstack_work\frontend`:
+
+### Post-Edit Command & Outcome Summary
+
+| # | Command | Scope & Runner | Outcome |
+| :-: | :--- | :--- | :--- |
+| 1 | `..\backend\.venv\Scripts\python.exe e2e\run_e2e_stack.py` (`BypassSandbox: true`) | Live Chromium Playwright E2E + disposable PostgreSQL `18.6` (`127.0.0.1:56843`, `pid=63228`) + `uvicorn` (`pid=29952`) + `next start` (`pid=66616`) | **`5 passed (32.6s)`** (`0` failed, `0` skipped, exit `0`; `Clean teardown verified; zero temporary processes remain.`) |
+| 2 | `npm.cmd run lint` | `next lint` (`frontend/`) | `✔ No ESLint warnings or errors` (exit `0`) |
+| 3 | `npx.cmd tsc --noEmit` | TypeScript strict typecheck (`frontend/`) | `0` errors (exit `0`) |
+| 4 | `npm.cmd test` | Vitest `v4.1.12` (`jsdom`, `frontend/tests/*.test.ts*`) | **`6 files passed (6), 95 tests passed (95)`** (`0` failed, `0` skipped) in `9.68s` |
+| 5 | `npm.cmd run build` (`BypassSandbox: true`) | `next build` (`Next.js 15.5.29`, production bundle) | **`21` routes built** (`17/17` static pages generated, `5` dynamic `ƒ` routes, exit `0`) |
+
+### Post-Edit Breakdown
+
+- **Vitest (`6` files / `95` passed)**:
+  - `tests/format-and-security.test.ts`: `10` passed (`29ms`)
+  - `tests/api-client.test.ts`: `8` passed (`41ms`)
+  - `tests/storefront-ssr.test.tsx`: `20` passed (`749ms`) — added assertion for `#home-categories-rail` (`role="region"`, `aria-label="Popular categories"`, `snap-x`, `overflow-x-auto`, `md:grid-cols-3`) and `"Scroll categories left"` / `"Scroll categories right"` (`aria-controls="home-categories-rail"`).
+  - `tests/ui-and-shells.test.tsx`: `23` passed (`1872ms`) — updated `MobileBottomNav` route-visibility test to assert empty DOM on `/products/linen-overshirt` and `/products/merino-crewneck` alongside `/checkout`, `/cart`, `/login`, `/register` (while visible on `/`, `/products`, `/account`, `/orders`).
+  - `tests/checkout-and-orders.test.tsx`: `20` passed (`2603ms`)
+  - `tests/admin-console.test.tsx`: `14` passed (`3031ms`)
+- **Live Playwright Chromium (`5` passed / `32.6s`)**:
+  1. `1. Authenticated customer purchase, sandbox payment & order history` (`6.9s`) — passed
+  2. `2. Guest checkout, HttpOnly cookie reload access, zero storage tokens & self-cancel` (`6.0s`) — passed
+  3. `3. Staff RBAC & fulfillment, Admin dashboard analytics, refund+restock & audit diff` (`3.7s`) — passed
+  4. `4. Cross-context concurrent oversell guard prevents second order on last unit` (`12.2s`) — passed
+  5. `5. Raw HTTP SSR HTML, dynamic PDP <title>, theme toggle/persistence, hero & all 8 PNGs, HTTP 404 & mobile nav` (`3.0s`) — passed:
+     - Mobile `/` (`390×844`): verified `#home-categories-rail` (`role="region"`, `aria-label="Popular categories"`) is horizontally scrollable (`scrollWidth > clientWidth`), `"Scroll categories right"` is visible & enabled and clicking it advances `scrollLeft > 0` (enabling `"Scroll categories left"`), and `document.documentElement.scrollWidth <= window.innerWidth`.
+     - Mobile `/products/linen-overshirt` (`390×844`): verified `nav[aria-label="Mobile bottom navigation"]` count `0`, scrolled PDP with `scrollWidth <= window.innerWidth`, verified `radiogroup` `"Size"` (`M` / `L` radios), `Decrease quantity` / `Increase quantity`, and `"Add to Cart"` are unobstructed via `assertElementUnobstructed` (`document.elementFromPoint` hit-test), verified clicking Size `"L"` selects `ATL-LINEN-SND-L` cleanly, then selected in-stock Size `"M"` (`ATL-LINEN-SND-M`, since Test 4 holds the active reservation on `ATL-LINEN-SND-L`) and clicked `"Add to Cart"` so `/cart` and `/checkout` checks execute deterministically.
+- **Process/Port Teardown Check**: `Get-NetTCPConnection -LocalPort 3000,8000,56843` returned zero active listeners; `run_e2e_stack.py` stopped `next` (`pid=66616`), `uvicorn` (`pid=29952`), and disposable PostgreSQL (`pid=63228`) and removed `C:\Users\User\AppData\Local\Temp\ecom_e2e_pg18_zucurq_8`.
+- **Defects found**: None (`0` failures; note: `getByRole('region', { name: 'Popular categories' })` without `exact: true` matches both the outer `<section aria-labelledby="home-categories-heading">` and `#home-categories-rail`, so E2E targets `#home-categories-rail` directly).

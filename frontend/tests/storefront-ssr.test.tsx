@@ -959,5 +959,23 @@ describe("REM-P2-M09: Storefront SSR, Metadata, 404 & Asset Integrity", () => {
       const directImg = screen.getByRole("img", { name: "Direct ProductImage eager default" });
       expect(directImg).toHaveAttribute("loading", "eager");
     });
+
+    it("renders HomeView Popular Categories with #home-categories-rail and accessible scroll controls", () => {
+      render(
+        <HomeView
+          initialCategories={makeCategories().slice(0, 4)}
+          initialProducts={[makeProductSummary()]}
+        />
+      );
+
+      const rail = screen.getByRole("region", { name: "Popular categories" });
+      expect(rail).toHaveAttribute("id", "home-categories-rail");
+      expect(rail).toHaveClass("snap-x", "overflow-x-auto", "md:grid-cols-3");
+
+      const scrollLeftBtn = screen.getByRole("button", { name: "Scroll categories left" });
+      const scrollRightBtn = screen.getByRole("button", { name: "Scroll categories right" });
+      expect(scrollLeftBtn).toHaveAttribute("aria-controls", "home-categories-rail");
+      expect(scrollRightBtn).toHaveAttribute("aria-controls", "home-categories-rail");
+    });
   });
 });

@@ -3,7 +3,15 @@
 import * as React from "react";
 import Image from "next/image";
 import Link from "next/link";
-import { ArrowRight, Clock, PackageCheck, RotateCcw, Truck } from "lucide-react";
+import {
+  ArrowRight,
+  ChevronLeft,
+  ChevronRight,
+  Clock,
+  PackageCheck,
+  RotateCcw,
+  Truck,
+} from "lucide-react";
 import { catalogApi } from "@/lib/api/client";
 import type { CategoryPublicDTO, ProductSummaryDTO } from "@/lib/api/types";
 import { cn } from "@/lib/utils";
@@ -188,6 +196,48 @@ export function HomeView({ initialCategories, initialProducts }: HomeViewProps =
     };
   }, []);
 
+  const categoriesRailRef = React.useRef<HTMLDivElement | null>(null);
+  const [canScrollCategoriesLeft, setCanScrollCategoriesLeft] = React.useState(false);
+  const [canScrollCategoriesRight, setCanScrollCategoriesRight] = React.useState(false);
+
+  const syncCategoriesRailControls = React.useCallback(() => {
+    const rail = categoriesRailRef.current;
+    if (!rail) {
+      setCanScrollCategoriesLeft(false);
+      setCanScrollCategoriesRight(false);
+      return;
+    }
+    const maxScrollLeft = rail.scrollWidth - rail.clientWidth;
+    setCanScrollCategoriesLeft(rail.scrollLeft > 4);
+    setCanScrollCategoriesRight(maxScrollLeft - rail.scrollLeft > 4);
+  }, []);
+
+  React.useEffect(() => {
+    const rail = categoriesRailRef.current;
+    syncCategoriesRailControls();
+    if (!rail) {
+      return;
+    }
+    rail.addEventListener("scroll", syncCategoriesRailControls, { passive: true });
+    window.addEventListener("resize", syncCategoriesRailControls);
+    return () => {
+      rail.removeEventListener("scroll", syncCategoriesRailControls);
+      window.removeEventListener("resize", syncCategoriesRailControls);
+    };
+  }, [categoriesLoading, categories.length, syncCategoriesRailControls]);
+
+  const scrollCategoriesRail = React.useCallback((direction: -1 | 1) => {
+    const rail = categoriesRailRef.current;
+    if (!rail) {
+      return;
+    }
+    const firstCard = rail.firstElementChild as HTMLElement | null;
+    const step = firstCard
+      ? firstCard.getBoundingClientRect().width + 12
+      : Math.max(rail.clientWidth * 0.74, 240);
+    rail.scrollBy({ left: direction * step, behavior: "smooth" });
+  }, []);
+
   return (
     <div className="space-y-12 pb-12 sm:space-y-14 sm:pb-16">
       {/* 1. Architectural Hero Banner */}
@@ -339,19 +389,48 @@ export function HomeView({ initialCategories, initialProducts }: HomeViewProps =
                 Browse active collections arranged by studio department.
               </p>
             </div>
-            <Link
-              href="/products"
-              className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap text-sm font-medium text-accent underline-offset-4 hover:underline"
-            >
-              View all
-              <ArrowRight className="h-4 w-4" aria-hidden="true" />
-            </Link>
+            <div className="flex shrink-0 items-center gap-2 sm:gap-3">
+              {!categoriesLoading && categories.length > 1 ? (
+                <div className="flex items-center gap-1.5 md:hidden">
+                  <button
+                    type="button"
+                    onClick={() => scrollCategoriesRail(-1)}
+                    disabled={!canScrollCategoriesLeft}
+                    aria-label="Scroll categories left"
+                    aria-controls="home-categories-rail"
+                    className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-border-control bg-card text-foreground shadow-sm transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-40"
+                  >
+                    <ChevronLeft className="h-4 w-4" aria-hidden="true" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => scrollCategoriesRail(1)}
+                    disabled={!canScrollCategoriesRight}
+                    aria-label="Scroll categories right"
+                    aria-controls="home-categories-rail"
+                    className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-border-control bg-card text-foreground shadow-sm transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-40"
+                  >
+                    <ChevronRight className="h-4 w-4" aria-hidden="true" />
+                  </button>
+                </div>
+              ) : null}
+              <Link
+                href="/products"
+                className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap text-sm font-medium text-accent underline-offset-4 hover:underline"
+              >
+                View all
+                <ArrowRight className="h-4 w-4" aria-hidden="true" />
+              </Link>
+            </div>
           </div>
 
           {categoriesLoading ? (
-            <div className="grid grid-cols-2 gap-3 sm:gap-5 md:grid-cols-3">
+            <div className="flex snap-x snap-mandatory gap-3 overflow-x-auto pb-2 scroll-smooth [scrollbar-width:none] [&::-webkit-scrollbar]:hidden md:grid md:grid-cols-3 md:gap-5 md:overflow-visible md:pb-0">
               {[1, 2, 3].map((idx) => (
-                <Card key={idx} className="overflow-hidden rounded-[12px] p-2.5 sm:p-3">
+                <Card
+                  key={idx}
+                  className="w-[74%] shrink-0 snap-start overflow-hidden rounded-[12px] p-2.5 sm:w-[46%] sm:p-3 md:w-auto"
+                >
                   <Skeleton className="aspect-[4/3] w-full rounded-lg sm:aspect-[16/10]" />
                   <Skeleton className="mx-auto mt-3.5 h-5 w-28" />
                   <Skeleton className="mx-auto mt-2 h-3.5 w-36" />
@@ -359,14 +438,20 @@ export function HomeView({ initialCategories, initialProducts }: HomeViewProps =
               ))}
             </div>
           ) : (
-            <div className="grid grid-cols-2 gap-3 sm:gap-5 md:grid-cols-3">
+            <div
+              id="home-categories-rail"
+              ref={categoriesRailRef}
+              role="region"
+              aria-label="Popular categories"
+              className="flex snap-x snap-mandatory gap-3 overflow-x-auto pb-2 scroll-smooth [scrollbar-width:none] [&::-webkit-scrollbar]:hidden md:grid md:grid-cols-3 md:gap-5 md:overflow-visible md:pb-0"
+            >
               {categories.map((category) => {
                 const previewUrl = resolveCategoryPreviewUrl(category, allProductsCache);
                 return (
                   <Link
                     key={category.id}
                     href={`/products?category_slug=${encodeURIComponent(category.slug)}`}
-                    className="group block rounded-[12px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    className="group block w-[74%] shrink-0 snap-start rounded-[12px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:w-[46%] md:w-auto"
                   >
                     <Card className="flex h-full flex-col overflow-hidden rounded-[12px] border border-border bg-card p-2.5 transition-all duration-200 group-hover:-translate-y-0.5 group-hover:border-accent/60 group-hover:shadow-sm sm:p-3">
                       <div className="relative aspect-[4/3] w-full overflow-hidden rounded-lg bg-[#0E1115] sm:aspect-[16/10]">
@@ -374,7 +459,7 @@ export function HomeView({ initialCategories, initialProducts }: HomeViewProps =
                           src={previewUrl}
                           alt={category.name}
                           fallbackLabel={category.name}
-                          sizes="(max-width: 768px) 50vw, 33vw"
+                          sizes="(max-width: 640px) 74vw, (max-width: 768px) 46vw, 33vw"
                           loading="eager"
                           className="bg-transparent"
                           imgClassName="transition-transform duration-300 group-hover:scale-[1.04]"

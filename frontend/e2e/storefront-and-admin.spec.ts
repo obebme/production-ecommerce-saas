@@ -619,6 +619,33 @@ test.describe("REM-P2-M09 & FE-REDESIGN-001: Storefront SSR, Metadata, Theme, As
     await expect(page.locator('main img[src$="/assets/products/hero-showcase.png"]')).toBeVisible();
     await assertAllMainImagesLoaded(page, "mobile /");
 
+    const categoriesRail = page.locator("#home-categories-rail");
+    await expect(categoriesRail).toBeVisible();
+    await expect(categoriesRail).toHaveAttribute("role", "region");
+    await expect(categoriesRail).toHaveAttribute("aria-label", "Popular categories");
+    const railMetricsBefore = await categoriesRail.evaluate((el) => ({
+      scrollWidth: el.scrollWidth,
+      clientWidth: el.clientWidth,
+      scrollLeft: el.scrollLeft,
+    }));
+    expect(railMetricsBefore.scrollWidth).toBeGreaterThan(railMetricsBefore.clientWidth);
+    expect(railMetricsBefore.scrollLeft).toBe(0);
+
+    const scrollLeftBtn = page.getByRole("button", { name: "Scroll categories left" });
+    const scrollRightBtn = page.getByRole("button", { name: "Scroll categories right" });
+    await expect(scrollLeftBtn).toBeVisible();
+    await expect(scrollLeftBtn).toBeDisabled();
+    await expect(scrollRightBtn).toBeVisible();
+    await expect(scrollRightBtn).toBeEnabled();
+
+    await scrollRightBtn.click();
+    await expect
+      .poll(async () => await categoriesRail.evaluate((el) => el.scrollLeft), {
+        message: "Expected #home-categories-rail scrollLeft > 0 after clicking Scroll categories right",
+      })
+      .toBeGreaterThan(0);
+    await expect(scrollLeftBtn).toBeEnabled();
+
     await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
     const homeMobileLayout = await page.evaluate((navSel) => {
       const footer = document.querySelector("footer");
@@ -660,12 +687,45 @@ test.describe("REM-P2-M09 & FE-REDESIGN-001: Storefront SSR, Metadata, Theme, As
     expect(catalogMobileLayout.scrollY).toBeGreaterThan(0);
     expect(catalogMobileLayout.footerBottom).toBeLessThanOrEqual(catalogMobileLayout.navTop + 1);
 
-    // Add 1 item to guest cart so /cart and /checkout render full interactive CTAs & form fields
-    await page.goto("/products/merino-crewneck");
-    await page.getByRole("button", { name: "Add to Cart" }).click();
+    // 3. Mobile /products/linen-overshirt (PDP): MobileBottomNav absent, controls unobstructed, size selection & Add to Cart
+    await page.goto("/products/linen-overshirt");
+    await expect(page.locator(mobileNavSelector)).toHaveCount(0);
+
+    const pdpSizeGroup = page.getByRole("radiogroup", { name: "Size" });
+    const pdpSizeM = pdpSizeGroup.getByRole("radio", { name: /^M(?:\s|$)/ });
+    const pdpSizeL = pdpSizeGroup.getByRole("radio", { name: /^L(?:\s|$)/ });
+    const pdpDecreaseQtyBtn = page.getByRole("button", { name: "Decrease quantity" });
+    const pdpIncreaseQtyBtn = page.getByRole("button", { name: "Increase quantity" });
+    const pdpAddToCartBtn = page.getByRole("button", { name: "Add to Cart" });
+
+    await assertElementUnobstructed(pdpSizeM, "PDP Size M radio");
+    await assertElementUnobstructed(pdpSizeL, "PDP Size L radio");
+    await assertElementUnobstructed(pdpDecreaseQtyBtn, "PDP Decrease quantity button");
+    await assertElementUnobstructed(pdpIncreaseQtyBtn, "PDP Increase quantity button");
+    await assertElementUnobstructed(pdpAddToCartBtn, "PDP Add to Cart button");
+
+    await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+    await expect
+      .poll(async () => await page.evaluate(() => window.scrollY))
+      .toBeGreaterThan(0);
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)
+    ).toBe(true);
+
+    // Verify Size "L" radio toggles cleanly (note: Test 4 reserved the last unit of ATL-LINEN-SND-L),
+    // then select in-stock Size "M" and add to guest bag so /cart and /checkout remain deterministic.
+    await pdpSizeL.scrollIntoViewIfNeeded();
+    await pdpSizeL.click();
+    await expect(pdpSizeL).toHaveAttribute("aria-checked", "true");
+    await expect(page.getByText("SKU: ATL-LINEN-SND-L")).toBeVisible();
+
+    await pdpSizeM.click();
+    await expect(pdpSizeM).toHaveAttribute("aria-checked", "true");
+    await expect(page.getByText("SKU: ATL-LINEN-SND-M")).toBeVisible();
+    await pdpAddToCartBtn.click();
     await expect(page.getByRole("link", { name: "View Full Cart" })).toBeVisible();
 
-    // 3. Mobile /cart: MobileBottomNav absent + CTA unobstructed
+    // 4. Mobile /cart: MobileBottomNav absent + CTA unobstructed
     await page.goto("/cart");
     await expect(page.locator(mobileNavSelector)).toHaveCount(0);
     await assertElementUnobstructed(
@@ -676,7 +736,7 @@ test.describe("REM-P2-M09 & FE-REDESIGN-001: Storefront SSR, Metadata, Theme, As
       await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)
     ).toBe(true);
 
-    // 4. Mobile /checkout: MobileBottomNav absent + inputs & CTA unobstructed
+    // 5. Mobile /checkout: MobileBottomNav absent + inputs & CTA unobstructed
     await page.goto("/checkout");
     await expect(page.locator(mobileNavSelector)).toHaveCount(0);
     await assertElementUnobstructed(page.locator("#checkout-email"), "Checkout email input");
@@ -688,7 +748,7 @@ test.describe("REM-P2-M09 & FE-REDESIGN-001: Storefront SSR, Metadata, Theme, As
       await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)
     ).toBe(true);
 
-    // 5. Mobile /login: MobileBottomNav absent + #login-email & Sign In button unobstructed
+    // 6. Mobile /login: MobileBottomNav absent + #login-email & Sign In button unobstructed
     await page.goto("/login");
     await expect(page.locator(mobileNavSelector)).toHaveCount(0);
     await assertElementUnobstructed(page.locator("#login-email"), "Login email input");
