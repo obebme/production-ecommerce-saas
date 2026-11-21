@@ -64,6 +64,7 @@ import type {
 const DEFAULT_API_BASE_URL = "http://localhost:8000/api/v1";
 const CSRF_COOKIE_NAME = "ecom_csrf";
 const MUTATING_METHODS = new Set(["POST", "PATCH", "PUT", "DELETE"]);
+export const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 
 /** Module-memory CSRF token (never stored in localStorage or sessionStorage). */
 let memoryCsrfToken: string | null = null;
@@ -209,6 +210,7 @@ interface RequestOptions {
   skipCsrf?: boolean;
   skipAuthInvalidationHook?: boolean;
   signal?: AbortSignal;
+  timeoutMs?: number;
 }
 
 async function parseErrorResponse(response: Response): Promise<ApiError> {
@@ -306,6 +308,33 @@ async function apiRequest<T>(
     }
   }
 
+  const timeoutMs = options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+  const callerSignal = options.signal;
+  const timeoutController = timeoutMs > 0 ? new AbortController() : null;
+  let timedOut = false;
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  let detachCallerAbort: (() => void) | undefined;
+
+  let effectiveSignal: AbortSignal | undefined = callerSignal;
+  if (timeoutController) {
+    effectiveSignal = timeoutController.signal;
+    if (callerSignal?.aborted) {
+      timeoutController.abort(callerSignal.reason);
+    } else {
+      if (callerSignal) {
+        const onCallerAbort = () => {
+          timeoutController.abort(callerSignal.reason);
+        };
+        callerSignal.addEventListener("abort", onCallerAbort, { once: true });
+        detachCallerAbort = () => callerSignal.removeEventListener("abort", onCallerAbort);
+      }
+      timeoutId = setTimeout(() => {
+        timedOut = true;
+        timeoutController.abort();
+      }, timeoutMs);
+    }
+  }
+
   let response: Response;
   try {
     response = await fetch(buildEndpointUrl(path), {
@@ -313,10 +342,17 @@ async function apiRequest<T>(
       credentials: "include",
       headers,
       body: serializedBody,
-      signal: options.signal,
+      signal: effectiveSignal,
     });
   } catch (err) {
-    if (err instanceof DOMException && err.name === "AbortError") {
+    if (timedOut && !callerSignal?.aborted) {
+      throw new ApiError({
+        status: 0,
+        code: "REQUEST_TIMEOUT",
+        message: "The request timed out. Please try again.",
+      });
+    }
+    if (callerSignal?.aborted || (err instanceof DOMException && err.name === "AbortError")) {
       throw err;
     }
     throw new ApiError({
@@ -324,6 +360,11 @@ async function apiRequest<T>(
       code: "NETWORK_ERROR",
       message: "Unable to reach the server. Please check your connection and try again.",
     });
+  } finally {
+    if (timeoutId !== undefined) {
+      clearTimeout(timeoutId);
+    }
+    detachCallerAbort?.();
   }
 
   if (!response.ok) {
@@ -345,12 +386,8 @@ async function apiRequest<T>(
 
     if (!options.skipAuthInvalidationHook) {
       if (apiError.status === 401 && apiError.code === "AUTH_SESSION_EXPIRED") {
-        const isAnonymousAuthRequired =
-          !getEffectiveCsrfToken() && apiError.message === "Authentication required.";
-        if (!isAnonymousAuthRequired) {
-          memoryCsrfToken = null;
-          authInvalidationListener?.("session_expired");
-        }
+        memoryCsrfToken = null;
+        authInvalidationListener?.("session_expired");
       } else if (apiError.status === 403 && apiError.code === "AUTH_ACCOUNT_DISABLED") {
         memoryCsrfToken = null;
         authInvalidationListener?.("account_disabled");

@@ -10,6 +10,7 @@ import {
   setMemoryCsrfToken,
 } from "@/lib/api/client";
 import type { CartDTO, UserDTO } from "@/lib/api/types";
+import { clearAllGuestOrderTokens } from "@/lib/guest-order-memory";
 import { useToast } from "@/components/ui/toast";
 
 type MergedCartSubscriber = (mergedCart: CartDTO) => void;
@@ -114,9 +115,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           setAccountDisabled(true);
         } else if (
           err.status === 401 &&
-          (hadCsrfCookie ||
-            (err.code === "AUTH_SESSION_EXPIRED" &&
-              err.message !== "Authentication required."))
+          err.code !== "AUTH_REQUIRED" &&
+          (err.code === "AUTH_SESSION_EXPIRED" || hadCsrfCookie)
         ) {
           setSessionExpired(true);
         }
@@ -192,6 +192,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     } catch {
       // Clear local session state even if session was already expired server-side
     } finally {
+      clearAllGuestOrderTokens();
       setUser(null);
       setMemoryCsrfToken(null);
       setSessionExpired(false);

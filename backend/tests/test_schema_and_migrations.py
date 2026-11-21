@@ -184,12 +184,12 @@ def test_orm_metadata_contains_all_17_tables_checks_and_indexes() -> None:
 
 
 def test_alembic_single_head_and_offline_upgrade_downgrade_sql() -> None:
-    """Alembic has one head (0002_phase1_commerce_integrity) and compiles offline SQL."""
+    """Alembic has one head (0003_phase2_indexes_and_cleanup) and compiles offline SQL."""
     heads_res = _run_alembic("heads")
     assert heads_res.returncode == 0, heads_res.stderr
     head_lines = [line.strip() for line in heads_res.stdout.splitlines() if line.strip()]
     assert len(head_lines) == 1
-    assert head_lines[0].startswith("0002_phase1_commerce_integrity")
+    assert head_lines[0].startswith("0003_phase2_indexes_and_cleanup")
 
     upgrade_res = _run_alembic("upgrade", "head", "--sql")
     assert upgrade_res.returncode == 0, upgrade_res.stderr
@@ -198,8 +198,17 @@ def test_alembic_single_head_and_offline_upgrade_downgrade_sql() -> None:
     for expected_checks in EXPECTED_CHECK_CONSTRAINTS.values():
         for ck_name in expected_checks:
             assert f"CONSTRAINT {ck_name} CHECK" in upgrade_res.stdout
+    for idx_name in (
+        "idx_product_images_product_sort",
+        "idx_orders_placed_at",
+        "idx_audit_logs_actor_created",
+        "idx_audit_logs_action_created",
+        "idx_auth_sessions_expires_at",
+        "idx_carts_status_expires",
+    ):
+        assert idx_name in upgrade_res.stdout
 
-    downgrade_res = _run_alembic("downgrade", "0002_phase1_commerce_integrity:base", "--sql")
+    downgrade_res = _run_alembic("downgrade", "0003_phase2_indexes_and_cleanup:base", "--sql")
     assert downgrade_res.returncode == 0, downgrade_res.stderr
     for table_name in EXPECTED_TABLES:
         assert f"DROP TABLE {table_name}" in downgrade_res.stdout
@@ -210,9 +219,16 @@ def test_alembic_single_head_and_offline_upgrade_downgrade_sql() -> None:
     reason="Live PostgreSQL TEST_DATABASE_URL is not configured in this environment.",
 )
 def test_alembic_live_postgresql_upgrade_and_downgrade() -> None:
-    """Verify 0001 -> 0002 upgrade, downgrade to 0001, re-upgrade to head, and downgrade base."""
+    """Verify 0003 migration indexes, downgrade to 0002/0001, re-upgrade head, & downgrade base."""
     test_db_url = os.environ["TEST_DATABASE_URL"]
     pg_engine = create_engine_from_url(test_db_url)
+    expected_0003_indexes = {
+        "product_images": {"idx_product_images_product_sort"},
+        "orders": {"idx_orders_placed_at"},
+        "audit_logs": {"idx_audit_logs_actor_created", "idx_audit_logs_action_created"},
+        "auth_sessions": {"idx_auth_sessions_expires_at"},
+        "carts": {"idx_carts_status_expires"},
+    }
     try:
         up_res = _run_alembic("upgrade", "head", database_url=test_db_url)
         assert up_res.returncode == 0, up_res.stderr
@@ -228,8 +244,31 @@ def test_alembic_live_postgresql_upgrade_and_downgrade() -> None:
             idx["name"] for idx in insp_head.get_indexes("inventory_reservations")
         }
         assert "idx_reservations_variant_active_expiry" in res_indexes_head
+        for table_name, req_idxs in expected_0003_indexes.items():
+            actual = {idx["name"] for idx in insp_head.get_indexes(table_name)}
+            assert req_idxs <= actual, f"{table_name} missing 0003 indexes: {req_idxs - actual}"
 
-        # Downgrade 0002 -> 0001_initial_schema
+        # Downgrade 0003 -> 0002_phase1_commerce_integrity
+        down_0002 = _run_alembic(
+            "downgrade", "0002_phase1_commerce_integrity", database_url=test_db_url
+        )
+        assert down_0002.returncode == 0, down_0002.stderr
+        insp_0002 = inspect(pg_engine)
+        for table_name, req_idxs in expected_0003_indexes.items():
+            actual_0002 = {idx["name"] for idx in insp_0002.get_indexes(table_name)}
+            assert not (req_idxs & actual_0002), (
+                f"{table_name} still has 0003 indexes after downgrade: {req_idxs & actual_0002}"
+            )
+
+        # Re-upgrade 0002 -> head (0003_phase2_indexes_and_cleanup)
+        reup_0003 = _run_alembic("upgrade", "head", database_url=test_db_url)
+        assert reup_0003.returncode == 0, reup_0003.stderr
+        insp_reup3 = inspect(pg_engine)
+        for table_name, req_idxs in expected_0003_indexes.items():
+            actual_reup3 = {idx["name"] for idx in insp_reup3.get_indexes(table_name)}
+            assert req_idxs <= actual_reup3
+
+        # Downgrade 0003 -> 0001_initial_schema
         down_0001 = _run_alembic("downgrade", "0001_initial_schema", database_url=test_db_url)
         assert down_0001.returncode == 0, down_0001.stderr
 
@@ -238,7 +277,7 @@ def test_alembic_live_postgresql_upgrade_and_downgrade() -> None:
         order_cols_0001 = {col["name"] for col in insp_0001.get_columns("orders")}
         assert "guest_client_key_hash" not in order_cols_0001
 
-        # Re-upgrade 0001 -> head (0002_phase1_commerce_integrity)
+        # Re-upgrade 0001 -> head (0003_phase2_indexes_and_cleanup)
         reup_res = _run_alembic("upgrade", "head", database_url=test_db_url)
         assert reup_res.returncode == 0, reup_res.stderr
 
@@ -246,6 +285,8 @@ def test_alembic_live_postgresql_upgrade_and_downgrade() -> None:
         assert "payment_refund_requests" in insp_reup.get_table_names()
         order_cols_reup = {col["name"] for col in insp_reup.get_columns("orders")}
         assert "guest_client_key_hash" in order_cols_reup
+        for table_name, req_idxs in expected_0003_indexes.items():
+            assert req_idxs <= {idx["name"] for idx in insp_reup.get_indexes(table_name)}
 
         down_res = _run_alembic("downgrade", "base", database_url=test_db_url)
         assert down_res.returncode == 0, down_res.stderr

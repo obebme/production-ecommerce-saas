@@ -23,7 +23,7 @@ RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /build
-COPY . /build
+COPY requirements.txt pyproject.toml /build/
 
 RUN python -m pip install --upgrade pip && \
     if [ -f requirements.txt ]; then \
@@ -34,6 +34,8 @@ RUN python -m pip install --upgrade pip && \
         echo "ERROR: Expected backend/requirements.txt or backend/pyproject.toml in build context." >&2; \
         exit 1; \
     fi
+
+COPY . /build
 
 
 FROM python:3.12-slim AS runtime
@@ -60,4 +62,7 @@ EXPOSE 8000
 HEALTHCHECK --interval=15s --timeout=5s --start-period=15s --retries=3 \
     CMD ["python", "-c", "import sys, urllib.request; resp = urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=3); sys.exit(0 if resp.status == 200 else 1)"]
 
+# App-level H-04 trusted-proxy parsing (TRUSTED_PROXY_IPS) validates TCP peer IP
+# before reading X-Forwarded-For. If overriding CMD behind a reverse proxy with
+# `--proxy-headers`, set `--forwarded-allow-ips=<exact-proxy-ip-or-cidr>` (never `*`).
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

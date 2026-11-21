@@ -5,16 +5,18 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, exists, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
+from app.core.database import ts_lt
 from app.core.errors import ConflictError, NotFoundError, ValidationAppError
 from app.core.security import generate_session_token, hash_token
 from app.models.cart import Cart, CartItem
 from app.models.catalog import Category, Product, ProductImage
 from app.models.inventory import InventoryStock, ProductVariant
+from app.models.order import Order
 from app.modules.cart.schemas import AddCartItemRequest, CartDTO, CartItemDTO, UpdateCartItemRequest
 from app.modules.catalog.schemas import ensure_utc_datetime
 from app.modules.catalog.service import compute_variant_availability
@@ -184,6 +186,26 @@ def _fetch_cart_item_rows(
     ]
 
 
+def _estimate_tax_cents(subtotal_cents: int, tax_rate_bps: int) -> int:
+    if subtotal_cents <= 0 or tax_rate_bps <= 0:
+        return 0
+    return (subtotal_cents * tax_rate_bps + 5000) // 10000
+
+
+def _empty_cart_dto(settings: Settings) -> CartDTO:
+    return CartDTO(
+        id=uuid.UUID(int=0),
+        currency="USD",
+        items=[],
+        item_count=0,
+        subtotal_cents=0,
+        estimated_shipping_cents=0,
+        tax_rate_bps=settings.tax_rate_bps,
+        estimated_tax_cents=0,
+        estimated_total_cents=0,
+    )
+
+
 def build_cart_dto(
     db: Session,
     cart: Cart,
@@ -240,6 +262,7 @@ def build_cart_dto(
         if not item_dtos or subtotal_cents >= settings.free_shipping_threshold_cents
         else settings.standard_shipping_cents
     )
+    estimated_tax_cents = _estimate_tax_cents(subtotal_cents, settings.tax_rate_bps)
     return CartDTO(
         id=cart.id,
         currency=cart.currency,
@@ -247,6 +270,8 @@ def build_cart_dto(
         item_count=item_count,
         subtotal_cents=subtotal_cents,
         estimated_shipping_cents=estimated_shipping_cents,
+        tax_rate_bps=settings.tax_rate_bps,
+        estimated_tax_cents=estimated_tax_cents,
         estimated_total_cents=subtotal_cents + estimated_shipping_cents,
     )
 
@@ -284,18 +309,7 @@ def get_cart(
         db.commit()
 
     if cart is None:
-        return (
-            CartDTO(
-                id=uuid.UUID(int=0),
-                currency="USD",
-                items=[],
-                item_count=0,
-                subtotal_cents=0,
-                estimated_shipping_cents=0,
-                estimated_total_cents=0,
-            ),
-            None,
-        )
+        return _empty_cart_dto(settings), None
 
     return build_cart_dto(db, cart, settings, reclaim_expired=True), None
 
@@ -731,3 +745,42 @@ def merge_guest_cart(
     locked_user_cart.expires_at = _new_cart_expiry(now)
     db.commit()
     return build_cart_dto(db, locked_user_cart, settings, reclaim_expired=False), True
+
+
+def purge_expired_carts(
+    db: Session,
+    *,
+    retention_days: int = 30,
+    batch_size: int = 500,
+    max_batches: int = 20,
+    now: datetime | None = None,
+) -> int:
+    """Delete unreferenced expired carts past retention_days in bounded batches."""
+    current_time = ensure_utc_datetime(now) if now is not None else datetime.now(UTC)
+    cutoff = current_time - timedelta(days=retention_days)
+    total_deleted = 0
+
+    for _ in range(max_batches):
+        batch_ids = list(
+            db.scalars(
+                select(Cart.id)
+                .where(
+                    Cart.status.in_(("ACTIVE", "ABANDONED", "CONVERTED")),
+                    ts_lt(db, Cart.expires_at, cutoff),
+                    ~exists(select(Order.id).where(Order.cart_id == Cart.id)),
+                )
+                .order_by(Cart.id.asc())
+                .limit(batch_size)
+            ).all()
+        )
+        if not batch_ids:
+            break
+        db.execute(delete(CartItem).where(CartItem.cart_id.in_(batch_ids)))
+        result = db.execute(delete(Cart).where(Cart.id.in_(batch_ids)))
+        deleted = int(getattr(result, "rowcount", 0) or 0)
+        db.commit()
+        total_deleted += deleted
+        if deleted == 0:
+            break
+
+    return total_deleted

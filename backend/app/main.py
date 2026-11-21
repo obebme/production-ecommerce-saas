@@ -12,12 +12,20 @@ from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
+from pydantic_settings.sources import DotEnvSettingsSource
 from sqlalchemy.orm import Session
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.datastructures import MutableHeaders
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.core.config import Settings, get_app_settings, get_settings
-from app.core.database import check_db_connection, get_db, get_engine, get_session_factory
+from app.core.database import (
+    check_db_connection,
+    dispose_engine,
+    get_db,
+    get_engine,
+    get_session_factory,
+)
 from app.core.errors import (
     RequestIDMiddleware,
     ServiceUnavailableError,
@@ -104,6 +112,60 @@ class _SettingsAwareCORSMiddleware:
         await cors(scope, receive, send)
 
 
+_SENSITIVE_NO_STORE_SEGMENTS = frozenset(
+    {"auth", "cart", "checkout", "orders", "payments", "admin"}
+)
+
+
+def _is_sensitive_no_store_path(path: str) -> bool:
+    if not path.startswith("/api/v1/"):
+        return False
+    remainder = path[len("/api/v1/") :]
+    segment = remainder.split("/", 1)[0]
+    return segment in _SENSITIVE_NO_STORE_SEGMENTS
+
+
+class SensitiveRouteNoStoreMiddleware:
+    """Attach Cache-Control: no-store to sensitive auth/cart/checkout/order/payment/admin APIs."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or not _is_sensitive_no_store_path(scope.get("path", "")):
+            await self.app(scope, receive, send)
+            return
+
+        async def send_wrapper(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                if headers.get("Cache-Control") != "no-store":
+                    headers["Cache-Control"] = "no-store"
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+
+def _resolve_environment_for_docs(settings: Settings | None) -> str:
+    """Resolve runtime environment for OpenAPI/Swagger visibility."""
+    if settings is not None:
+        return settings.environment
+    try:
+        return get_settings().environment
+    except ValidationError:
+        env_var = os.environ.get("ENVIRONMENT", "").strip().lower()
+        if env_var:
+            return env_var
+        try:
+            dotenv_values = DotEnvSettingsSource(Settings)()
+            dotenv_env = dotenv_values.get("environment") or dotenv_values.get("ENVIRONMENT")
+            if isinstance(dotenv_env, str) and dotenv_env.strip():
+                return dotenv_env.strip().lower()
+        except Exception:
+            pass
+        return "development"
+
+
 def create_app(
     settings: Settings | None = None,
     *,
@@ -113,12 +175,15 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(fastapi_app: FastAPI) -> AsyncIterator[None]:
-        # Eagerly validate Settings and fail closed in production on server startup.
+        # Eagerly validate Settings and fail closed in staging/production on server startup.
         active_settings = (
             getattr(fastapi_app.state, "settings", None) or get_settings()
         )
         fastapi_app.state.settings = active_settings
-        get_engine(active_settings)
+        resolved_default_engine = False
+        if getattr(fastapi_app.state, "db_session_factory", None) is None:
+            get_engine(active_settings)
+            resolved_default_engine = True
 
         sweeper_task: asyncio.Task[None] | None = None
         if (
@@ -136,19 +201,20 @@ def create_app(
                 sweeper_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await sweeper_task
+            if (
+                resolved_default_engine
+                and getattr(fastapi_app.state, "db_session_factory", None) is None
+            ):
+                dispose_engine(active_settings)
 
-    is_production = (
-        settings.environment == "production"
-        if settings is not None
-        else os.environ.get("ENVIRONMENT", "").strip().lower() == "production"
-    )
+    disable_docs = _resolve_environment_for_docs(settings) in ("production", "staging")
 
     fastapi_app = FastAPI(
         title="E-Commerce SaaS API",
         version="1.1.0-arch",
-        docs_url=None if is_production else "/api/v1/docs",
-        redoc_url=None if is_production else "/api/v1/redoc",
-        openapi_url=None if is_production else "/api/v1/openapi.json",
+        docs_url=None if disable_docs else "/api/v1/docs",
+        redoc_url=None if disable_docs else "/api/v1/redoc",
+        openapi_url=None if disable_docs else "/api/v1/openapi.json",
         dependencies=[Depends(require_valid_origin)],
         lifespan=lifespan,
     )
@@ -177,6 +243,7 @@ def create_app(
     else:
         fastapi_app.add_middleware(_SettingsAwareCORSMiddleware, app_ref=fastapi_app)
 
+    fastapi_app.add_middleware(SensitiveRouteNoStoreMiddleware)
     fastapi_app.add_middleware(RequestIDMiddleware)
     register_exception_handlers(fastapi_app)
 

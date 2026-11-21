@@ -81,12 +81,16 @@ def validate_product_image_url(value: object) -> object:
         raise ValueError("Image URL must not contain whitespace or control characters.")
 
     decoded_pass = candidate
+    if _has_unsafe_url_chars(decoded_pass):
+        raise ValueError(
+            "Image URL must not contain control characters, path traversal, or backslashes."
+        )
     for _ in range(3):
+        decoded_pass = unquote(decoded_pass)
         if _has_unsafe_url_chars(decoded_pass):
             raise ValueError(
                 "Image URL must not contain control characters, path traversal, or backslashes."
             )
-        decoded_pass = unquote(decoded_pass)
 
     if candidate.startswith("https://"):
         try:

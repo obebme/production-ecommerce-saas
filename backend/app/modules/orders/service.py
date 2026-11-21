@@ -1168,7 +1168,7 @@ def authorize_order_access(
     if order.user_id is not None:
         if auth is None:
             raise UnauthorizedError(
-                code="AUTH_SESSION_EXPIRED",
+                code="AUTH_REQUIRED",
                 message="Authentication required.",
             )
         is_owner = auth.user.id == order.user_id

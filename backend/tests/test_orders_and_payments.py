@@ -384,9 +384,11 @@ def test_order_detail_validation_strict_owner_and_guest_token_authorization(
     assert ok_owner.status_code == 200
     assert ok_owner.json()["order_number"] == user_order_num
 
-    # Anonymous -> 401 AUTH_SESSION_EXPIRED
+    # Anonymous -> 401 AUTH_REQUIRED
     client.cookies.clear()
-    assert client.get(f"/api/v1/orders/{user_order_num}").status_code == 401
+    anon_owner = client.get(f"/api/v1/orders/{user_order_num}")
+    assert anon_owner.status_code == 401
+    assert anon_owner.json()["error"]["code"] == "AUTH_REQUIRED"
 
     # Another customer, non-owner staff, and non-owner admin -> all strictly 403 FORBIDDEN!
     for other_role in ("customer", "staff", "admin"):
@@ -2534,7 +2536,7 @@ def test_live_postgresql_be003_checkout_and_webhook_concurrency() -> None:
 
         def _guest_cap_worker(idx_and_tok: tuple[int, str]) -> tuple[int, dict[str, Any]]:
             idx, cart_tok = idx_and_tok
-            with TestClient(pg_app) as w_client:
+            with TestClient(pg_app, client=("198.51.100.10", 50000)) as w_client:
                 w_client.cookies.set(GUEST_CART_COOKIE_NAME, cart_tok)
                 gcap_barrier.wait(timeout=15)
                 resp = w_client.post(
@@ -2566,7 +2568,7 @@ def test_live_postgresql_be003_checkout_and_webhook_concurrency() -> None:
         with pg_session_factory() as verify_db:
             from app.core.security import hash_token
 
-            expected_ip_hash = hash_token("guest_ip:testclient")
+            expected_ip_hash = hash_token("guest_ip:198.51.100.10")
             gcap_orders = list(
                 verify_db.scalars(
                     select(Order).where(

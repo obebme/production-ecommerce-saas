@@ -104,6 +104,7 @@ class AuthSession(Base):
             postgresql_where=text("revoked_at IS NULL"),
             sqlite_where=text("revoked_at IS NULL"),
         ),
+        Index("idx_auth_sessions_expires_at", expires_at.asc()),
     )
 
 
@@ -133,5 +134,7 @@ class AuditLog(Base):
 
     __table_args__ = (
         Index("idx_audit_logs_created_at", created_at.desc()),
+        Index("idx_audit_logs_actor_created", "actor_user_id", created_at.desc()),
+        Index("idx_audit_logs_action_created", "action", created_at.desc()),
         Index("idx_audit_logs_resource", "resource_type", "resource_id"),
     )

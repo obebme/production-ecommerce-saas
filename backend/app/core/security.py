@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict, deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 from urllib.parse import urlsplit
@@ -157,18 +157,108 @@ def parse_client_ip(raw_host: str | None) -> str | None:
         return None
 
 
+def _resolve_trusted_proxies(request: Request) -> Sequence[str]:
+    """Resolve trusted proxy CIDRs from app.state.settings or Settings without failing on mocks."""
+    scope = getattr(request, "scope", None)
+    app_obj = scope.get("app") if isinstance(scope, Mapping) else getattr(request, "app", None)
+    state = getattr(app_obj, "state", None)
+    state_settings = getattr(state, "settings", None)
+    if state_settings is not None:
+        proxies = getattr(state_settings, "trusted_proxy_ips", None)
+        if proxies is not None:
+            return proxies  # type: ignore[no-any-return]
+    try:
+        from app.core.config import get_settings
+
+        return get_settings().trusted_proxy_ips
+    except Exception:
+        return ()
+
+
+def resolve_client_ip(
+    request: Request,
+    trusted_proxy_ips: Sequence[str] | None = None,
+) -> str | None:
+    """Resolve client IP, parsing X-Forwarded-For right-to-left only from trusted proxies."""
+    peer_ip = parse_client_ip(request.client.host if request.client else None)
+    if peer_ip is None:
+        return None
+
+    proxies = (
+        _resolve_trusted_proxies(request)
+        if trusted_proxy_ips is None
+        else trusted_proxy_ips
+    )
+    if not proxies:
+        return peer_ip
+
+    trusted_networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    for entry in proxies:
+        try:
+            trusted_networks.append(ipaddress.ip_network(entry.strip(), strict=False))
+        except ValueError:
+            continue
+    if not trusted_networks:
+        return peer_ip
+
+    peer_addr = ipaddress.ip_address(peer_ip)
+    if not any(peer_addr in net for net in trusted_networks):
+        return peer_ip
+
+    xff_raw = request.headers.get("x-forwarded-for", "")
+    if not xff_raw or not xff_raw.strip():
+        return peer_ip
+
+    for raw_hop in reversed(xff_raw.split(",")):
+        hop = raw_hop.strip()
+        if not hop:
+            return peer_ip
+        hop_ip = parse_client_ip(hop)
+        if hop_ip is None:
+            return peer_ip
+        hop_addr = ipaddress.ip_address(hop_ip)
+        if any(hop_addr in net for net in trusted_networks):
+            continue
+        return hop_ip
+
+    return peer_ip
+
+
 def get_client_ip_key(request: Request) -> str:
-    """Extract a stable client identifier for rate limiting (without trusting spoofed headers)."""
-    if request.client and request.client.host:
-        return request.client.host
-    return "unknown"
+    """Extract a stable client identifier using trusted proxy configuration."""
+    return resolve_client_ip(request) or "unknown"
 
 
 def _extract_origin_tuple(url: str) -> tuple[str, str] | None:
-    parsed = urlsplit(url.strip())
-    if not parsed.scheme or not parsed.netloc:
+    try:
+        parsed = urlsplit(url.strip())
+        port = parsed.port
+    except ValueError:
         return None
-    return (parsed.scheme.lower(), parsed.netloc.lower())
+    if (
+        not parsed.scheme
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.netloc.endswith(":")
+    ):
+        return None
+    scheme = parsed.scheme.lower()
+    if scheme not in ("http", "https"):
+        return None
+    if port is not None and (port < 1 or port > 65535):
+        return None
+    hostname = parsed.hostname.lower()
+    host_part = f"[{hostname}]" if ":" in hostname else hostname
+    if (
+        port is None
+        or (scheme == "http" and port == 80)
+        or (scheme == "https" and port == 443)
+    ):
+        netloc_normalized = host_part
+    else:
+        netloc_normalized = f"{host_part}:{port}"
+    return (scheme, netloc_normalized)
 
 
 def validate_request_origin(request: Request, allowed_origins: Sequence[str]) -> None:
@@ -206,14 +296,20 @@ def validate_request_origin(request: Request, allowed_origins: Sequence[str]) ->
                 code="CSRF_INVALID",
                 message="Null or empty Origin header is not allowed.",
             )
-        parsed = urlsplit(normalized_origin)
+        try:
+            parsed = urlsplit(normalized_origin)
+        except ValueError as exc:
+            raise ForbiddenError(
+                code="CSRF_INVALID",
+                message="Request Origin is malformed.",
+            ) from exc
+        origin_tuple = _extract_origin_tuple(normalized_origin)
         if (
-            not parsed.scheme
-            or not parsed.netloc
+            origin_tuple is None
             or parsed.path not in ("", "/")
             or parsed.query
             or parsed.fragment
-            or (parsed.scheme.lower(), parsed.netloc.lower()) not in allowed_tuples
+            or origin_tuple not in allowed_tuples
         ):
             raise ForbiddenError(
                 code="CSRF_INVALID",

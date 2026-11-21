@@ -16,7 +16,7 @@ from app.core.security import (
     get_client_ip_key,
     get_rate_limiter,
     hash_token,
-    parse_client_ip,
+    resolve_client_ip,
 )
 from app.modules.identity import service
 from app.modules.identity.dependencies import (
@@ -105,7 +105,7 @@ def register(
         full_name=payload.full_name,
         settings=settings,
         prior_session_token=request.cookies.get(SESSION_COOKIE_NAME),
-        ip_address=parse_client_ip(request.client.host if request.client else None),
+        ip_address=resolve_client_ip(request),
         user_agent=request.headers.get("user-agent"),
     )
     _set_auth_cookies(
@@ -156,7 +156,7 @@ def login(
         password=payload.password,
         settings=settings,
         prior_session_token=request.cookies.get(SESSION_COOKIE_NAME),
-        ip_address=parse_client_ip(request.client.host if request.client else None),
+        ip_address=resolve_client_ip(request),
         user_agent=request.headers.get("user-agent"),
     )
     _set_auth_cookies(

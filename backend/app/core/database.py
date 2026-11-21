@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Generator
 from datetime import UTC, datetime
 from functools import lru_cache
-from typing import Literal
+from typing import Any, Literal
 
 from fastapi import Request
 from sqlalchemy import ColumnElement, MetaData, String, case, cast, create_engine, func, text
@@ -30,7 +31,33 @@ class Base(DeclarativeBase):
     metadata = MetaData(naming_convention=POSTGRES_INDEXES_NAMING_CONVENTION)
 
 
-def create_engine_from_url(database_url: str) -> Engine:
+_EngineCacheKey = tuple[str, int, int, int, int, int, int, int]
+_engine_lock = threading.Lock()
+_tracked_engines: dict[_EngineCacheKey, Engine] = {}
+
+
+def _engine_params_from_settings(
+    database_url: str,
+    settings: Settings | None = None,
+) -> _EngineCacheKey:
+    if settings is not None:
+        return (
+            database_url,
+            settings.db_pool_size,
+            settings.db_max_overflow,
+            settings.db_pool_timeout_seconds,
+            settings.db_pool_recycle_seconds,
+            settings.db_statement_timeout_ms,
+            settings.db_lock_timeout_ms,
+            settings.db_idle_in_transaction_timeout_ms,
+        )
+    return (database_url, 5, 10, 15, 1800, 30000, 10000, 60000)
+
+
+def create_engine_from_url(
+    database_url: str,
+    settings: Settings | None = None,
+) -> Engine:
     """Build a SQLAlchemy 2.0 Engine appropriate for the configured dialect."""
     if database_url.startswith("sqlite"):
         return create_engine(
@@ -38,21 +65,108 @@ def create_engine_from_url(database_url: str) -> Engine:
             connect_args={"check_same_thread": False},
             future=True,
         )
+    (
+        _url,
+        pool_size,
+        max_overflow,
+        pool_timeout,
+        pool_recycle,
+        stmt_ms,
+        lock_ms,
+        idle_ms,
+    ) = _engine_params_from_settings(database_url, settings)
+    pg_options: list[str] = []
+    if stmt_ms > 0:
+        pg_options.append(f"-c statement_timeout={stmt_ms}")
+    if lock_ms > 0:
+        pg_options.append(f"-c lock_timeout={lock_ms}")
+    if idle_ms > 0:
+        pg_options.append(f"-c idle_in_transaction_session_timeout={idle_ms}")
+    connect_args: dict[str, Any] = {"options": " ".join(pg_options)} if pg_options else {}
     return create_engine(
         database_url,
         pool_pre_ping=True,
+        pool_size=pool_size,
+        max_overflow=max_overflow,
+        pool_timeout=pool_timeout,
+        pool_recycle=pool_recycle,
+        connect_args=connect_args,
         future=True,
     )
 
 
-@lru_cache(maxsize=4)
-def _cached_engine(database_url: str) -> Engine:
-    return create_engine_from_url(database_url)
+@lru_cache(maxsize=8)
+def _cached_engine(
+    database_url: str,
+    pool_size: int,
+    max_overflow: int,
+    pool_timeout: int,
+    pool_recycle: int,
+    stmt_ms: int,
+    lock_ms: int,
+    idle_ms: int,
+) -> Engine:
+    key: _EngineCacheKey = (
+        database_url,
+        pool_size,
+        max_overflow,
+        pool_timeout,
+        pool_recycle,
+        stmt_ms,
+        lock_ms,
+        idle_ms,
+    )
+    if database_url.startswith("sqlite"):
+        engine = create_engine(
+            database_url,
+            connect_args={"check_same_thread": False},
+            future=True,
+        )
+    else:
+        pg_options: list[str] = []
+        if stmt_ms > 0:
+            pg_options.append(f"-c statement_timeout={stmt_ms}")
+        if lock_ms > 0:
+            pg_options.append(f"-c lock_timeout={lock_ms}")
+        if idle_ms > 0:
+            pg_options.append(f"-c idle_in_transaction_session_timeout={idle_ms}")
+        connect_args: dict[str, Any] = {"options": " ".join(pg_options)} if pg_options else {}
+        engine = create_engine(
+            database_url,
+            pool_pre_ping=True,
+            pool_size=pool_size,
+            max_overflow=max_overflow,
+            pool_timeout=pool_timeout,
+            pool_recycle=pool_recycle,
+            connect_args=connect_args,
+            future=True,
+        )
+    with _engine_lock:
+        _tracked_engines[key] = engine
+    return engine
 
 
-@lru_cache(maxsize=4)
-def _cached_session_factory(database_url: str) -> sessionmaker[Session]:
-    engine = _cached_engine(database_url)
+@lru_cache(maxsize=8)
+def _cached_session_factory(
+    database_url: str,
+    pool_size: int,
+    max_overflow: int,
+    pool_timeout: int,
+    pool_recycle: int,
+    stmt_ms: int,
+    lock_ms: int,
+    idle_ms: int,
+) -> sessionmaker[Session]:
+    engine = _cached_engine(
+        database_url,
+        pool_size,
+        max_overflow,
+        pool_timeout,
+        pool_recycle,
+        stmt_ms,
+        lock_ms,
+        idle_ms,
+    )
     return sessionmaker(
         bind=engine,
         autoflush=False,
@@ -64,19 +178,38 @@ def _cached_session_factory(database_url: str) -> sessionmaker[Session]:
 def get_engine(settings: Settings | None = None) -> Engine:
     """Return the cached Engine for the active Settings."""
     resolved = settings or get_settings()
-    return _cached_engine(resolved.database_url)
+    return _cached_engine(*_engine_params_from_settings(resolved.database_url, resolved))
 
 
 def get_session_factory(settings: Settings | None = None) -> sessionmaker[Session]:
     """Return the cached sessionmaker for the active Settings."""
     resolved = settings or get_settings()
-    return _cached_session_factory(resolved.database_url)
+    return _cached_session_factory(
+        *_engine_params_from_settings(resolved.database_url, resolved)
+    )
+
+
+def dispose_engine(settings: Settings | None = None) -> None:
+    """Dispose the cached Engine matching settings and reset engine/session caches."""
+    resolved = settings or get_settings()
+    key = _engine_params_from_settings(resolved.database_url, resolved)
+    with _engine_lock:
+        engine = _tracked_engines.pop(key, None)
+        _cached_session_factory.cache_clear()
+        _cached_engine.cache_clear()
+    if engine is not None:
+        engine.dispose()
 
 
 def clear_db_caches() -> None:
-    """Dispose cached engines and reset caches (intended for tests)."""
-    _cached_session_factory.cache_clear()
-    _cached_engine.cache_clear()
+    """Dispose all cached engines and reset caches (intended for tests and shutdown)."""
+    with _engine_lock:
+        engines = list(_tracked_engines.values())
+        _tracked_engines.clear()
+        _cached_session_factory.cache_clear()
+        _cached_engine.cache_clear()
+    for engine in engines:
+        engine.dispose()
 
 
 def get_db(request: Request) -> Generator[Session, None, None]:

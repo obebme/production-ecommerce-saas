@@ -10,12 +10,16 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import event, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from tests.conftest import DEFAULT_ORIGIN, AuthenticatedSession
 
+from app.core.errors import ConflictError
 from app.models.catalog import Category, Product, ProductImage
 from app.models.identity import AuditLog
 from app.models.inventory import InventoryStock, ProductVariant
+from app.modules.catalog.schemas import CreateCategoryRequest, validate_product_image_url
+from app.modules.catalog.service import create_category
 
 
 def _csrf_headers(session: AuthenticatedSession) -> dict[str, str]:
@@ -756,7 +760,7 @@ def test_admin_categories_rbac_csrf_origin_crud_conflicts_cycles_and_audit(
         headers={"Origin": DEFAULT_ORIGIN},
     )
     assert unauth_post.status_code == 401
-    assert unauth_post.json()["error"]["code"] == "AUTH_SESSION_EXPIRED"
+    assert unauth_post.json()["error"]["code"] == "AUTH_REQUIRED"
 
     # Customer -> 403 FORBIDDEN_ROLE
     cust_session = login_as(client, role="customer")
@@ -1222,3 +1226,29 @@ def test_admin_products_rbac_crud_activation_guard_images_filters_and_archive_au
     assert archived_log.before_state["status"] == "ACTIVE"
     assert archived_log.after_state is not None
     assert archived_log.after_state["status"] == "ARCHIVED"
+
+
+def test_l03_triple_encoded_image_url_rejected_and_non_slug_integrity_conflict(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """L-03: Triple-encoded traversal rejected; non-slug IntegrityError -> INTEGRITY_CONFLICT."""
+    with pytest.raises(ValueError, match="path traversal"):
+        validate_product_image_url("/assets/%25252e%25252e/secret.png")
+
+    def _raise_fk_integrity() -> None:
+        raise IntegrityError(
+            "INSERT INTO categories ...",
+            {},
+            Exception("FOREIGN KEY constraint failed: fk_categories_parent_id_categories"),
+        )
+
+    monkeypatch.setattr(db_session, "flush", _raise_fk_integrity)
+    with pytest.raises(ConflictError) as exc_info:
+        create_category(
+            db_session,
+            payload=CreateCategoryRequest(name="Integrity Test", slug="integrity-test"),
+            actor_user_id=uuid.uuid4(),
+            ip_address=None,
+        )
+    assert exc_info.value.code == "INTEGRITY_CONFLICT"

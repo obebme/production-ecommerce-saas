@@ -9,11 +9,13 @@ x-backend-env: &backend-env
   ENVIRONMENT: ${ENVIRONMENT:-development}
   COOKIE_SECURE: ${COOKIE_SECURE:-false}
   ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000}
+  TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-}
   CSRF_HMAC_SECRET: ${CSRF_HMAC_SECRET:?CSRF_HMAC_SECRET must be set in .env}
   GUEST_ORDER_HMAC_SECRET: ${GUEST_ORDER_HMAC_SECRET:?GUEST_ORDER_HMAC_SECRET must be set in .env}
   PAYMENT_WEBHOOK_SECRET: ${PAYMENT_WEBHOOK_SECRET:?PAYMENT_WEBHOOK_SECRET must be set in .env}
   PAYMENT_SANDBOX_MODE: ${PAYMENT_SANDBOX_MODE:-true}
   SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-168}
+  RESERVATION_SWEEPER_INTERVAL_SECONDS: ${RESERVATION_SWEEPER_INTERVAL_SECONDS:-60}
   FREE_SHIPPING_THRESHOLD_CENTS: ${FREE_SHIPPING_THRESHOLD_CENTS:-10000}
   STANDARD_SHIPPING_CENTS: ${STANDARD_SHIPPING_CENTS:-1000}
   TAX_RATE_BPS: ${TAX_RATE_BPS:-800}
@@ -56,7 +58,7 @@ services:
       dockerfile: ../infra/docker/backend.Dockerfile
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
       <<: *backend-env
     depends_on:
@@ -86,7 +88,7 @@ services:
         NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000/api/v1}
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
       NODE_ENV: production
       PORT: "3000"

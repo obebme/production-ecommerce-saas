@@ -154,6 +154,7 @@ class Order(Base):
             ),
         ),
         Index("idx_orders_status_placed", "status", placed_at.desc()),
+        Index("idx_orders_placed_at", placed_at.desc()),
         Index("idx_orders_analytics_paid_at", "paid_at", "status", "payment_status"),
     )
 

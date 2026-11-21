@@ -407,7 +407,7 @@ describe("ProductDetailView", () => {
       const method = init?.method ?? "GET";
 
       if (url.endsWith("/auth/me")) {
-        return errorResponse(401, "AUTH_SESSION_EXPIRED", "Authentication required.");
+        return errorResponse(401, "AUTH_REQUIRED", "Authentication required.");
       }
       if (url.endsWith("/cart") && method === "GET") {
         return jsonResponse(makeEmptyCart());
@@ -529,7 +529,7 @@ describe("AdminShell & AdminRoleGuard RBAC", () => {
     fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.endsWith("/auth/me")) {
-        return errorResponse(401, "AUTH_SESSION_EXPIRED", "Authentication required.");
+        return errorResponse(401, "AUTH_REQUIRED", "Authentication required.");
       }
       return errorResponse(404, "NOT_FOUND", `Unexpected ${url}`);
     });
@@ -656,7 +656,7 @@ describe("AdminShell & AdminRoleGuard RBAC", () => {
     fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.endsWith("/auth/me")) {
-        return errorResponse(401, "AUTH_SESSION_EXPIRED", "Authentication required.");
+        return errorResponse(401, "AUTH_REQUIRED", "Authentication required.");
       }
       return errorResponse(404, "NOT_FOUND", `Unexpected ${url}`);
     });
@@ -859,7 +859,7 @@ describe("ProductDetailPage route validation, Auth/Cart fail-closed states & Log
       const url = String(input);
       const method = init?.method ?? "GET";
       if (url.endsWith("/auth/me")) {
-        return errorResponse(401, "AUTH_SESSION_EXPIRED", "Authentication required.");
+        return errorResponse(401, "AUTH_REQUIRED", "Authentication required.");
       }
       if (url.endsWith("/cart") && method === "GET") {
         return jsonResponse(makeEmptyCart());
@@ -1008,7 +1008,7 @@ describe("StorefrontHeader", () => {
     fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.endsWith("/auth/me")) {
-        return errorResponse(401, "AUTH_SESSION_EXPIRED", "Authentication required.");
+        return errorResponse(401, "AUTH_REQUIRED", "Authentication required.");
       }
       if (url.endsWith("/categories")) {
         return jsonResponse({ items: [] });

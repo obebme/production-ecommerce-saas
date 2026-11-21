@@ -16,8 +16,8 @@ from tests.conftest import DEFAULT_ORIGIN, DEFAULT_TEST_PASSWORD, AuthenticatedS
 
 from app.core.config import Settings
 from app.core.errors import CSRF_COOKIE_NAME, SESSION_COOKIE_NAME
-from app.core.security import hash_token
-from app.models.identity import AuthSession, User
+from app.core.security import get_client_ip_key, hash_token, resolve_client_ip
+from app.models.identity import AuditLog, AuthSession, User
 from app.modules.identity.dependencies import require_roles
 
 
@@ -223,7 +223,7 @@ def test_require_roles_positive_and_negative_across_customer_staff_admin(
         return {"role": user.role}
 
     with TestClient(rbac_app) as rbac_client:
-        # Unauthenticated -> 401 AUTH_SESSION_EXPIRED
+        # Unauthenticated -> 401 AUTH_REQUIRED
         for path in (
             "/_test/rbac/customer-only",
             "/_test/rbac/staff-or-admin",
@@ -231,7 +231,7 @@ def test_require_roles_positive_and_negative_across_customer_staff_admin(
         ):
             unauth_resp = rbac_client.get(path)
             assert unauth_resp.status_code == 401
-            assert unauth_resp.json()["error"]["code"] == "AUTH_SESSION_EXPIRED"
+            assert unauth_resp.json()["error"]["code"] == "AUTH_REQUIRED"
 
         # Customer role matrix
         login_as(rbac_client, role="customer")
@@ -421,3 +421,181 @@ def test_cookie_secure_true_sets_secure_attribute_on_issue_and_deletion(
         for cookie_name in (SESSION_COOKIE_NAME, CSRF_COOKIE_NAME):
             assert "max-age=0" in cleared_err[cookie_name]
             assert "secure" in cleared_err[cookie_name]
+
+
+def test_h04_trusted_proxy_ip_resolution_audit_session_and_rate_limit(
+    app_factory: Callable[..., FastAPI],
+    db_session: Session,
+    create_user: Callable[..., User],
+    test_settings: Settings,
+) -> None:
+    """H-04: X-Forwarded-For honored right-to-left only from trusted proxies; untrusted ignored."""
+    from starlette.requests import Request as StarletteRequest
+
+    def _make_req(
+        peer: str,
+        xff: str | None = None,
+        proxies: list[str] | None = None,
+    ) -> StarletteRequest:
+        headers: list[tuple[bytes, bytes]] = []
+        if xff is not None:
+            headers.append((b"x-forwarded-for", xff.encode("latin-1")))
+        app_obj = FastAPI()
+        if proxies is not None:
+            app_obj.state.settings = test_settings.model_copy(
+                update={"trusted_proxy_ips": proxies}
+            )
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/v1/health",
+            "headers": headers,
+            "client": (peer, 50000),
+            "app": app_obj,
+        }
+        return StarletteRequest(scope)
+
+    # 1. Untrusted peer IP ignores X-Forwarded-For completely
+    req_untrusted = _make_req(
+        peer="198.51.100.77",
+        xff="203.0.113.10",
+        proxies=["10.0.0.0/8"],
+    )
+    assert resolve_client_ip(req_untrusted) == "198.51.100.77"
+    assert get_client_ip_key(req_untrusted) == "198.51.100.77"
+
+    # 2. Trusted proxy peer parses XFF right-to-left, skipping trusted hops & spoofed leftmost
+    req_trusted = _make_req(
+        peer="10.1.2.3",
+        xff="192.0.2.99, 198.51.100.55, 10.2.3.4",
+        proxies=["10.0.0.0/8", "127.0.0.1/32"],
+    )
+    assert resolve_client_ip(req_trusted) == "198.51.100.55"
+
+    # 3. Malformed XFF falls back safely to peer IP
+    req_malformed = _make_req(
+        peer="10.1.2.3",
+        xff="198.51.100.55, bad-ip-token, 10.2.3.4",
+        proxies=["10.0.0.0/8"],
+    )
+    assert resolve_client_ip(req_malformed) == "10.1.2.3"
+
+    # 4. End-to-end HTTP login & admin audit log & rate limit behind trusted proxy
+    proxy_settings = test_settings.model_copy(
+        update={"trusted_proxy_ips": ["10.0.0.0/8"]}
+    )
+    proxy_app = app_factory(proxy_settings)
+    admin_user = create_user(email="h04-admin@example.com", role="admin")
+
+    with TestClient(proxy_app, client=("10.9.8.7", 54321)) as proxy_client:
+        login_ok = proxy_client.post(
+            "/api/v1/auth/login",
+            json={"email": admin_user.email, "password": DEFAULT_TEST_PASSWORD},
+            headers={
+                "Origin": DEFAULT_ORIGIN,
+                "X-Forwarded-For": "203.0.113.1, 198.51.100.55, 10.0.0.5",
+            },
+        )
+        assert login_ok.status_code == 200, login_ok.text
+        csrf_tok = login_ok.json()["csrf_token"]
+
+        # Trigger audit log via admin category create
+        cat_resp = proxy_client.post(
+            "/api/v1/admin/categories",
+            json={"name": "Proxy Cat", "slug": f"proxy-cat-{uuid.uuid4().hex[:6]}"},
+            headers={
+                "Origin": DEFAULT_ORIGIN,
+                "X-CSRF-Token": csrf_tok,
+                "X-Forwarded-For": "203.0.113.1, 198.51.100.55, 10.0.0.5",
+            },
+        )
+        assert cat_resp.status_code == 201, cat_resp.text
+
+        db_session.expire_all()
+        sess = db_session.scalar(
+            select(AuthSession).where(AuthSession.user_id == admin_user.id)
+        )
+        assert sess is not None and str(sess.ip_address) == "198.51.100.55"
+        aud = db_session.scalar(
+            select(AuditLog).where(
+                AuditLog.actor_user_id == admin_user.id,
+                AuditLog.action == "CATEGORY_CREATED",
+            )
+        )
+        assert aud is not None and str(aud.ip_address) == "198.51.100.55"
+
+        # Rate limit exhausts 198.51.100.88 without blocking 198.51.100.89 behind same proxy
+        proxy_app.state.rate_limiter.reset()
+        for _ in range(10):
+            r = proxy_client.post(
+                "/api/v1/auth/login",
+                json={"email": "nobody@example.com", "password": DEFAULT_TEST_PASSWORD},
+                headers={
+                    "Origin": DEFAULT_ORIGIN,
+                    "X-Forwarded-For": "198.51.100.88, 10.0.0.5",
+                },
+            )
+            assert r.status_code == 401
+        blocked = proxy_client.post(
+            "/api/v1/auth/login",
+            json={"email": "nobody@example.com", "password": DEFAULT_TEST_PASSWORD},
+            headers={
+                "Origin": DEFAULT_ORIGIN,
+                "X-Forwarded-For": "198.51.100.88, 10.0.0.5",
+            },
+        )
+        assert blocked.status_code == 429
+
+        other_client_ok = proxy_client.post(
+            "/api/v1/auth/login",
+            json={"email": "nobody@example.com", "password": DEFAULT_TEST_PASSWORD},
+            headers={
+                "Origin": DEFAULT_ORIGIN,
+                "X-Forwarded-For": "198.51.100.89, 10.0.0.5",
+            },
+        )
+        assert other_client_ok.status_code == 401
+
+
+def test_l02_origin_default_ports_accepted_and_referer_userinfo_rejected(
+    app_factory: Callable[..., FastAPI],
+    test_settings: Settings,
+) -> None:
+    """L-02: Default :443/:80 ports match normalized origins; Referer userinfo is rejected."""
+    raw_dump = test_settings.model_dump()
+    raw_dump["allowed_origins"] = [
+        "https://store.example.com:443/",
+        "http://localhost:80/",
+    ]
+    l02_settings = Settings(**raw_dump)
+    assert l02_settings.allowed_origins == [
+        "https://store.example.com",
+        "http://localhost",
+    ]
+    l02_app = app_factory(l02_settings)
+
+    with TestClient(l02_app) as l02_client:
+        # Explicit :443 Origin matches normalized https://store.example.com
+        r_https_port = l02_client.post(
+            "/api/v1/auth/login",
+            json={"email": "l02@example.com", "password": DEFAULT_TEST_PASSWORD},
+            headers={"Origin": "https://store.example.com:443"},
+        )
+        assert r_https_port.status_code == 401
+
+        # Explicit :80 Referer (when Origin omitted) matches normalized http://localhost
+        r_http_port = l02_client.post(
+            "/api/v1/auth/login",
+            json={"email": "l02@example.com", "password": DEFAULT_TEST_PASSWORD},
+            headers={"Referer": "http://localhost:80/products"},
+        )
+        assert r_http_port.status_code == 401
+
+        # Userinfo in Referer is strictly rejected -> 403 CSRF_INVALID
+        r_userinfo = l02_client.post(
+            "/api/v1/auth/login",
+            json={"email": "l02@example.com", "password": DEFAULT_TEST_PASSWORD},
+            headers={"Referer": "https://user:pass@store.example.com/shop"},
+        )
+        assert r_userinfo.status_code == 403
+        assert r_userinfo.json()["error"]["code"] == "CSRF_INVALID"

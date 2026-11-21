@@ -1,8 +1,8 @@
 # Release Runbook & Verification Matrix (`REL-001`)
 
 - **Document ID**: `REL-001` (`docs/release/RELEASE-RUNBOOK.md`)
-- **Date**: `2026-11-20`
-- **Baseline Release Status**: **Code, Unit/Integration Tests, Live E2E, CI Config, and Pre-Release Security Audit Complete (`0` Critical / High / Medium Findings)** — **NOT yet live-deployed, NOT PCI-certified**, with remote GitHub Actions CI & local Docker (`postgres:16-alpine`) container parity pending execution.
+- **Date**: `2026-11-21`
+- **Baseline Release Status**: **Phase 2 Production Hardening Code, Unit/Integration Tests, Live E2E, CI Config, and Scoped Security Review (`REM-P2-SEC`: `GO`) Complete (`0` Critical / High / Medium Findings)** — **NOT yet live-deployed, NOT PCI-certified**, with remote GitHub Actions CI & local Docker (`postgres:16-alpine`) container parity pending execution (`docker info` daemon unavailable locally).
 
 ---
 
@@ -19,16 +19,17 @@
 Complete every item before deploying to any shared staging or production environment:
 
 - [ ] **Remote CI Verification on `postgres:16-alpine`**: Push to GitHub and confirm all 5 jobs (`detect`, `ops-validate`, `backend-ci`, `frontend-ci`, `e2e-ci`) pass against `postgres:16-alpine` and Docker multi-stage builds (`backend.Dockerfile`, `frontend.Dockerfile`).
-- [ ] **Frontend `.dockerignore` (`SEC-001` `LOW-1`)**: Before running local/CI Docker builds from dirty checkouts, have `frontend` owner add `frontend/.dockerignore` excluding `node_modules/`, `.next/`, `out/`, `test-results/`, `playwright-report/`, `.env*`, `tests/`, `e2e/`, and `*.tsbuildinfo`.
-- [ ] **TLS Reverse Proxy & Headers (`SEC-001` `INFO-1`, `LOW-5`)**:
-  - Terminate TLS 1.2/1.3 at the edge proxy and inject `Strict-Transport-Security: max-age=31536000; includeSubDomains`.
-  - Pass trusted forwarded headers to `uvicorn --proxy-headers --forwarded-allow-ips=<proxy_subnet>` (`backend.Dockerfile` CMD/args) so client IP rate limiting and audit logs reflect real client IPs behind a load balancer.
-  - If routing browser API calls through same-origin `/api/v1`, fix `deriveApiConnectOrigin()` in `frontend/next.config.mjs` (`LOW-5`) so CSP `connect-src` stays strictly `'self'`.
-  - Optionally harden CSP further with per-request nonces in Next.js `middleware.ts`.
-- [ ] **Backend `Cache-Control: no-store` & Supply-Chain Pinning (`SEC-001` `LOW-2`, `LOW-4`)**:
-  - Add `Cache-Control: no-store` on PII/admin FastAPI routes (`/api/v1/admin/*`, `/api/v1/orders*`, `/api/v1/checkout/*`, `/api/v1/cart*`).
-  - Generate hash-pinned backend lockfile (`pip-compile --generate-hashes`) and enable `pip-audit` + `npm audit --audit-level=high` in CI; remove unused `python-multipart` if multipart uploads remain out of scope.
-- [ ] **Backend URL Validation Alignment (`SEC-001` `LOW-3`)**: Check `_has_unsafe_url_chars(decoded_pass)` after `unquote()` on every iteration inside `validate_product_image_url` (`backend/app/modules/catalog/schemas.py`).
+- [x] **Frontend `.dockerignore` (`SEC-001` `LOW-1` / `H-07`)**: `frontend/.dockerignore` added to exclude `node_modules/`, `.next/`, `out/`, `test-results/`, `playwright-report/`, `.env*`, `tests/`, `e2e/`, and `*.tsbuildinfo` from Docker build contexts.
+- [ ] **TLS Reverse Proxy & Forwarded-IP Deployment Hardening (`SEC-001` `INFO-1`, `LOW-5` / Phase 2 `H-04`, `M-10`)**:
+  - [ ] Terminate TLS 1.2/1.3 at the edge proxy and inject `Strict-Transport-Security: max-age=31536000; includeSubDomains`.
+  - [x] Application trusted-proxy resolution (`TRUSTED_PROXY_IPS`) implemented in `backend/app/core/security.py` (`resolve_client_ip`) and wired across rate-limit/audit/guest-cap paths (`H-04`); configure `TRUSTED_PROXY_IPS` in deployment `.env` / Compose (`--proxy-headers` optional behind explicit `TRUSTED_PROXY_IPS`).
+  - [x] Relative `/api/v1` `deriveApiConnectOrigin()` CSP `connect-src` `'self'` fix completed in `frontend/next.config.mjs` (`M-10` / `LOW-5`).
+  - [ ] Optionally harden CSP further with per-request nonces in Next.js `middleware.ts`.
+- [ ] **Backend `Cache-Control: no-store` & Supply-Chain Pinning (`SEC-001` `LOW-2`, `LOW-4` / Phase 2 `M-07`, `L-04`)**:
+  - [x] `SensitiveRouteNoStoreMiddleware` enforces `Cache-Control: no-store` on sensitive API routes (`/api/v1/{auth,cart,checkout,orders,payments,admin}`), and `frontend/next.config.mjs` sets `Cache-Control: no-store` on `/account/:path*`, `/orders/:path*`, `/checkout/:path*`, `/login`, `/register` (`M-07`).
+  - [x] Unused `python-multipart` removed from `backend/requirements.txt` and `backend/pyproject.toml` (`L-04`), and CI enforces `pip check` + `npm ls --omit=dev --depth=0`.
+  - [ ] Generate hash-pinned backend lockfile (`pip-compile --generate-hashes`) and enable `pip-audit` + `npm audit --audit-level=high` in CI.
+- [x] **Backend URL Validation Alignment (`SEC-001` `LOW-3` / Phase 2 `L-03`)**: `validate_product_image_url` (`backend/app/modules/catalog/schemas.py`) checks `_has_unsafe_url_chars` after every `unquote()` pass.
 - [ ] **Environment & Cryptographic Secrets Provisioning**:
   - Set `ENVIRONMENT=production`, `COOKIE_SECURE=true`, `PAYMENT_SANDBOX_MODE=false`, explicit `https://` `ALLOWED_ORIGINS`, strong `POSTGRES_PASSWORD` / `DATABASE_URL`, and three independent `>= 32`-char secrets (`CSRF_HMAC_SECRET`, `GUEST_ORDER_HMAC_SECRET`, `PAYMENT_WEBHOOK_SECRET`) stored in platform secret manager (never `.env` in Git).
   - If running across multiple FastAPI worker replicas, replace in-memory `SlidingWindowRateLimiter` and `GuestPendingOrderTracker` (`backend/app/core/security.py`) with shared backing state (per ADR governance / user approval).
@@ -43,12 +44,12 @@ Complete every item before deploying to any shared staging or production environ
 - **`PAYMENT_WEBHOOK_SECRET`**: Coordinate dual-step rotation with payment provider webhook signing configuration so verified webhook delivery never drops during cutover.
 
 ### 3.2 Alembic Database Migration & Rollback Runbook
-All schema changes strictly flow through Alembic (`Base.metadata.create_all()` is forbidden in app startup). Current linear head: `0002_phase1_commerce_integrity`.
+All schema changes strictly flow through Alembic (`Base.metadata.create_all()` is forbidden in app startup). Current linear head: `0003_phase2_indexes_and_cleanup`.
 
 1. **Before deploying**:
    ```bash
    cd backend
-   alembic heads   # Expect exactly 1 head revision (0002_phase1_commerce_integrity)
+   alembic heads   # Expect exactly 1 head revision (0003_phase2_indexes_and_cleanup)
    ```
 2. **Pre-migration backup**: Take a verified PostgreSQL snapshot / `pg_dump` before upgrading production schemas.
 3. **Apply migration**:
@@ -82,7 +83,12 @@ Phase 1 audit remediation (`REM-P1-BE` / `REM-P1-FE` / `REM-P1-QA` / `REM-P1-SEC
   ```
 - **Durable Refund Staging (`H-02`, `M-01`, `M-02`)**: Automated edge-case captures and 3-phase admin refunds track state via `payment_refund_requests` and `REFUND_PENDING` without holding database `FOR UPDATE` row locks across refund gateway calls.
 - **Webhook Retry & Read-Only Cart (`H-03`, `H-05`)**: Failed webhook events (`payment_webhook_events.status = 'FAILED'`) are safely reclaimable on retry while `PROCESSED` rows remain idempotent; `GET /api/v1/cart` is read-only and `CartProvider` is mounted only under the storefront layout.
-- **Atomic Guest Pending Cap (`H-06`)**: Enforced atomically in PostgreSQL via `orders.guest_client_key_hash` and namespaced `pg_advisory_xact_lock(2, hashtext(...))`. Note: until Phase 2 `H-04` configures `--proxy-headers`, reverse-proxied traffic collapses `request.client.host` to the proxy IP (sharing one guest pending-order bucket), and general IP sliding-window rate limiting (`SlidingWindowRateLimiter`) remains per-process in memory.
+- **Atomic Guest Pending Cap (`H-06`)**: Enforced atomically in PostgreSQL via `orders.guest_client_key_hash` and namespaced `pg_advisory_xact_lock(2, hashtext(...))`. Phase 2 (`H-04`) replaces blind forwarded-header trust with `resolve_client_ip(request)` configured via `TRUSTED_PROXY_IPS` (default empty = peer IP only; general `SlidingWindowRateLimiter` remains per-process in memory).
+- **Phase 2 Production Hardening (`M-03`, `M-04`, `M-05`, `M-08`, `L-05`)**:
+  - `ENVIRONMENT=staging` and `ENVIRONMENT=production` enforce fail-closed startup guards (`HTTPS` `ALLOWED_ORIGINS`, `COOKIE_SECURE=true`, PostgreSQL URL, non-placeholder credentials/secrets, distinct >=32-char secrets; `seed-demo --with-demo-users` in `staging` requires explicit `DEMO_*_PASSWORD` values) and disable `/api/v1/docs`, `/api/v1/redoc`, and `/api/v1/openapi.json` via resolved settings (including `.env`).
+  - PostgreSQL pool bounds (`db_pool_size=5`, `db_max_overflow=10`, `db_pool_timeout_seconds=15`, `db_pool_recycle_seconds=1800`) and connection-level timeouts (`db_statement_timeout_ms=30000`, `db_lock_timeout_ms=10000`, `db_idle_in_transaction_timeout_ms=60000`) are wired in `backend/app/core/database.py` with shutdown disposal in `backend/app/main.py`.
+  - Scheduled retention cleanup for expired `auth_sessions` and non-order-linked `carts`: `python -m app.cli cleanup-expired-records` (`backend/app/cli.py`).
+  - Local `compose.yaml` binds `api` (`127.0.0.1:8000:8000`) and `web` (`127.0.0.1:3000:3000`) to loopback only (`L-05`).
 
 ---
 
@@ -128,6 +134,8 @@ Following recovery of an earlier `pg_ctl` pipe hang, all local multi-process run
 | **CI & Ops Finalization (`OPS-002`)** | `4fd3512` | `PyYAML` validation of `compose.yaml` (`api, db, migrate, web`) & `.github/workflows/ci.yml` (`detect, ops-validate, backend-ci, frontend-ci, e2e-ci`); `docker compose --env-file .env.example config --quiet` (exit `0`); `node:22-alpine` aligned; CLI & Windows subprocess safeguards documented. | [.github/workflows/ci.yml](../../.github/workflows/ci.yml), [frontend.Dockerfile](../../infra/docker/frontend.Dockerfile), [local-development-and-ci.md](../ops/local-development-and-ci.md) |
 | **Pre-Release Security Audit (`SEC-001`)** | `3a7704a` | Read-only audit across backend, frontend, runners, Dockerfiles & CI: **`0` Critical, `0` High, `0` Medium** (`5` Low, `4` Info tracked); `frontend` `npm audit` **`0/681`** (`43fea31`/`df6c303`; offline inside sandbox); `backend/.venv` distributions inspected. | [SEC-001-pre-release-audit.md](../security/SEC-001-pre-release-audit.md) |
 | **Release Docs (`REL-001`)** | *(final commit)* | Root `README.md`, `docs/release/RELEASE-RUNBOOK.md`, and `docs/TASKS.md` registry completed cleanly on `main`. | [README.md](../../README.md), [RELEASE-RUNBOOK.md](./RELEASE-RUNBOOK.md), [TASKS.md](../TASKS.md) |
+| **Phase 1 Commerce Integrity (`REM-P1`)** | `90816ec` | Atomic reservation expiration/reclamation, sweeper, advisory-locked guest cap, idempotent refunds/events (`0002_phase1_commerce_integrity`). | [TASKS.md](../TASKS.md) |
+| **Phase 2 Production Hardening (`REM-P2`)** | *(Phase 2 checkpoint)* | Trusted-proxy IP resolution (`H-04`), `frontend/.dockerignore` (`H-07`), fail-closed `staging` & docs (`M-03`, `M-04`), PG pool/timeouts (`M-05`), `no-store` (`M-07`), indexes + cleanup CLI (`0003_phase2_indexes_and_cleanup`, `M-08`), client resilience & tax preview (`M-10`), `L-02`–`L-06`, QA + SEC (`GO`). | [REM-P2-verification.md](../qa/REM-P2-verification.md), [REM-P2-security-review.md](../security/REM-P2-security-review.md) |
 
 ### 6.2 Unverified Items
 
@@ -148,6 +156,6 @@ Following recovery of an earlier `pg_ctl` pipe hang, all local multi-process run
 
 ## 7. Known Risks & Release Sign-Off Notes
 
-1. **PostgreSQL Version Delta (PG 18.6 Local vs. PG 16 Target)**: SQLite (`161 passed`), live PG 18.6 (`165 passed`), and full-stack Playwright E2E on PG 18.6 (`4 passed`) passed cleanly; exact `postgres:16-alpine` container parity remains pending remote CI or local Docker Desktop startup.
-2. **`SEC-001` Low/Info Tracking**: `LOW-1` (`frontend/.dockerignore` absent before local container builds), `LOW-2` (API `Cache-Control: no-store` on PII/admin routes), `LOW-3` (3rd `unquote()` pass check in `validate_product_image_url`), `LOW-4` (pinned Python hash lockfile + `pip-audit` + unused `python-multipart`), `LOW-5` (relative `/api/v1` CSP `connect-src` fallback), and `INFO-1`..`INFO-4` (TLS edge HSTS, `uvicorn --proxy-headers`, single-process rate limiter, non-prod `DEMO_*_PASSWORD` overrides) are documented for pre-staging/production completion.
+1. **PostgreSQL Version Delta & Local Docker Daemon**: SQLite (`192 passed, 4 skipped`), live PG 18.6 (`196 passed, 0 failed, 0 skipped`), Vitest (`5 files / 69 passed`), Next.js production build (`21 routes / 19 static pages`), and full-stack Playwright E2E on PG 18.6 (`4 passed`) passed after Phase 2 edits; local Docker builds remain **BLOCKED** (`docker info` daemon unavailable) and `postgres:16-alpine` container parity remains pending remote CI or local Docker Desktop startup.
+2. **Remaining Pre-Staging / Pre-Production Items (`SEC-REM-P2` + Deferred `REM-P2-M09`)**: Phase 2 resolved `SEC-001` `LOW-1`..`LOW-5`, `H-04`, `H-07`, `M-03`–`M-05`, `M-07`, `M-08`, `M-10`, and `L-02`–`L-06`. Remaining tracked items: edge TLS HSTS & multi-replica shared rate limiter, hash-pinned `pip-compile --generate-hashes` + `pip-audit`/`npm audit`, optional Next.js CSP nonces, `REM-P2-M09` (storefront SSR, dynamic metadata, `/assets/products/*`), and `SEC-REM-P2-01`..`05` (see [REM-P2-security-review.md](../security/REM-P2-security-review.md)).
 3. **Standalone Next.js Local E2E Notice**: Local `run_e2e_stack.py` runs `next start` against `.next` (logging Next's non-blocking `output: "standalone"` notice while serving all routes cleanly); both `frontend.Dockerfile` and GitHub Actions `e2e-ci` execute the production standalone server (`node server.js` / `node .next/standalone/server.js`) with copied `.next/static` and `public/` assets.

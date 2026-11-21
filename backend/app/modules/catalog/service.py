@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from collections import deque
 from collections.abc import Sequence
-from typing import Any, cast
+from typing import Any, Literal, NoReturn, cast
 
 from sqlalchemy import ColumnElement, case, exists, func, or_, select
 from sqlalchemy.exc import IntegrityError
@@ -36,6 +36,30 @@ from app.modules.catalog.schemas import (
     UpdateProductRequest,
     ensure_utc_datetime,
 )
+
+
+def _is_slug_integrity_error(exc: IntegrityError) -> bool:
+    orig_text = f"{exc.orig!s}".lower() if exc.orig is not None else f"{exc!s}".lower()
+    return any(
+        token in orig_text
+        for token in ("uq_categories_slug", "uq_products_slug", ".slug", "slug")
+    )
+
+
+def _raise_catalog_integrity_conflict(
+    exc: IntegrityError,
+    *,
+    resource: Literal["category", "product"],
+) -> NoReturn:
+    if _is_slug_integrity_error(exc):
+        raise ConflictError(
+            code="SLUG_CONFLICT",
+            message=f"A {resource} with this slug already exists.",
+        ) from exc
+    raise ConflictError(
+        code="INTEGRITY_CONFLICT",
+        message="Catalog constraint violation.",
+    ) from exc
 
 
 def _normalize_valid_slug_or_none(raw_slug: str | None, *, max_length: int = 220) -> str | None:
@@ -594,10 +618,7 @@ def create_category(
         db.flush()
     except IntegrityError as exc:
         db.rollback()
-        raise ConflictError(
-            code="SLUG_CONFLICT",
-            message="A category with this slug already exists.",
-        ) from exc
+        _raise_catalog_integrity_conflict(exc, resource="category")
 
     record_audit_log(
         db,
@@ -710,10 +731,7 @@ def update_category(
         db.flush()
     except IntegrityError as exc:
         db.rollback()
-        raise ConflictError(
-            code="SLUG_CONFLICT",
-            message="A category with this slug already exists.",
-        ) from exc
+        _raise_catalog_integrity_conflict(exc, resource="category")
 
     record_audit_log(
         db,
@@ -925,10 +943,7 @@ def create_admin_product(
         db.flush()
     except IntegrityError as exc:
         db.rollback()
-        raise ConflictError(
-            code="SLUG_CONFLICT",
-            message="A product with this slug already exists.",
-        ) from exc
+        _raise_catalog_integrity_conflict(exc, resource="product")
 
     record_audit_log(
         db,
@@ -1038,10 +1053,7 @@ def update_admin_product(
         db.flush()
     except IntegrityError as exc:
         db.rollback()
-        raise ConflictError(
-            code="SLUG_CONFLICT",
-            message="A product with this slug already exists.",
-        ) from exc
+        _raise_catalog_integrity_conflict(exc, resource="product")
 
     record_audit_log(
         db,

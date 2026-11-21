@@ -1,16 +1,20 @@
 /** @type {import('next').NextConfig} */
 function deriveApiConnectOrigin() {
   const raw = process.env.NEXT_PUBLIC_API_BASE_URL;
-  if (!raw) {
+  const trimmed = raw ? raw.trim() : "";
+  if (!trimmed) {
     return "http://localhost:8000";
   }
+  if (trimmed.startsWith("/")) {
+    return "";
+  }
   try {
-    const parsed = new URL(raw);
+    const parsed = new URL(trimmed);
     if (parsed.protocol === "http:" || parsed.protocol === "https:") {
       return parsed.origin;
     }
   } catch {
-    // Fall back to default local origin if env value is relative or invalid
+    // Fall back to default local origin if env value is invalid
   }
   return "http://localhost:8000";
 }
@@ -27,6 +31,8 @@ const nextConfig = {
         ? "script-src 'self' 'unsafe-inline' 'unsafe-eval'"
         : "script-src 'self' 'unsafe-inline'";
 
+    const connectSources = ["'self'", deriveApiConnectOrigin()].filter(Boolean).join(" ");
+
     const csp = [
       "default-src 'self'",
       "object-src 'none'",
@@ -37,7 +43,7 @@ const nextConfig = {
       "img-src 'self' https:",
       "style-src 'self' 'unsafe-inline'",
       scriptSrc,
-      `connect-src 'self' ${deriveApiConnectOrigin()}`,
+      `connect-src ${connectSources}`,
     ].join("; ");
 
     return [
@@ -60,6 +66,26 @@ const nextConfig = {
           { key: "Referrer-Policy", value: "no-referrer" },
           { key: "Cache-Control", value: "no-store" },
         ],
+      },
+      {
+        source: "/account/:path*",
+        headers: [{ key: "Cache-Control", value: "no-store" }],
+      },
+      {
+        source: "/orders/:path*",
+        headers: [{ key: "Cache-Control", value: "no-store" }],
+      },
+      {
+        source: "/checkout/:path*",
+        headers: [{ key: "Cache-Control", value: "no-store" }],
+      },
+      {
+        source: "/login",
+        headers: [{ key: "Cache-Control", value: "no-store" }],
+      },
+      {
+        source: "/register",
+        headers: [{ key: "Cache-Control", value: "no-store" }],
       },
     ];
   },

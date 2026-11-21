@@ -389,4 +389,98 @@ describe("API client & CSRF/session security behavior", () => {
     expect(listener).toHaveBeenCalledWith("account_disabled");
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
+
+  it("does NOT trigger auth invalidation on 401 AUTH_REQUIRED, unlike 401 AUTH_SESSION_EXPIRED", async () => {
+    const listener = vi.fn();
+    registerAuthInvalidationListener(listener);
+
+    setMemoryCsrfToken("existing-csrf");
+    fetchMock.mockResolvedValueOnce(
+      errorResponse(401, "AUTH_REQUIRED", "Authentication required.", "req-anon")
+    );
+
+    await expect(cartApi.getCart()).rejects.toMatchObject({
+      status: 401,
+      code: "AUTH_REQUIRED",
+    });
+    expect(listener).not.toHaveBeenCalled();
+    expect(getMemoryCsrfToken()).toBe("existing-csrf");
+
+    fetchMock.mockResolvedValueOnce(
+      errorResponse(401, "AUTH_SESSION_EXPIRED", "Session expired.", "req-exp")
+    );
+    await expect(cartApi.getCart()).rejects.toMatchObject({
+      status: 401,
+      code: "AUTH_SESSION_EXPIRED",
+    });
+    expect(listener).toHaveBeenCalledTimes(1);
+    expect(listener).toHaveBeenCalledWith("session_expired");
+    expect(getMemoryCsrfToken()).toBeNull();
+  });
+
+  it("throws ApiError with REQUEST_TIMEOUT when fetch stalls past DEFAULT_REQUEST_TIMEOUT_MS", async () => {
+    vi.useFakeTimers();
+    try {
+      fetchMock.mockImplementationOnce(
+        (_input: RequestInfo | URL, init?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener(
+              "abort",
+              () => reject(new DOMException("The operation was aborted.", "AbortError")),
+              { once: true }
+            );
+          })
+      );
+
+      const pending = cartApi.getCart();
+      const rejection = expect(pending).rejects.toMatchObject({
+        status: 0,
+        code: "REQUEST_TIMEOUT",
+      });
+      await vi.advanceTimersByTimeAsync(15_000);
+      await rejection;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("configures strict self connect-src for relative /api/v1 and no-store on PII routes in next.config.mjs", async () => {
+    const prevBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL;
+    process.env.NEXT_PUBLIC_API_BASE_URL = "/api/v1";
+    try {
+      // @ts-expect-error — untyped .mjs Next.js config module
+      const mod = (await import("../next.config.mjs")) as {
+        default: {
+          headers: () => Promise<
+            Array<{ source: string; headers: Array<{ key: string; value: string }> }>
+          >;
+        };
+      };
+      const headerEntries = await mod.default.headers();
+      const rootEntry = headerEntries.find((entry) => entry.source === "/:path*");
+      expect(rootEntry).toBeDefined();
+      const csp = rootEntry?.headers.find((h) => h.key === "Content-Security-Policy")?.value;
+      expect(csp).toBeDefined();
+      expect(csp).toMatch(/connect-src 'self'(;|$)/);
+      expect(csp).not.toContain("localhost:8000");
+
+      for (const piiSource of [
+        "/account/:path*",
+        "/orders/:path*",
+        "/checkout/:path*",
+        "/login",
+        "/register",
+      ]) {
+        const entry = headerEntries.find((h) => h.source === piiSource);
+        expect(entry).toBeDefined();
+        expect(entry?.headers).toContainEqual({ key: "Cache-Control", value: "no-store" });
+      }
+    } finally {
+      if (prevBaseUrl === undefined) {
+        delete process.env.NEXT_PUBLIC_API_BASE_URL;
+      } else {
+        process.env.NEXT_PUBLIC_API_BASE_URL = prevBaseUrl;
+      }
+    }
+  });
 });

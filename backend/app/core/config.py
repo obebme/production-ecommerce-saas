@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 from functools import lru_cache
 from typing import Annotated, Literal
 from urllib.parse import quote_plus, urlsplit
@@ -104,6 +105,16 @@ class Settings(BaseSettings):
     allowed_origins: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["http://localhost:3000"]
     )
+    trusted_proxy_ips: Annotated[list[str], NoDecode] = Field(default_factory=list)
+
+    # PostgreSQL connection pool and session timeouts
+    db_pool_size: int = Field(default=5, ge=1, le=100)
+    db_max_overflow: int = Field(default=10, ge=0, le=100)
+    db_pool_timeout_seconds: int = Field(default=15, ge=1, le=120)
+    db_pool_recycle_seconds: int = Field(default=1800, ge=30, le=86400)
+    db_statement_timeout_ms: int = Field(default=30000, ge=0, le=300000)
+    db_lock_timeout_ms: int = Field(default=10000, ge=0, le=120000)
+    db_idle_in_transaction_timeout_ms: int = Field(default=60000, ge=0, le=600000)
 
     # Cryptographic secrets (must be supplied via environment)
     csrf_hmac_secret: str = Field(..., min_length=1, repr=False)
@@ -138,6 +149,45 @@ class Settings(BaseSettings):
             return items
         raise ValueError("ALLOWED_ORIGINS must be a comma-separated string or list of origins.")
 
+    @field_validator("trusted_proxy_ips", mode="before")
+    @classmethod
+    def _parse_trusted_proxy_ips(cls, value: object) -> list[str]:
+        raw_items: list[str]
+        if value is None:
+            return []
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped or stripped == "[]":
+                return []
+            raw_items = [item.strip() for item in stripped.split(",") if item.strip()]
+        elif isinstance(value, (list, tuple, set)):
+            raw_items = []
+            for item in value:
+                if not isinstance(item, str):
+                    raise ValueError("TRUSTED_PROXY_IPS entries must be strings.")
+                cleaned = item.strip()
+                if cleaned:
+                    raw_items.append(cleaned)
+        else:
+            raise ValueError(
+                "TRUSTED_PROXY_IPS must be a comma-separated string or list of IP/CIDR entries."
+            )
+
+        validated: list[str] = []
+        for entry in raw_items:
+            if "*" in entry or any(
+                ord(ch) < 0x20 or ord(ch) == 0x7F or ch.isspace() for ch in entry
+            ):
+                raise ValueError(f"Invalid TRUSTED_PROXY_IPS entry: '{entry}'.")
+            try:
+                network = ipaddress.ip_network(entry, strict=False)
+            except ValueError as exc:
+                raise ValueError(
+                    f"TRUSTED_PROXY_IPS entry '{entry}' is not a valid IP or CIDR network."
+                ) from exc
+            validated.append(str(network))
+        return list(dict.fromkeys(validated))
+
     @model_validator(mode="after")
     def _validate_database_and_production_security(self) -> Settings:
         if not self.database_url.strip():
@@ -154,43 +204,45 @@ class Settings(BaseSettings):
         else:
             self.database_url = self.database_url.strip()
 
-        require_https = self.environment == "production"
+        is_deployed_env = self.environment in ("staging", "production")
         self.allowed_origins = list(
             dict.fromkeys(
-                _validate_and_normalize_origin(origin, require_https=require_https)
+                _validate_and_normalize_origin(origin, require_https=is_deployed_env)
                 for origin in self.allowed_origins
             )
         )
 
-        if self.environment == "production":
-            if self.payment_sandbox_mode:
-                raise ValueError(
-                    "PAYMENT_SANDBOX_MODE must be false when ENVIRONMENT=production."
-                )
+        if self.environment == "production" and self.payment_sandbox_mode:
+            raise ValueError(
+                "PAYMENT_SANDBOX_MODE must be false when ENVIRONMENT=production."
+            )
+
+        if is_deployed_env:
+            env_label = self.environment
             if not self.cookie_secure:
-                raise ValueError("COOKIE_SECURE must be true when ENVIRONMENT=production.")
+                raise ValueError(f"COOKIE_SECURE must be true when ENVIRONMENT={env_label}.")
             if not self.allowed_origins:
                 raise ValueError(
-                    "ALLOWED_ORIGINS must be non-empty when ENVIRONMENT=production."
+                    f"ALLOWED_ORIGINS must be non-empty when ENVIRONMENT={env_label}."
                 )
             if not self.database_url.lower().startswith(
                 ("postgresql://", "postgresql+psycopg://")
             ):
                 raise ValueError(
                     "DATABASE_URL must use a postgresql:// or postgresql+psycopg:// scheme "
-                    "when ENVIRONMENT=production."
+                    f"when ENVIRONMENT={env_label}."
                 )
             if _contains_insecure_placeholder(self.database_url):
                 raise ValueError(
                     "DATABASE_URL must not contain development/CI placeholder credentials "
-                    "when ENVIRONMENT=production."
+                    f"when ENVIRONMENT={env_label}."
                 )
             if self.postgres_password is not None and _contains_insecure_placeholder(
                 self.postgres_password
             ):
                 raise ValueError(
                     "POSTGRES_PASSWORD (and DATABASE_URL) must not contain development/CI "
-                    "placeholders when ENVIRONMENT=production."
+                    f"placeholders when ENVIRONMENT={env_label}."
                 )
 
             for field_name in (
@@ -207,7 +259,7 @@ class Settings(BaseSettings):
                     raise ValueError(
                         f"{field_name.upper()} must be at least 32 characters without "
                         "leading/trailing whitespace or development/CI placeholders "
-                        "when ENVIRONMENT=production."
+                        f"when ENVIRONMENT={env_label}."
                     )
 
             if (
@@ -222,7 +274,7 @@ class Settings(BaseSettings):
             ):
                 raise ValueError(
                     "CSRF_HMAC_SECRET, GUEST_ORDER_HMAC_SECRET, and PAYMENT_WEBHOOK_SECRET "
-                    "must be distinct when ENVIRONMENT=production."
+                    f"must be distinct when ENVIRONMENT={env_label}."
                 )
 
         return self

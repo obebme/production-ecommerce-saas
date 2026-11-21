@@ -145,6 +145,7 @@ class ProductImage(Base):
     product: Mapped[Product] = relationship(back_populates="images")
 
     __table_args__ = (
+        Index("idx_product_images_product_sort", "product_id", sort_order.asc()),
         Index(
             "uq_product_primary_image",
             "product_id",

@@ -109,7 +109,7 @@ def get_auth_context(
     auth = _resolve_auth_context_from_cookie(request, db, settings)
     if auth is None:
         raise UnauthorizedError(
-            code="AUTH_SESSION_EXPIRED",
+            code="AUTH_REQUIRED",
             message="Authentication required.",
         )
     return auth

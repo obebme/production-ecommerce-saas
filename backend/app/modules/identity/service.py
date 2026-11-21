@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
+from app.core.database import ts_lt
 from app.core.errors import ConflictError, ForbiddenError, UnauthorizedError
 from app.core.security import (
     derive_csrf_token,
@@ -172,3 +173,48 @@ def update_user_profile(db: Session, user: User, *, full_name: str) -> User:
     db.commit()
     db.refresh(user)
     return user
+
+
+def purge_expired_auth_sessions(
+    db: Session,
+    *,
+    retention_days: int = 30,
+    batch_size: int = 500,
+    max_batches: int = 20,
+    now: datetime | None = None,
+) -> int:
+    """Delete expired or long-revoked auth_sessions past retention_days in bounded batches."""
+    if now is None:
+        current_time = datetime.now(UTC)
+    elif now.tzinfo is None:
+        current_time = now.replace(tzinfo=UTC)
+    else:
+        current_time = now.astimezone(UTC)
+    cutoff = current_time - timedelta(days=retention_days)
+    total_deleted = 0
+
+    for _ in range(max_batches):
+        batch_ids = list(
+            db.scalars(
+                select(AuthSession.id)
+                .where(
+                    or_(
+                        ts_lt(db, AuthSession.expires_at, cutoff),
+                        AuthSession.revoked_at.is_not(None)
+                        & ts_lt(db, AuthSession.revoked_at, cutoff),
+                    )
+                )
+                .order_by(AuthSession.id.asc())
+                .limit(batch_size)
+            ).all()
+        )
+        if not batch_ids:
+            break
+        result = db.execute(delete(AuthSession).where(AuthSession.id.in_(batch_ids)))
+        deleted = int(getattr(result, "rowcount", 0) or 0)
+        db.commit()
+        total_deleted += deleted
+        if deleted == 0:
+            break
+
+    return total_deleted

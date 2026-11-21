@@ -76,6 +76,7 @@ class Cart(Base):
             postgresql_where=text("status = 'ACTIVE' AND user_id IS NOT NULL"),
             sqlite_where=text("status = 'ACTIVE' AND user_id IS NOT NULL"),
         ),
+        Index("idx_carts_status_expires", "status", expires_at.asc()),
     )
 
 

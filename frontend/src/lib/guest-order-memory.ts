@@ -41,3 +41,8 @@ export function clearGuestOrderToken(orderNumber: string): void {
   }
   guestOrderTokens.delete(normalizedOrder);
 }
+
+/** Clear all in-memory guest order access tokens (e.g., on logout). */
+export function clearAllGuestOrderTokens(): void {
+  guestOrderTokens.clear();
+}

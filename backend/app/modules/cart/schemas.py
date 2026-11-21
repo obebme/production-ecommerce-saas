@@ -53,4 +53,6 @@ class CartDTO(BaseModel):
     item_count: int
     subtotal_cents: int
     estimated_shipping_cents: int
+    tax_rate_bps: int
+    estimated_tax_cents: int
     estimated_total_cents: int

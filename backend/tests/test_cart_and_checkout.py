@@ -14,6 +14,7 @@ from sqlalchemy import event, select
 from sqlalchemy.orm import Session
 from tests.conftest import DEFAULT_ORIGIN, AuthenticatedSession
 
+from app import cli as app_cli
 from app.core.config import Settings
 from app.core.errors import (
     CSRF_COOKIE_NAME,
@@ -24,6 +25,7 @@ from app.core.errors import (
 from app.core.security import GuestPendingOrderTracker, hash_token
 from app.models.cart import Cart, CartItem
 from app.models.catalog import Category, Product, ProductImage
+from app.models.identity import AuthSession, User
 from app.models.inventory import (
     InventoryLedgerEntry,
     InventoryReservation,
@@ -32,6 +34,7 @@ from app.models.inventory import (
 )
 from app.models.order import Order, OrderEvent, OrderItem
 from app.models.payment import PaymentIntent
+from app.modules.cart.service import purge_expired_carts
 from app.modules.catalog.schemas import ensure_utc_datetime
 from app.modules.orders.service import parse_guest_orders_cookie
 
@@ -258,6 +261,8 @@ def test_cart_get_guest_cookie_creation_reuse_and_auth_fail_closed(
         "item_count": 0,
         "subtotal_cents": 0,
         "estimated_shipping_cents": 0,
+        "tax_rate_bps": 800,
+        "estimated_tax_cents": 0,
         "estimated_total_cents": 0,
     }
     assert GUEST_CART_COOKIE_NAME not in _set_cookie_headers_by_name(
@@ -1766,3 +1771,160 @@ def test_checkout_forged_guest_orders_cookie_pair_does_not_count_toward_cap(
     )
     assert gb_4th.status_code == 429
     assert gb_4th.json()["error"]["code"] == "RATE_LIMIT_EXCEEDED"
+
+
+def test_m10_cart_dto_returns_server_tax_rate_bps_and_estimated_tax_cents(
+    db_session: Session,
+    app_factory: Callable[..., FastAPI],
+    test_settings: Settings,
+) -> None:
+    """M-10: CartDTO exposes server tax_rate_bps & estimated_tax_cents rounded per TAX_RATE_BPS."""
+    _, _, var, _ = _seed_variant(db_session, sku="M10-TAX", price_cents=1005, on_hand=10)
+    tax_settings = test_settings.model_copy(update={"tax_rate_bps": 825})
+    tax_app = app_factory(tax_settings)
+
+    with TestClient(tax_app) as tax_client:
+        empty_cart = tax_client.get("/api/v1/cart").json()
+        assert empty_cart["tax_rate_bps"] == 825
+        assert empty_cart["estimated_tax_cents"] == 0
+
+        # 1005 * 825 / 10000 = 82.9125 -> ROUND_HALF_UP = 83
+        added = tax_client.post(
+            "/api/v1/cart/items",
+            json={"variant_id": str(var.id), "quantity": 1},
+            headers={"Origin": DEFAULT_ORIGIN},
+        )
+        assert added.status_code == 200, added.text
+        cart_body = added.json()
+        assert cart_body["subtotal_cents"] == 1005
+        assert cart_body["tax_rate_bps"] == 825
+        assert cart_body["estimated_tax_cents"] == 83
+
+
+def test_m08_purge_expired_carts_and_cli_cleanup_expired_records(
+    db_session: Session,
+    test_settings: Settings,
+    create_user: Callable[..., User],
+) -> None:
+    """M-08: purge_expired_carts & cleanup-expired-records delete unlinked old carts only."""
+    from sqlalchemy.orm import sessionmaker
+
+    _, _, var, _ = _seed_variant(db_session, sku="M08-CART", price_cents=2000, on_hand=10)
+    user = create_user(email="m08-cart-user@example.com", role="customer")
+    now = datetime.now(UTC)
+
+    old_unlinked_cart = Cart(
+        guest_token_hash=hash_token("guest-old-unlinked"),
+        status="ABANDONED",
+        currency="USD",
+        expires_at=now - timedelta(days=40),
+    )
+    old_order_linked_cart = Cart(
+        guest_token_hash=hash_token("guest-old-linked"),
+        status="CONVERTED",
+        currency="USD",
+        expires_at=now - timedelta(days=40),
+    )
+    recent_expired_cart = Cart(
+        guest_token_hash=hash_token("guest-recent-exp"),
+        status="ABANDONED",
+        currency="USD",
+        expires_at=now - timedelta(days=5),
+    )
+    active_cart = Cart(
+        guest_token_hash=hash_token("guest-active"),
+        status="ACTIVE",
+        currency="USD",
+        expires_at=now + timedelta(days=5),
+    )
+    db_session.add_all(
+        [old_unlinked_cart, old_order_linked_cart, recent_expired_cart, active_cart]
+    )
+    db_session.flush()
+
+    db_session.add(
+        CartItem(
+            cart_id=old_unlinked_cart.id,
+            variant_id=var.id,
+            quantity=1,
+        )
+    )
+    db_session.add(
+        Order(
+            order_number="ORD-M08-LINKED",
+            user_id=user.id,
+            cart_id=old_order_linked_cart.id,
+            customer_email=user.email,
+            status="CONFIRMED",
+            payment_status="PAID",
+            fulfillment_status="ALLOCATED",
+            currency="USD",
+            subtotal_cents=2000,
+            discount_cents=0,
+            shipping_cents=0,
+            tax_cents=0,
+            total_cents=2000,
+            idempotency_key="m08" + "0" * 61,
+            request_fingerprint="m08" + "1" * 61,
+            shipping_address_json=_sample_address(),
+            billing_address_json=_sample_address(),
+        )
+    )
+    old_session = AuthSession(
+        user_id=user.id,
+        token_hash=hash_token("m08-old-sess"),
+        csrf_version=1,
+        expires_at=now - timedelta(days=40),
+    )
+    db_session.add(old_session)
+    db_session.commit()
+
+    # Verify direct purge_expired_carts preserves order-linked cart & active/recent carts
+    cli_factory = sessionmaker(
+        bind=db_session.get_bind(),
+        autoflush=False,
+        autocommit=False,
+        expire_on_commit=False,
+    )
+    assert (
+        app_cli.main(
+            ["cleanup-expired-records", "--retention-days", "-1"],
+            session_factory=cli_factory,
+            settings=test_settings,
+        )
+        == 1
+    )
+    assert (
+        app_cli.main(
+            [
+                "cleanup-expired-records",
+                "--retention-days",
+                "30",
+                "--batch-size",
+                "2",
+                "--max-batches",
+                "10",
+            ],
+            session_factory=cli_factory,
+            settings=test_settings,
+        )
+        == 0
+    )
+
+    old_unlinked_id = old_unlinked_cart.id
+    old_session_id = old_session.id
+    old_linked_id = old_order_linked_cart.id
+    recent_id = recent_expired_cart.id
+    active_id = active_cart.id
+
+    db_session.expunge_all()
+    assert db_session.get(Cart, old_unlinked_id) is None
+    assert db_session.get(AuthSession, old_session_id) is None
+    assert db_session.get(Cart, old_linked_id) is not None
+    assert db_session.get(Cart, recent_id) is not None
+    assert db_session.get(Cart, active_id) is not None
+
+    # Also verify direct purge_expired_carts with retention_days=0 cleans recent_expired_cart
+    assert purge_expired_carts(db_session, retention_days=0, batch_size=2, max_batches=5) == 1
+    db_session.expunge_all()
+    assert db_session.get(Cart, recent_id) is None

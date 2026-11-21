@@ -13,9 +13,15 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from sqlalchemy.exc import OperationalError
 
-from app.core.config import Settings
-from app.core.database import clear_db_caches, get_engine
-from app.main import create_app
+from app.core import database as db_module
+from app.core.config import Settings, get_settings
+from app.core.database import (
+    clear_db_caches,
+    create_engine_from_url,
+    dispose_engine,
+    get_engine,
+)
+from app.main import _resolve_environment_for_docs, create_app
 
 _STRONG_SECRET_A = "prod-csrf-hmac-secret-9f8e7d6c5b4a3210!"
 _STRONG_SECRET_B = "prod-guest-hmac-secret-1a2b3c4d5e6f7890!"
@@ -363,3 +369,201 @@ def test_production_create_app_disables_docs_and_openapi_endpoints() -> None:
     finally:
         get_engine(prod_settings).dispose()
         clear_db_caches()
+
+
+def test_h04_trusted_proxy_ips_parsing_and_rejection() -> None:
+    """H-04: TRUSTED_PROXY_IPS accepts valid IPs/CIDRs and rejects wildcards/invalid entries."""
+    ok_str = Settings(
+        **_valid_prod_kwargs(
+            trusted_proxy_ips="10.0.0.0/8, 127.0.0.1, ::1, 10.0.0.0/8",
+        )
+    )
+    assert ok_str.trusted_proxy_ips == ["10.0.0.0/8", "127.0.0.1/32", "::1/128"]
+
+    ok_empty = Settings(**_valid_prod_kwargs(trusted_proxy_ips="[]"))
+    assert ok_empty.trusted_proxy_ips == []
+
+    for bad_proxy in ("*", "10.0.0.*", "not-an-ip", "10.0.0.1/99", "10.0.0.1\n127.0.0.1"):
+        with pytest.raises(ValidationError, match="TRUSTED_PROXY_IPS"):
+            Settings(**_valid_prod_kwargs(trusted_proxy_ips=[bad_proxy]))
+
+
+def test_m03_dotenv_production_disables_docs_without_process_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """M-03: .env-only ENVIRONMENT=production disables docs even without os.environ."""
+    monkeypatch.chdir(tmp_path)
+    for var in (
+        "ENVIRONMENT",
+        "DATABASE_URL",
+        "CSRF_HMAC_SECRET",
+        "GUEST_ORDER_HMAC_SECRET",
+        "PAYMENT_WEBHOOK_SECRET",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    # Deliberately omit secrets so get_settings() fails ValidationError and falls back to .env
+    (tmp_path / ".env").write_text("ENVIRONMENT=production\n", encoding="utf-8")
+    get_settings.cache_clear()
+    try:
+        assert _resolve_environment_for_docs(None) == "production"
+        app = create_app()
+        assert app.docs_url is None
+        assert app.redoc_url is None
+        assert app.openapi_url is None
+    finally:
+        get_settings.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_fragment"),
+    [
+        ({"cookie_secure": False}, "COOKIE_SECURE"),
+        ({"allowed_origins": ["http://staging.example.com"]}, "ALLOWED_ORIGINS"),
+        ({"database_url": "sqlite:///./staging.db"}, "DATABASE_URL"),
+        (
+            {"database_url": "postgresql+psycopg://app:Change_Me_123@db:5432/ecom"},
+            "DATABASE_URL",
+        ),
+        ({"csrf_hmac_secret": "short"}, "CSRF_HMAC_SECRET"),
+        ({"csrf_hmac_secret": "staging_Change_Me_" + "a" * 20}, "CSRF_HMAC_SECRET"),
+        ({"guest_order_hmac_secret": _STRONG_SECRET_A}, "distinct"),
+    ],
+)
+def test_m04_staging_settings_fail_closed_and_allow_sandbox(
+    overrides: dict[str, Any],
+    expected_fragment: str,
+) -> None:
+    """M-04: Staging rejects insecure flags/SQLite/weak secrets, while allowing sandbox=True."""
+    staging_ok = Settings(
+        **_valid_prod_kwargs(
+            environment="staging",
+            payment_sandbox_mode=True,
+            allowed_origins=["https://staging.example.com"],
+        )
+    )
+    assert staging_ok.environment == "staging"
+    assert staging_ok.payment_sandbox_mode is True
+
+    staging_kwargs = _valid_prod_kwargs(
+        environment="staging",
+        payment_sandbox_mode=True,
+        allowed_origins=["https://staging.example.com"],
+    )
+    staging_kwargs.update(overrides)
+    with pytest.raises(ValidationError, match=expected_fragment):
+        Settings(**staging_kwargs)
+
+
+def test_m05_postgres_engine_pool_timeouts_and_lifespan_disposal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """M-05: PG pool/timeouts forwarded, clear_db_caches/dispose_engine & lifespan dispose."""
+    captured_calls: list[tuple[str, dict[str, Any]]] = []
+    disposed_engines: list[str] = []
+
+    class _FakeEngine:
+        def __init__(self, label: str) -> None:
+            self.label = label
+            self.dispose_calls = 0
+
+        def dispose(self) -> None:
+            self.dispose_calls += 1
+            disposed_engines.append(self.label)
+
+    def _fake_create_engine(url: str, **kwargs: Any) -> _FakeEngine:
+        captured_calls.append((url, kwargs))
+        return _FakeEngine(f"engine-{len(captured_calls)}")
+
+    monkeypatch.setattr(db_module, "create_engine", _fake_create_engine)
+    clear_db_caches()
+
+    pg_settings = Settings(
+        **_valid_prod_kwargs(
+            db_pool_size=7,
+            db_max_overflow=14,
+            db_pool_timeout_seconds=22,
+            db_pool_recycle_seconds=900,
+            db_statement_timeout_ms=25000,
+            db_lock_timeout_ms=8000,
+            db_idle_in_transaction_timeout_ms=45000,
+        )
+    )
+
+    try:
+        direct = create_engine_from_url(pg_settings.database_url, pg_settings)
+        assert isinstance(direct, _FakeEngine)
+        url, kwargs = captured_calls[0]
+        assert url == pg_settings.database_url
+        assert kwargs["pool_size"] == 7
+        assert kwargs["max_overflow"] == 14
+        assert kwargs["pool_timeout"] == 22
+        assert kwargs["pool_recycle"] == 900
+        opts = kwargs["connect_args"]["options"]
+        assert "-c statement_timeout=25000" in opts
+        assert "-c lock_timeout=8000" in opts
+        assert "-c idle_in_transaction_session_timeout=45000" in opts
+
+        cached_eng = get_engine(pg_settings)
+        assert get_engine(pg_settings) is cached_eng
+        dispose_engine(pg_settings)
+        assert cached_eng.dispose_calls == 1
+
+        cached_eng_2 = get_engine(pg_settings)
+        clear_db_caches()
+        assert cached_eng_2.dispose_calls == 1
+    finally:
+        clear_db_caches()
+
+    # Lifespan disposal on default-resolved engine (SQLite file under tmp_path)
+    monkeypatch.undo()
+    clear_db_caches()
+    sqlite_settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'lifespan.db'}",
+        environment="test",
+        cookie_secure=False,
+        allowed_origins=["http://localhost:3000"],
+        csrf_hmac_secret=_STRONG_SECRET_A,
+        guest_order_hmac_secret=_STRONG_SECRET_B,
+        payment_webhook_secret=_STRONG_SECRET_C,
+        payment_sandbox_mode=True,
+    )
+    dispose_spy_calls: list[Settings | None] = []
+    real_dispose = db_module.dispose_engine
+
+    def _spy_dispose(s: Settings | None = None) -> None:
+        dispose_spy_calls.append(s)
+        real_dispose(s)
+
+    monkeypatch.setattr("app.main.dispose_engine", _spy_dispose)
+    app = create_app(sqlite_settings)
+    with TestClient(app):
+        pass
+    assert len(dispose_spy_calls) == 1
+    assert dispose_spy_calls[0] is sqlite_settings
+
+
+def test_m07_sensitive_routes_no_store_headers_and_catalog_not_forced(
+    client: TestClient,
+) -> None:
+    """M-07: Sensitive API paths enforce Cache-Control: no-store; public catalog/health do not."""
+    for method, path in (
+        ("GET", "/api/v1/auth/me"),
+        ("GET", "/api/v1/cart"),
+        ("POST", "/api/v1/checkout/orders"),
+        ("GET", "/api/v1/orders"),
+        ("GET", "/api/v1/admin/orders"),
+    ):
+        resp = client.request(
+            method,
+            path,
+            headers={"Origin": "http://localhost:3000"} if method != "GET" else None,
+        )
+        assert resp.headers.get("Cache-Control") == "no-store", (method, path, resp.headers)
+
+    for public_path in ("/api/v1/products", "/api/v1/health"):
+        pub_resp = client.get(public_path)
+        assert pub_resp.status_code == 200
+        assert pub_resp.headers.get("Cache-Control") != "no-store"

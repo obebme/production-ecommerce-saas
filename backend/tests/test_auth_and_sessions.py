@@ -21,6 +21,7 @@ from app.modules.identity.dependencies import (
     revoke_all_user_sessions,
 )
 from app.modules.identity.schemas import LoginRequest, RegisterRequest
+from app.modules.identity.service import purge_expired_auth_sessions
 
 
 def _set_cookie_headers_by_name(headers: list[str]) -> dict[str, str]:
@@ -587,3 +588,70 @@ def test_sliding_window_rate_limiter_per_bucket_windows_and_max_keys_eviction() 
 
     with pytest.raises(ValueError, match="max_keys"):
         SlidingWindowRateLimiter(max_keys=0)
+
+
+def test_m08_purge_expired_auth_sessions_and_retention(
+    db_session: Session,
+    create_user: Callable[..., User],
+) -> None:
+    """M-08: purge_expired_auth_sessions deletes old expired/revoked rows and keeps active."""
+    user = create_user(email="m08-purge-sess@example.com")
+    now = datetime(2026, 11, 21, 12, 0, 0, tzinfo=UTC)
+
+    old_expired = AuthSession(
+        user_id=user.id,
+        token_hash=hash_token("tok-old-exp"),
+        csrf_version=1,
+        expires_at=now - timedelta(days=35),
+    )
+    old_revoked = AuthSession(
+        user_id=user.id,
+        token_hash=hash_token("tok-old-rev"),
+        csrf_version=1,
+        expires_at=now + timedelta(days=5),
+        revoked_at=now - timedelta(days=31),
+    )
+    recent_expired = AuthSession(
+        user_id=user.id,
+        token_hash=hash_token("tok-recent-exp"),
+        csrf_version=1,
+        expires_at=now - timedelta(days=5),
+    )
+    active_sess = AuthSession(
+        user_id=user.id,
+        token_hash=hash_token("tok-active"),
+        csrf_version=1,
+        expires_at=now + timedelta(days=5),
+    )
+    db_session.add_all([old_expired, old_revoked, recent_expired, active_sess])
+    db_session.commit()
+
+    deleted = purge_expired_auth_sessions(
+        db_session,
+        retention_days=30,
+        batch_size=1,
+        max_batches=10,
+        now=now,
+    )
+    assert deleted == 2
+
+    db_session.expire_all()
+    assert db_session.get(AuthSession, old_expired.id) is None
+    assert db_session.get(AuthSession, old_revoked.id) is None
+    assert db_session.get(AuthSession, recent_expired.id) is not None
+    assert db_session.get(AuthSession, active_sess.id) is not None
+
+
+def test_m10_anonymous_401_auth_required_vs_invalid_cookie_auth_session_expired(
+    client: TestClient,
+) -> None:
+    """M-10: Missing cookie -> AUTH_REQUIRED; stale/invalid cookie -> AUTH_SESSION_EXPIRED."""
+    client.cookies.clear()
+    anon_resp = client.get("/api/v1/auth/me")
+    assert anon_resp.status_code == 401
+    assert anon_resp.json()["error"]["code"] == "AUTH_REQUIRED"
+
+    client.cookies.set(SESSION_COOKIE_NAME, "bogus-stale-cookie")
+    stale_resp = client.get("/api/v1/auth/me")
+    assert stale_resp.status_code == 401
+    assert stale_resp.json()["error"]["code"] == "AUTH_SESSION_EXPIRED"

@@ -1,22 +1,22 @@
-# Local Development, Container Topology & CI Runbook (`OPS-002`)
+# Local Development, Container Topology & CI Runbook (`OPS-002` / `REM-P2-OPS`)
 
 > **Scope**: Reproducible Docker Compose setup, multi-stage Dockerfiles, environment templates, database migration and CLI administration workflows, local PostgreSQL/E2E runners, Windows subprocess operational safeguards, and GitHub Actions CI.  
 > **Baseline Constraint**: Minimum 4-service stack (`db`, `migrate`, `api`, `web`) with PostgreSQL 16 as single source of truth. Redis, Celery, Kubernetes, and external SaaS services are intentionally excluded per `ARCH-001`.
 
 ---
 
-## 1. Prerequisites & Verification Status (`OPS-002`)
+## 1. Prerequisites & Verification Status (`OPS-002` / `REM-P2-OPS`)
 
 ### Verified vs. Unverified vs. Blocked Capabilities
 
 | Area | Status | Notes / Evidence |
 | :--- | :--- | :--- |
 | `compose.yaml` & `.github/workflows/ci.yml` YAML parsing | **Verified** | Validated statically via Python `PyYAML` and `ops-validate` service assertions |
-| `.env.example` variable coverage & placeholder check | **Verified** | All 17 required keys match `Settings` in [config.py](../../backend/app/core/config.py) |
-| `docker compose --env-file .env.example config --quiet` | **Verified** | Validated locally via Docker Compose CLI (`v5.6.0`) |
-| Backend quality gates & live PostgreSQL 18.6 suite (`BE-004` / `QA-BE-004`) | **Verified (Host)** | `ruff check .` (`0`), `mypy app tests/run_disposable_pg_pytest.py tests/test_admin_and_analytics.py` (`0 issues / 55 files`), `alembic heads` (`0001_initial_schema`), SQLite `pytest -v` (`161 passed, 4 skipped`), [run_disposable_pg_pytest.py](../../backend/tests/run_disposable_pg_pytest.py) (`165 passed, 0 skipped`) |
-| Frontend gates & live Chromium E2E (`FE-003` / `QA-FE-003` / `QA-E2E-001`) | **Verified (Host)** | `npm run lint`, `npx tsc --noEmit`, `npm run build` (`output: "standalone"`), Vitest (`60 passed` / 5 files), [run_e2e_stack.py](../../frontend/e2e/run_e2e_stack.py) (`4 passed` against disposable PostgreSQL 18.6 + `uvicorn` + `next start`) |
-| Container image builds (`docker build`) & `docker compose up --build` | **Blocked locally / Unverified** | Local Docker Desktop Linux Engine daemon is not running (`npipe:////./pipe/dockerDesktopLinuxEngine` unavailable on host); verified in CI via `ops-validate` |
+| `.env.example` variable coverage & placeholder check | **Verified** | All 18 required keys + optional `TRUSTED_PROXY_IPS` match `Settings` in [config.py](../../backend/app/core/config.py) |
+| `docker compose --env-file .env.example config --quiet` | **Verified** | Validated locally via Docker Compose CLI |
+| Alembic migration head check (`alembic heads`) | **Verified (Host)** | Single linear head `0003_phase2_indexes_and_cleanup (head)` |
+| Phase 1 / Phase 2 full test & E2E suites | **Prior baseline verified (`REM-P1-QA`); `REM-P2-QA` pending** | Phase 1 verified (`173` SQLite / `177` PG 18.6, `64` Vitest, `4` Playwright E2E); Phase 2 (`0003` migration + hardening) awaits `REM-P2-QA` |
+| Container image builds (`docker build`) & `docker compose up --build` | **Blocked locally / Unverified** | Local Docker daemon is not running (`npipe:////./pipe/docker_engine` unavailable on host); configured in CI via `ops-validate` |
 | Exact PostgreSQL 16 (`postgres:16-alpine`) CI parity (`backend-ci`, `e2e-ci`) | **Configured for CI / Pending remote CI run** | Configured in [ci.yml](../../.github/workflows/ci.yml) using `postgres:16-alpine` service containers + least-privilege `ecom_test` role |
 
 Required host tooling:
@@ -98,21 +98,26 @@ docker compose down -v
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | `db` | `postgres:16-alpine` | N/A | `127.0.0.1:5432:5432` | `pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}` | None |
 | `migrate` | [backend.Dockerfile](../../infra/docker/backend.Dockerfile) | `./backend` | None | One-shot exit code `0` | `db` (`service_healthy`) |
-| `api` | [backend.Dockerfile](../../infra/docker/backend.Dockerfile) | `./backend` | `8000:8000` | Python `urllib.request` on `http://127.0.0.1:8000/api/v1/health` (`HTTP 200`) | `db` (`service_healthy`), `migrate` (`service_completed_successfully`) |
-| `web` | [frontend.Dockerfile](../../infra/docker/frontend.Dockerfile) | `./frontend` | `3000:3000` | Node `http.get` on `http://127.0.0.1:3000/` (`HTTP 2xx/3xx`) | `api` (`service_healthy`) |
+| `api` | [backend.Dockerfile](../../infra/docker/backend.Dockerfile) | `./backend` | `127.0.0.1:8000:8000` | Python `urllib.request` on `http://127.0.0.1:8000/api/v1/health` (`HTTP 200`) | `db` (`service_healthy`), `migrate` (`service_completed_successfully`) |
+| `web` | [frontend.Dockerfile](../../infra/docker/frontend.Dockerfile) | `./frontend` | `127.0.0.1:3000:3000` | Node `http.get` on `http://127.0.0.1:3000/` (`HTTP 2xx/3xx`) | `api` (`service_healthy`) |
 
 ### Container Hardening & Build Notes
 
-- **Non-root Execution**:
-  - [backend.Dockerfile](../../infra/docker/backend.Dockerfile) runs as `appuser` (`UID 10001`, `nologin`) using an isolated `/opt/venv` copied from a multi-stage `python:3.12-slim` builder image (no compilers in runtime).
+- **Loopback-Only Dev Port Bindings (`L-05`)**:
+  - `db`, `api`, and `web` bind strictly to `127.0.0.1` (`127.0.0.1:5432`, `127.0.0.1:8000`, `127.0.0.1:3000`) in [compose.yaml](../../compose.yaml) so local development/sandbox containers never listen on `0.0.0.0` LAN interfaces.
+- **Layer Caching (`L-04`) & Non-root Execution**:
+  - [backend.Dockerfile](../../infra/docker/backend.Dockerfile) copies `requirements.txt` and `pyproject.toml` and installs dependencies into `/opt/venv` **before** `COPY . /build`, preserving the Docker dependency layer cache when only application code changes. Runtime runs as `appuser` (`UID 10001`, `nologin`) without compilers.
   - [frontend.Dockerfile](../../infra/docker/frontend.Dockerfile) runs as `nextjs` (`UID 10001`) on `node:22-alpine`, copying the `output: "standalone"` runtime bundle (`server.js`, `.next/static`, `public`, and minimal traced `node_modules`) without shipping dev dependencies such as `vitest` or `@playwright/test`.
+- **Trusted Proxy IP & Uvicorn Proxy-Headers (`H-04`)**:
+  - App-level `resolve_client_ip` in [security.py](../../backend/app/core/security.py) validates the TCP peer IP (`request.client.host`) against `TRUSTED_PROXY_IPS` before parsing `X-Forwarded-For` right-to-left, regardless of whether Uvicorn `--proxy-headers` is enabled.
+  - Keep the default `CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]` (and **never** pass `--forwarded-allow-ips=*`, which overwrites `request.client.host` and bypasses peer-IP trust verification). If `--proxy-headers` is required behind a TLS-terminating reverse proxy for scheme/host forwarding, pass `--forwarded-allow-ips=<exact-proxy-ip-or-cidr>` matching `TRUSTED_PROXY_IPS`.
 - **No `curl` Required**: Health checks use Python `urllib.request` and Node `http.get` built-ins to keep minimal runtime images free of extra utilities.
 - **Browser vs. SSR URL Split**:
   - `NEXT_PUBLIC_API_BASE_URL=http://localhost:8000/api/v1` is passed as a Docker build arg (and CSP `connect-src` origin) so browser requests target `localhost:8000` (same-site as `localhost:3000` for `SameSite=Lax` HTTP-only cookies).
   - `INTERNAL_API_BASE_URL=http://api:8000/api/v1` is passed as a runtime env var for Next.js SSR fetches inside the Compose network (`http://127.0.0.1:8000/api/v1` when running on a single host outside Docker).
-- **Docker Build Context Hygiene**:
+- **Docker Build Context Hygiene (`H-07`)**:
   - [backend/.dockerignore](../../backend/.dockerignore) excludes `.venv/`, `__pycache__/`, `.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/`, `.env*`, and `tests/`.
-  - `frontend/` currently does not ship a `.dockerignore` file (owned by `frontend/**`). On clean CI checkouts `frontend.Dockerfile` builds directly without host artifacts; when building locally after running host `npm install` or `npm run build`, avoid copying host `node_modules/` or `.next/` into Alpine builds until a `frontend/.dockerignore` excluding `node_modules/`, `.next/`, `test-results/`, and `.env*` is added by the frontend owner.
+  - [frontend/.dockerignore](../../frontend/.dockerignore) excludes `node_modules/`, `.next/`, `out/`, `test-results/`, `playwright-report/`, `.env`, `.env*`, `tests/`, `e2e/`, `*.tsbuildinfo`, `.git/`, and `coverage/`.
 
 ---
 
@@ -136,7 +141,7 @@ Before opening or merging a PR with schema changes, confirm Alembic has exactly 
 docker compose run --rm --no-deps api alembic heads
 ```
 
-Expected output: a single revision line (`0001_initial_schema (head)`). Multiple heads fail CI in `backend-ci`.
+Expected output: a single revision line (`0003_phase2_indexes_and_cleanup (head)`). Multiple heads fail CI in `backend-ci`.
 
 ### Rollback Workflow (Development / Recovery)
 
@@ -193,6 +198,20 @@ DEMO_CUSTOMER_PASSWORD='<strong-unique-password>' \
 > **Fail-Closed Production Guard & Default Password Warning (`BE-004` `INFO-1`)**:
 > 1. `seed-demo` **hard-fails with exit code `1`** whenever `ENVIRONMENT=production` (`Error: Refusing to run seed-demo when ENVIRONMENT=production.`).
 > 2. When `--with-demo-users` is passed and `DEMO_ADMIN_PASSWORD`, `DEMO_STAFF_PASSWORD`, or `DEMO_CUSTOMER_PASSWORD` are unset, `cli.py` falls back to repository default demo passwords in non-production environments. **Always override all three `DEMO_*_PASSWORD` environment variables with strong unique passwords whenever running `--with-demo-users` outside disposable local development** (such as staging or shared test environments).
+
+### Reservation Sweeper & Expired Record Cleanup (`app.cli`)
+
+- **Reservation Sweeper (`sweep-expired-reservations`)**:
+  - By default, FastAPI runs an in-process background sweeper every `RESERVATION_SWEEPER_INTERVAL_SECONDS` (`60` seconds in `.env.example`; set `0` to disable if running externally via cron/job).
+  - Manual/scheduled one-shot execution:
+    ```bash
+    python -m app.cli sweep-expired-reservations --batch-size 100 --max-batches 20
+    ```
+- **Expired Session & Cart Cleanup (`cleanup-expired-records`, `M-08`)**:
+  - Purges expired/revoked `auth_sessions` and unreferenced expired `carts` in bounded batches using the indexes introduced in migration `0003_phase2_indexes_and_cleanup`:
+    ```bash
+    python -m app.cli cleanup-expired-records --retention-days 30 --batch-size 500 --max-batches 20
+    ```
 
 ---
 
@@ -296,15 +315,15 @@ The GitHub Actions workflow ([ci.yml](../../.github/workflows/ci.yml)) runs on `
 2. **`ops-validate`** (`needs: detect`):
    - Parses `compose.yaml` and `.github/workflows/ci.yml` with `PyYAML`.
    - Verifies `compose.yaml` defines only the 4 baseline services (`db`, `migrate`, `api`, `web`).
-   - Verifies `.env` is untracked in Git and `.env.example` defines all 17 required keys with `CHANGE_ME_DEV_ONLY_` secret placeholders.
+   - Verifies `.env` is untracked in Git and `.env.example` defines all 18 required keys (plus optional `TRUSTED_PROXY_IPS`) with `CHANGE_ME_DEV_ONLY_` secret placeholders.
    - Runs `docker compose --env-file .env.example config --quiet`.
    - Builds `infra/docker/backend.Dockerfile` and `infra/docker/frontend.Dockerfile` (Node 22 Alpine).
 3. **`backend-ci`** (`needs: detect`, `postgres:16-alpine` service):
    - Provisions least-privilege `ecom_test` role (`NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION`) and `ecom_test` database on PostgreSQL 16.
    - Exports both `DATABASE_URL` and `TEST_DATABASE_URL` (`postgresql+psycopg://ecom_test:ecom_test_password@localhost:5432/ecom_test`) so all live PostgreSQL 16 migration, constraint, concurrency, and analytics/INET tests execute instead of skipping.
-   - Runs `ruff check .`, `mypy app tests/run_disposable_pg_pytest.py tests/test_admin_and_analytics.py`, single-head `alembic heads` check, `alembic upgrade head`, and `pytest -v`.
+   - Runs `python -m pip check`, `ruff check .`, `mypy app tests/run_disposable_pg_pytest.py tests/test_admin_and_analytics.py`, single-head `alembic heads` check (`0003_phase2_indexes_and_cleanup`), `alembic upgrade head`, and `pytest -v`.
 4. **`frontend-ci`** (`needs: detect`, Node.js 22):
-   - Runs `npm ci`, `npm run lint`, `npx tsc --noEmit`, `npm run build`, and `npm test` (Vitest unit/component suite).
+   - Runs `npm ci`, `npm ls --omit=dev --depth=0`, `npm run lint`, `npx tsc --noEmit`, `npm run build`, and `npm test` (Vitest unit/component suite).
 5. **`e2e-ci`** (`needs: [backend-ci, frontend-ci]`, `postgres:16-alpine` service, Python 3.12 + Node.js 22):
    - Generates masked ephemeral CI HMAC secrets and demo passwords (`::add-mask::`), provisions least-privilege `ecom_test` on PostgreSQL 16, runs `alembic upgrade head`, and runs `python -m app.cli seed-demo --with-demo-users`.
    - Installs frontend dependencies (`npm ci`), installs Playwright Chromium (`npx playwright install --with-deps chromium`), and builds the Next.js standalone bundle (`NEXT_PUBLIC_API_BASE_URL=http://localhost:8000/api/v1 npm run build`).

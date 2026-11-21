@@ -20,9 +20,11 @@ from app.core.security import hash_password
 from app.models.catalog import Category, Product, ProductImage
 from app.models.identity import User
 from app.models.inventory import InventoryLedgerEntry, InventoryStock, ProductVariant
+from app.modules.cart.service import purge_expired_carts
 from app.modules.catalog.schemas import strip_single_line
 from app.modules.identity.dependencies import revoke_all_user_sessions
 from app.modules.identity.schemas import UserRole
+from app.modules.identity.service import purge_expired_auth_sessions
 from app.modules.inventory.service import reclaim_all_expired_reservations
 
 _EMAIL_ADAPTER = TypeAdapter(EmailStr)
@@ -496,6 +498,20 @@ def _cmd_seed_demo(
         )
         return 1
 
+    if active_settings.environment == "staging" and args.with_demo_users:
+        missing_vars = [
+            env_var
+            for _email, _full_name, _role, env_var, _default_pw in _DEMO_USERS
+            if not os.environ.get(env_var)
+        ]
+        if missing_vars:
+            print(
+                "Error: In staging, --with-demo-users requires explicit non-empty "
+                f"environment variables: {', '.join(missing_vars)}.",
+                file=sys.stderr,
+            )
+            return 1
+
     factory = session_factory or get_session_factory(active_settings)
     created_products = 0
     created_variants = 0
@@ -605,7 +621,10 @@ def _cmd_seed_demo(
 
         if args.with_demo_users:
             for email, full_name, role, env_var, default_pw in _DEMO_USERS:
-                raw_pw = os.environ.get(env_var) or default_pw
+                if active_settings.environment == "staging":
+                    raw_pw = os.environ.get(env_var) or ""
+                else:
+                    raw_pw = os.environ.get(env_var) or default_pw
                 try:
                     validated_pw = _validate_password(raw_pw)
                 except ValueError as exc:
@@ -656,6 +675,39 @@ def _cmd_sweep_expired_reservations(
             max_batches=args.max_batches,
         )
     print(f"Reclaimed {reclaimed} expired reservation order(s).")
+    return 0
+
+
+def _cmd_cleanup_expired_records(
+    args: argparse.Namespace,
+    *,
+    session_factory: sessionmaker[Session] | None,
+    settings: Settings | None,
+) -> int:
+    if args.retention_days < 0 or args.batch_size < 1 or args.max_batches < 1:
+        print(
+            "Error: --retention-days must be >= 0 and --batch-size/--max-batches must be >= 1.",
+            file=sys.stderr,
+        )
+        return 1
+    active_settings = settings or get_settings()
+    factory = session_factory or get_session_factory(active_settings)
+    with factory() as db:
+        deleted_sessions = purge_expired_auth_sessions(
+            db,
+            retention_days=args.retention_days,
+            batch_size=args.batch_size,
+            max_batches=args.max_batches,
+        )
+        deleted_carts = purge_expired_carts(
+            db,
+            retention_days=args.retention_days,
+            batch_size=args.batch_size,
+            max_batches=args.max_batches,
+        )
+    print(
+        f"Cleaned up expired records (auth_sessions={deleted_sessions}, carts={deleted_carts})."
+    )
     return 0
 
 
@@ -723,6 +775,29 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Maximum batches to execute in one run (default: 20).",
     )
 
+    cleanup_parser = subparsers.add_parser(
+        "cleanup-expired-records",
+        help="Purge expired auth_sessions and unreferenced expired carts in bounded batches.",
+    )
+    cleanup_parser.add_argument(
+        "--retention-days",
+        type=int,
+        default=30,
+        help="Minimum age in days past expiry/revocation before deletion (default: 30).",
+    )
+    cleanup_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=500,
+        help="Maximum rows to delete per transaction batch (default: 500).",
+    )
+    cleanup_parser.add_argument(
+        "--max-batches",
+        type=int,
+        default=20,
+        help="Maximum batches to execute per table (default: 20).",
+    )
+
     return parser
 
 
@@ -742,6 +817,10 @@ def main(
         return _cmd_seed_demo(args, session_factory=session_factory, settings=settings)
     if args.command == "sweep-expired-reservations":
         return _cmd_sweep_expired_reservations(
+            args, session_factory=session_factory, settings=settings
+        )
+    if args.command == "cleanup-expired-records":
+        return _cmd_cleanup_expired_records(
             args, session_factory=session_factory, settings=settings
         )
 

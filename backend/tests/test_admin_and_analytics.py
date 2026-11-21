@@ -306,8 +306,9 @@ def test_admin_and_analytics_rbac_and_csrf_matrix(
         ("GET", "/api/v1/admin/analytics/inventory-health", None),
     ]
 
-    # 1. Anonymous and stale session cookie -> 401 AUTH_SESSION_EXPIRED on all 13 routes
+    # 1. Anonymous -> 401 AUTH_REQUIRED; stale session cookie -> 401 AUTH_SESSION_EXPIRED
     for stale_cookie in (None, "invalid-stale-session-token"):
+        expected_code = "AUTH_REQUIRED" if stale_cookie is None else "AUTH_SESSION_EXPIRED"
         client.cookies.clear()
         if stale_cookie is not None:
             client.cookies.set(SESSION_COOKIE_NAME, stale_cookie)
@@ -319,7 +320,7 @@ def test_admin_and_analytics_rbac_and_csrf_matrix(
                 headers={"Origin": DEFAULT_ORIGIN} if method != "GET" else None,
             )
             assert resp.status_code == 401, (stale_cookie, method, path, resp.text)
-            assert resp.json()["error"]["code"] == "AUTH_SESSION_EXPIRED"
+            assert resp.json()["error"]["code"] == expected_code
 
     # 2. Customer with valid CSRF -> 403 FORBIDDEN_ROLE on all 13 routes
     cust_session = login_as(client, role="customer", email="rbac-cust@example.com")
@@ -2560,6 +2561,69 @@ def test_sec_rem_p1_03_admin_refund_rejects_concurrent_pending_within_60s(
     )
     assert resp.status_code == 409, resp.text
     assert resp.json()["error"]["code"] == "REFUND_IN_PROGRESS"
+
+
+def test_m04_seed_demo_staging_requires_explicit_demo_passwords(
+    db_session: Session,
+    test_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M-04: Staging seed-demo --with-demo-users fails closed unless all DEMO_*_PASSWORD set."""
+    staging_settings = test_settings.model_copy(
+        update={
+            "environment": "staging",
+            "cookie_secure": True,
+            "allowed_origins": ["https://staging.example.com"],
+            "payment_sandbox_mode": True,
+        }
+    )
+    cli_factory = sessionmaker(
+        bind=db_session.get_bind(),
+        autoflush=False,
+        autocommit=False,
+        expire_on_commit=False,
+    )
+    for var in ("DEMO_ADMIN_PASSWORD", "DEMO_STAFF_PASSWORD", "DEMO_CUSTOMER_PASSWORD"):
+        monkeypatch.delenv(var, raising=False)
+
+    assert (
+        cli.main(
+            ["seed-demo", "--with-demo-users"],
+            session_factory=cli_factory,
+            settings=staging_settings,
+        )
+        == 1
+    )
+
+    monkeypatch.setenv("DEMO_ADMIN_PASSWORD", "StagingAdmin!2026")
+    monkeypatch.setenv("DEMO_STAFF_PASSWORD", "StagingStaff!2026")
+    monkeypatch.setenv("DEMO_CUSTOMER_PASSWORD", "StagingCustomer!2026")
+    assert (
+        cli.main(
+            ["seed-demo", "--with-demo-users"],
+            session_factory=cli_factory,
+            settings=staging_settings,
+        )
+        == 0
+    )
+    demo_emails = sorted(
+        db_session.scalars(
+            select(User.email).where(
+                User.email.in_(
+                    [
+                        "admin@atelier.example",
+                        "staff@atelier.example",
+                        "customer@atelier.example",
+                    ]
+                )
+            )
+        ).all()
+    )
+    assert demo_emails == [
+        "admin@atelier.example",
+        "customer@atelier.example",
+        "staff@atelier.example",
+    ]
 
 
 @pytest.mark.skipif(

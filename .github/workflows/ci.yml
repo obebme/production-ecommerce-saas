@@ -103,6 +103,7 @@ jobs:
               "PAYMENT_WEBHOOK_SECRET",
               "PAYMENT_SANDBOX_MODE",
               "SESSION_TTL_HOURS",
+              "RESERVATION_SWEEPER_INTERVAL_SECONDS",
               "FREE_SHIPPING_THRESHOLD_CENTS",
               "STANDARD_SHIPPING_CENTS",
               "TAX_RATE_BPS",
@@ -121,11 +122,14 @@ jobs:
           if missing:
               raise SystemExit(f"Missing or empty variables in .env.example: {missing}")
 
+          if "TRUSTED_PROXY_IPS" not in env_values:
+              raise SystemExit("Missing optional key TRUSTED_PROXY_IPS in .env.example")
+
           for secret_var in ("POSTGRES_PASSWORD", "CSRF_HMAC_SECRET", "GUEST_ORDER_HMAC_SECRET", "PAYMENT_WEBHOOK_SECRET"):
               if not env_values[secret_var].startswith("CHANGE_ME_DEV_ONLY_"):
                   raise SystemExit(f"{secret_var} in .env.example must use a CHANGE_ME_DEV_ONLY_ placeholder")
 
-          print(f".env.example coverage verified ({len(required_vars)} required variables present)")
+          print(f".env.example coverage verified ({len(required_vars)} required variables + TRUSTED_PROXY_IPS present)")
           PY
 
       - name: Validate Compose configuration with .env.example
@@ -170,11 +174,13 @@ jobs:
       TEST_DATABASE_URL: postgresql+psycopg://ecom_test:ecom_test_password@localhost:5432/ecom_test
       COOKIE_SECURE: "false"
       ALLOWED_ORIGINS: http://localhost:3000
+      TRUSTED_PROXY_IPS: ""
       CSRF_HMAC_SECRET: ci_test_only_csrf_hmac_secret_min_32_characters_01
       GUEST_ORDER_HMAC_SECRET: ci_test_only_guest_order_hmac_secret_min_32_chars_02
       PAYMENT_WEBHOOK_SECRET: ci_test_only_payment_webhook_secret_min_32_chars_03
       PAYMENT_SANDBOX_MODE: "true"
       SESSION_TTL_HOURS: "168"
+      RESERVATION_SWEEPER_INTERVAL_SECONDS: "60"
       FREE_SHIPPING_THRESHOLD_CENTS: "10000"
       STANDARD_SHIPPING_CENTS: "1000"
       TAX_RATE_BPS: "800"
@@ -201,6 +207,10 @@ jobs:
             pip install -e ".[dev]" || pip install -e .
           fi
           pip install ruff mypy pytest httpx
+
+      - name: Verify Python dependency consistency
+        working-directory: backend
+        run: python -m pip check
 
       - name: Provision least-privilege PostgreSQL test role and database
         run: |
@@ -250,6 +260,10 @@ jobs:
             echo "ERROR: Expected exactly 1 Alembic head revision, found $HEAD_COUNT." >&2
             exit 1
           fi
+          if ! printf '%s\n' "$HEADS_OUTPUT" | grep -qE '^0003_phase2_indexes_and_cleanup\b'; then
+            echo "ERROR: Expected Alembic head 0003_phase2_indexes_and_cleanup, got: $HEADS_OUTPUT" >&2
+            exit 1
+          fi
 
       - name: Run Alembic migrations against PostgreSQL 16
         working-directory: backend
@@ -286,6 +300,10 @@ jobs:
           else
             npm install
           fi
+
+      - name: Verify frontend production dependency tree
+        working-directory: frontend
+        run: npm ls --omit=dev --depth=0
 
       - name: Run ESLint
         working-directory: frontend
@@ -327,8 +345,10 @@ jobs:
       DATABASE_URL: postgresql+psycopg://ecom_test:ecom_test_password@localhost:5432/ecom_test
       COOKIE_SECURE: "false"
       ALLOWED_ORIGINS: http://localhost:3000
+      TRUSTED_PROXY_IPS: ""
       PAYMENT_SANDBOX_MODE: "true"
       SESSION_TTL_HOURS: "168"
+      RESERVATION_SWEEPER_INTERVAL_SECONDS: "60"
       FREE_SHIPPING_THRESHOLD_CENTS: "10000"
       STANDARD_SHIPPING_CENTS: "1000"
       TAX_RATE_BPS: "800"

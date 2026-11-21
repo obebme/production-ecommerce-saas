@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.pagination import MAX_PAGINATION_PAGE, PaginatedResponse, PaginationParams
-from app.core.security import parse_client_ip
+from app.core.security import resolve_client_ip
 from app.models.identity import User
 from app.modules.admin import service
 from app.modules.admin.schemas import (
@@ -42,7 +42,7 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 
 
 def _client_ip(request: Request) -> str | None:
-    return parse_client_ip(request.client.host if request.client else None)
+    return resolve_client_ip(request)
 
 
 @router.get(

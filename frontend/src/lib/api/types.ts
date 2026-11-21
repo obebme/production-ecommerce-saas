@@ -190,6 +190,8 @@ export interface CartDTO {
   item_count: number;
   subtotal_cents: number;
   estimated_shipping_cents: number;
+  tax_rate_bps?: number;
+  estimated_tax_cents?: number;
   estimated_total_cents: number;
 }
 

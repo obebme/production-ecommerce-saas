@@ -67,11 +67,26 @@ const EMPTY_ADDRESS: AddressFormState = {
   phone: "",
 };
 
-function computePreviewTaxCents(subtotalCents: number): number {
-  if (subtotalCents <= 0) {
+function computePreviewTaxCents(
+  subtotalCents: number,
+  taxRateBps: number = BASELINE_TAX_RATE_BPS
+): number {
+  if (subtotalCents <= 0 || taxRateBps <= 0) {
     return 0;
   }
-  return Math.floor((subtotalCents * BASELINE_TAX_RATE_BPS + 5000) / 10000);
+  return Math.floor((subtotalCents * taxRateBps + 5000) / 10000);
+}
+
+function resolveCartPreviewTotals(cart: CartDTO): {
+  taxRateBps: number;
+  previewTaxCents: number;
+  previewTotalCents: number;
+} {
+  const taxRateBps = cart.tax_rate_bps ?? BASELINE_TAX_RATE_BPS;
+  const previewTaxCents =
+    cart.estimated_tax_cents ?? computePreviewTaxCents(cart.subtotal_cents, taxRateBps);
+  const previewTotalCents = cart.subtotal_cents + cart.estimated_shipping_cents + previewTaxCents;
+  return { taxRateBps, previewTaxCents, previewTotalCents };
 }
 
 function normalizeAddressDto(form: AddressFormState): AddressDTO {
@@ -387,8 +402,7 @@ function AddressFields({
 
 function CheckoutOrderSummaryCard({ cart }: { cart: CartDTO }) {
   const currency = cart.currency || "USD";
-  const previewTaxCents = computePreviewTaxCents(cart.subtotal_cents);
-  const previewTotalCents = cart.subtotal_cents + cart.estimated_shipping_cents + previewTaxCents;
+  const { taxRateBps, previewTaxCents, previewTotalCents } = resolveCartPreviewTotals(cart);
 
   return (
     <Card className="shadow-sm">
@@ -437,12 +451,14 @@ function CheckoutOrderSummaryCard({ cart }: { cart: CartDTO }) {
             <span className="text-muted-foreground">Estimated Shipping</span>
             <span className="font-medium tabular-nums">
               {cart.estimated_shipping_cents === 0
-                ? "$0.00 (Free)"
+                ? `${formatCents(0, currency)} (Free)`
                 : formatCents(cart.estimated_shipping_cents, currency)}
             </span>
           </div>
           <div className="flex justify-between">
-            <span className="text-muted-foreground">Estimated Tax (8.00% preview)</span>
+            <span className="text-muted-foreground">
+              Estimated Tax ({(taxRateBps / 100).toFixed(2)}% preview)
+            </span>
             <span className="font-medium tabular-nums">
               {formatCents(previewTaxCents, currency)}
             </span>
@@ -786,12 +802,7 @@ export function CheckoutView() {
                   )}
                 </span>
                 <span className="tabular-nums">
-                  {formatCents(
-                    cart.subtotal_cents +
-                      cart.estimated_shipping_cents +
-                      computePreviewTaxCents(cart.subtotal_cents),
-                    cart.currency
-                  )}
+                  {formatCents(resolveCartPreviewTotals(cart).previewTotalCents, cart.currency)}
                 </span>
               </button>
               {mobileSummaryOpen ? (

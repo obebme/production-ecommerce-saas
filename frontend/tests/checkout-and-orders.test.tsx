@@ -30,7 +30,7 @@ import { CheckoutView } from "@/components/storefront/checkout-view";
 import { OrderDetailView } from "@/components/storefront/order-detail-view";
 import { OrderHistoryView } from "@/components/storefront/order-history-view";
 import { ToastProvider } from "@/components/ui/toast";
-import { AuthProvider } from "@/providers/auth-provider";
+import { AuthProvider, useAuth } from "@/providers/auth-provider";
 import { CartProvider, useCart } from "@/providers/cart-provider";
 
 class NextNotFoundError extends Error {
@@ -434,7 +434,7 @@ describe("CartDrawer & CartPageView", () => {
     fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.endsWith("/auth/me")) {
-        return errorResponse(401, "AUTH_SESSION_EXPIRED", "Authentication required.");
+        return errorResponse(401, "AUTH_REQUIRED", "Authentication required.");
       }
       if (url.endsWith("/cart")) {
         return jsonResponse(validCart);
@@ -463,7 +463,7 @@ describe("CartDrawer & CartPageView", () => {
     fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.endsWith("/auth/me")) {
-        return errorResponse(401, "AUTH_SESSION_EXPIRED", "Authentication required.");
+        return errorResponse(401, "AUTH_REQUIRED", "Authentication required.");
       }
       if (url.endsWith("/cart")) {
         return jsonResponse(makeCart([]));
@@ -501,7 +501,7 @@ describe("CartDrawer & CartPageView", () => {
     fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.endsWith("/auth/me")) {
-        return errorResponse(401, "AUTH_SESSION_EXPIRED", "Authentication required.");
+        return errorResponse(401, "AUTH_REQUIRED", "Authentication required.");
       }
       if (url.endsWith("/cart")) {
         return jsonResponse(unavailableCart);
@@ -574,7 +574,7 @@ describe("CartDrawer & CartPageView", () => {
       const url = String(input);
       const method = init?.method ?? "GET";
       if (url.endsWith("/auth/me")) {
-        return errorResponse(401, "AUTH_SESSION_EXPIRED", "Authentication required.");
+        return errorResponse(401, "AUTH_REQUIRED", "Authentication required.");
       }
       if (url.endsWith("/cart") && method === "GET") {
         return jsonResponse(initialCart);
@@ -660,7 +660,7 @@ describe("CartDrawer & CartPageView", () => {
       const url = String(input);
       const method = init?.method ?? "GET";
       if (url.endsWith("/auth/me")) {
-        return errorResponse(401, "AUTH_SESSION_EXPIRED", "Authentication required.");
+        return errorResponse(401, "AUTH_REQUIRED", "Authentication required.");
       }
       if (url.endsWith("/cart") && method === "GET") {
         return jsonResponse(initialCart);
@@ -756,7 +756,7 @@ describe("CheckoutView (/checkout)", () => {
     fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.endsWith("/auth/me")) {
-        return errorResponse(401, "AUTH_SESSION_EXPIRED", "Authentication required.");
+        return errorResponse(401, "AUTH_REQUIRED", "Authentication required.");
       }
       if (url.endsWith("/cart")) {
         return jsonResponse(makeCart([]));
@@ -781,7 +781,7 @@ describe("CheckoutView (/checkout)", () => {
     fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.endsWith("/auth/me")) {
-        return errorResponse(401, "AUTH_SESSION_EXPIRED", "Authentication required.");
+        return errorResponse(401, "AUTH_REQUIRED", "Authentication required.");
       }
       if (url.endsWith("/cart")) {
         return jsonResponse(conflictCart);
@@ -841,7 +841,7 @@ describe("CheckoutView (/checkout)", () => {
       const url = String(input);
       const method = init?.method ?? "GET";
       if (url.endsWith("/auth/me")) {
-        return errorResponse(401, "AUTH_SESSION_EXPIRED", "Authentication required.");
+        return errorResponse(401, "AUTH_REQUIRED", "Authentication required.");
       }
       if (url.endsWith("/cart") && method === "GET") {
         return jsonResponse(activeCart);
@@ -922,7 +922,7 @@ describe("CheckoutView (/checkout)", () => {
       const url = String(input);
       const method = init?.method ?? "GET";
       if (url.endsWith("/auth/me")) {
-        return errorResponse(401, "AUTH_SESSION_EXPIRED", "Authentication required.");
+        return errorResponse(401, "AUTH_REQUIRED", "Authentication required.");
       }
       if (url.endsWith("/cart") && method === "GET") {
         return jsonResponse(activeCart);
@@ -1012,7 +1012,7 @@ describe("CheckoutView (/checkout)", () => {
       const url = String(input);
       const method = init?.method ?? "GET";
       if (url.endsWith("/auth/me")) {
-        return errorResponse(401, "AUTH_SESSION_EXPIRED", "Authentication required.");
+        return errorResponse(401, "AUTH_REQUIRED", "Authentication required.");
       }
       if (url.endsWith("/cart") && method === "GET") {
         return jsonResponse(activeCart);
@@ -1093,7 +1093,7 @@ describe("CheckoutView (/checkout)", () => {
       const url = String(input);
       const method = init?.method ?? "GET";
       if (url.endsWith("/auth/me")) {
-        return errorResponse(401, "AUTH_SESSION_EXPIRED", "Authentication required.");
+        return errorResponse(401, "AUTH_REQUIRED", "Authentication required.");
       }
       if (url.endsWith("/cart") && method === "GET") {
         return jsonResponse(postCompleted ? makeCart([]) : activeCart);
@@ -1507,7 +1507,7 @@ describe("OrderDetailPage & OrderDetailView (/orders/[orderNumber])", () => {
     fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith("/auth/me")) {
-        return errorResponse(401, "AUTH_SESSION_EXPIRED", "Authentication required.");
+        return errorResponse(401, "AUTH_REQUIRED", "Authentication required.");
       }
       if (url.endsWith("/cart")) {
         return jsonResponse(makeCart([]));
@@ -1592,7 +1592,7 @@ describe("OrderHistoryView (/orders)", () => {
     fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.endsWith("/auth/me")) {
-        return errorResponse(401, "AUTH_SESSION_EXPIRED", "Authentication required.");
+        return errorResponse(401, "AUTH_REQUIRED", "Authentication required.");
       }
       if (url.endsWith("/cart")) {
         return jsonResponse(makeCart([]));
@@ -1767,5 +1767,85 @@ describe("OrderHistoryView (/orders)", () => {
 
     expect((await screen.findAllByText("Refund Pending")).length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText("Stale Payment Refund Pending")).toBeInTheDocument();
+  });
+
+  it("renders dynamic tax_rate_bps / estimated_tax_cents and currency-aware free shipping on CheckoutView", async () => {
+    vi.stubGlobal("ResizeObserver", MockResizeObserver);
+    mockPathname = "/checkout";
+    const eurCart = makeCart(
+      [makeCartItem({ unit_price_cents: 12000, quantity: 1 })],
+      {
+        currency: "EUR",
+        subtotal_cents: 12000,
+        estimated_shipping_cents: 0,
+        tax_rate_bps: 1250,
+        estimated_tax_cents: 1500,
+        estimated_total_cents: 12000,
+      }
+    );
+
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/auth/me")) {
+        return errorResponse(401, "AUTH_REQUIRED", "Authentication required.");
+      }
+      if (url.endsWith("/cart")) {
+        return jsonResponse(eurCart);
+      }
+      return errorResponse(404, "NOT_FOUND", `Unexpected ${url}`);
+    });
+
+    renderStorefront(<CheckoutView />);
+
+    expect(await screen.findByText("Estimated Tax (12.50% preview)")).toBeInTheDocument();
+    expect(screen.getByText("€0.00 (Free)")).toBeInTheDocument();
+    expect(screen.getByText("€15.00")).toBeInTheDocument();
+    expect(screen.getAllByText("€135.00").length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("clears all in-memory guest order access tokens on AuthProvider.logout()", async () => {
+    saveGuestOrderToken("ORD-20261121-A1", "guest-tok-a1");
+    saveGuestOrderToken("ORD-20261121-B2", "guest-tok-b2");
+    expect(getGuestOrderToken("ORD-20261121-A1")).toBe("guest-tok-a1");
+    expect(getGuestOrderToken("ORD-20261121-B2")).toBe("guest-tok-b2");
+
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      if (url.endsWith("/auth/me")) {
+        return jsonResponse({ user: makeUser("customer"), csrf_token: "csrf-logout-test" });
+      }
+      if (url.endsWith("/auth/logout") && method === "POST") {
+        return new Response(null, { status: 204 });
+      }
+      return errorResponse(404, "NOT_FOUND", `Unexpected ${method} ${url}`);
+    });
+
+    function LogoutProbe() {
+      const { user, logout } = useAuth();
+      return (
+        <div>
+          <span>{user ? user.email : "signed-out"}</span>
+          <button type="button" onClick={() => void logout()}>
+            Trigger Logout
+          </button>
+        </div>
+      );
+    }
+
+    render(
+      <ToastProvider>
+        <AuthProvider>
+          <LogoutProbe />
+        </AuthProvider>
+      </ToastProvider>
+    );
+
+    expect(await screen.findByText("customer@atelier.test")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Trigger Logout" }));
+    expect(await screen.findByText("signed-out")).toBeInTheDocument();
+
+    expect(getGuestOrderToken("ORD-20261121-A1")).toBeUndefined();
+    expect(getGuestOrderToken("ORD-20261121-B2")).toBeUndefined();
   });
 });
