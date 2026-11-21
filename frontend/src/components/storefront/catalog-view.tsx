@@ -48,7 +48,17 @@ function parsePositiveInt(raw: string | null): number | undefined {
   return num;
 }
 
-export function CatalogView() {
+export interface CatalogViewProps {
+  initialCategories?: CategoryPublicDTO[] | null;
+  initialResults?: PaginatedResponse<ProductSummaryDTO> | null;
+  initialQueryKey?: string;
+}
+
+export function CatalogView({
+  initialCategories,
+  initialResults,
+  initialQueryKey,
+}: CatalogViewProps = {}) {
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
@@ -65,11 +75,50 @@ export function CatalogView() {
   const parsedPage = parsePositiveInt(searchParams.get("page"));
   const page = parsedPage && parsedPage >= 1 ? parsedPage : 1;
 
-  const [categories, setCategories] = React.useState<CategoryPublicDTO[]>([]);
-  const [results, setResults] = React.useState<PaginatedResponse<ProductSummaryDTO> | null>(null);
-  const [isLoading, setIsLoading] = React.useState(true);
+  const currentQueryKey = React.useMemo(() => {
+    const keyParams = new URLSearchParams();
+    if (categorySlug) {
+      keyParams.set("category_slug", categorySlug);
+    }
+    if (searchQuery) {
+      keyParams.set("q", searchQuery);
+    }
+    if (minPriceCents !== undefined) {
+      keyParams.set("min_price_cents", String(minPriceCents));
+    }
+    if (maxPriceCents !== undefined) {
+      keyParams.set("max_price_cents", String(maxPriceCents));
+    }
+    if (inStockOnly) {
+      keyParams.set("in_stock", "true");
+    }
+    keyParams.set("sort", sort);
+    keyParams.set("page", String(page));
+    keyParams.set("page_size", String(DEFAULT_PAGE_SIZE));
+    return keyParams.toString();
+  }, [categorySlug, searchQuery, minPriceCents, maxPriceCents, inStockOnly, sort, page]);
+
+  const hasInitialCategories = initialCategories !== undefined && initialCategories !== null;
+  const matchesInitialQuery =
+    initialResults !== undefined &&
+    initialResults !== null &&
+    initialQueryKey !== undefined &&
+    currentQueryKey === initialQueryKey;
+
+  const [categories, setCategories] = React.useState<CategoryPublicDTO[]>(() =>
+    hasInitialCategories ? initialCategories : []
+  );
+  const [results, setResults] = React.useState<PaginatedResponse<ProductSummaryDTO> | null>(() =>
+    matchesInitialQuery ? initialResults : null
+  );
+  const [isLoading, setIsLoading] = React.useState<boolean>(() => !matchesInitialQuery);
   const [error, setError] = React.useState<string | null>(null);
   const [reloadNonce, setReloadNonce] = React.useState(0);
+
+  const skipInitialCategoriesRef = React.useRef<boolean>(hasInitialCategories);
+  const hydratedQueryKeyRef = React.useRef<string | null>(
+    matchesInitialQuery && initialQueryKey ? initialQueryKey : null
+  );
 
   // Controlled filter inputs synced with URL params
   const [minPriceInput, setMinPriceInput] = React.useState(formatCentsForInput(minPriceCents));
@@ -89,6 +138,9 @@ export function CatalogView() {
   }, [searchQuery]);
 
   React.useEffect(() => {
+    if (skipInitialCategoriesRef.current) {
+      return;
+    }
     const controller = new AbortController();
     catalogApi
       .listCategories(controller.signal)
@@ -98,6 +150,11 @@ export function CatalogView() {
   }, []);
 
   React.useEffect(() => {
+    if (reloadNonce === 0 && hydratedQueryKeyRef.current === currentQueryKey) {
+      return;
+    }
+    hydratedQueryKeyRef.current = null;
+
     const controller = new AbortController();
     setIsLoading(true);
     setError(null);
@@ -140,6 +197,7 @@ export function CatalogView() {
     inStockOnly,
     sort,
     page,
+    currentQueryKey,
     reloadNonce,
   ]);
 

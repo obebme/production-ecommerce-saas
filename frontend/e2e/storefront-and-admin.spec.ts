@@ -451,3 +451,54 @@ test.describe.serial("QA-E2E-001: Live Storefront, Checkout, Payments, RBAC & Ad
     }
   });
 });
+
+const SEEDED_PRODUCT_SLUGS = [
+  "linen-overshirt",
+  "merino-crewneck",
+  "leather-weekender",
+  "canvas-tote",
+  "stoneware-mug-set",
+  "walnut-serving-board",
+  "ceramic-table-lamp",
+  "wool-throw-blanket",
+] as const;
+
+test.describe("REM-P2-M09: Storefront SSR, Dynamic Metadata, HTTP 404 & Asset Resolution", () => {
+  test("5. Raw HTTP SSR HTML, dynamic PDP <title>, real HTTP 404 & all 8 PNG assets load cleanly", async ({
+    page,
+  }) => {
+    for (const route of ["/", "/products", "/products/linen-overshirt"] as const) {
+      const response = await page.request.get(route);
+      expect(response.status(), `Expected HTTP 200 for ${route}`).toBe(200);
+      const html = await response.text();
+      expect(html, `Expected SSR product content in ${route}`).toContain("Atelier Linen Overshirt");
+      if (route === "/products/linen-overshirt") {
+        expect(html).toMatch(/<title>Atelier Linen Overshirt \| Atelier<\/title>/i);
+      }
+    }
+
+    const notFoundResponse = await page.request.get("/products/nonexistent-product-slug-404");
+    expect(notFoundResponse.status()).toBe(404);
+
+    await page.goto("/products");
+    await expect(page.getByRole("heading", { name: "Collection" })).toBeVisible();
+
+    for (const slug of SEEDED_PRODUCT_SLUGS) {
+      const assetPath = `/assets/products/${slug}.png`;
+      const img = page.locator(`main img[src$="${assetPath}"]`);
+      await img.scrollIntoViewIfNeeded();
+      await expect(img, `Expected rendered <img> for ${assetPath}`).toBeVisible();
+      await expect
+        .poll(
+          async () =>
+            img.evaluate((el: HTMLImageElement) => el.complete && el.naturalWidth > 0),
+          { message: `Expected naturalWidth > 0 for ${assetPath}` }
+        )
+        .toBe(true);
+
+      const assetResponse = await page.request.get(assetPath);
+      expect(assetResponse.status(), `Expected HTTP 200 for ${assetPath}`).toBe(200);
+      expect(assetResponse.headers()["content-type"]).toContain("image/png");
+    }
+  });
+});

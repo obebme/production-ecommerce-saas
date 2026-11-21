@@ -91,17 +91,62 @@ function extractAttributeGroups(
   });
 }
 
-export function ProductDetailView({ slug }: { slug: string }) {
+export interface ProductDetailViewProps {
+  slug: string;
+  initialProduct?: ProductDetailDTO | null;
+  initialError?: string | null;
+}
+
+function getInitialImageIndex(product: ProductDetailDTO | null | undefined): number {
+  if (!product) {
+    return 0;
+  }
+  const sortedImgs = [...product.images].sort((a, b) => a.sort_order - b.sort_order);
+  const primaryIdx = sortedImgs.findIndex((img) => img.is_primary);
+  return primaryIdx >= 0 ? primaryIdx : 0;
+}
+
+function getInitialVariantId(product: ProductDetailDTO | null | undefined): string | null {
+  if (!product) {
+    return null;
+  }
+  const activeVariants = product.variants.filter((v) => v.is_active);
+  const initialVariant = activeVariants.find((v) => v.in_stock) ?? activeVariants[0] ?? null;
+  return initialVariant?.id ?? null;
+}
+
+export function ProductDetailView({
+  slug,
+  initialProduct,
+  initialError,
+}: ProductDetailViewProps) {
   const { addItem } = useCart();
 
-  const [product, setProduct] = React.useState<ProductDetailDTO | null>(null);
-  const [isLoading, setIsLoading] = React.useState(true);
+  const hasInitialProduct =
+    initialProduct !== undefined &&
+    initialProduct !== null &&
+    initialProduct.slug === slug;
+  const hasInitialError =
+    !hasInitialProduct && typeof initialError === "string" && initialError.length > 0;
+
+  const [product, setProduct] = React.useState<ProductDetailDTO | null>(() =>
+    hasInitialProduct ? initialProduct : null
+  );
+  const [isLoading, setIsLoading] = React.useState<boolean>(
+    () => !hasInitialProduct && !hasInitialError
+  );
   const [notFound, setNotFound] = React.useState(false);
-  const [error, setError] = React.useState<string | null>(null);
+  const [error, setError] = React.useState<string | null>(() =>
+    hasInitialError ? initialError : null
+  );
   const [reloadNonce, setReloadNonce] = React.useState(0);
 
-  const [selectedImageIndex, setSelectedImageIndex] = React.useState(0);
-  const [selectedVariantId, setSelectedVariantId] = React.useState<string | null>(null);
+  const [selectedImageIndex, setSelectedImageIndex] = React.useState<number>(() =>
+    getInitialImageIndex(hasInitialProduct ? initialProduct : null)
+  );
+  const [selectedVariantId, setSelectedVariantId] = React.useState<string | null>(() =>
+    getInitialVariantId(hasInitialProduct ? initialProduct : null)
+  );
   const [availabilityOverrides, setAvailabilityOverrides] = React.useState<
     Record<string, VariantAvailabilityDTO>
   >({});
@@ -114,8 +159,19 @@ export function ProductDetailView({ slug }: { slug: string }) {
   } | null>(null);
 
   const thumbnailRefs = React.useRef<(HTMLButtonElement | null)[]>([]);
+  const hydratedSlugRef = React.useRef<string | null>(hasInitialProduct ? slug : null);
+  const initialErrorSlugRef = React.useRef<string | null>(hasInitialError ? slug : null);
 
   React.useEffect(() => {
+    if (
+      reloadNonce === 0 &&
+      (hydratedSlugRef.current === slug || initialErrorSlugRef.current === slug)
+    ) {
+      return;
+    }
+    hydratedSlugRef.current = null;
+    initialErrorSlugRef.current = null;
+
     const controller = new AbortController();
     setIsLoading(true);
     setNotFound(false);
@@ -127,14 +183,8 @@ export function ProductDetailView({ slug }: { slug: string }) {
       .getProductBySlug(slug, controller.signal)
       .then((data) => {
         setProduct(data);
-        const sortedImgs = [...data.images].sort((a, b) => a.sort_order - b.sort_order);
-        const primaryIdx = sortedImgs.findIndex((img) => img.is_primary);
-        setSelectedImageIndex(primaryIdx >= 0 ? primaryIdx : 0);
-
-        const activeVariants = data.variants.filter((v) => v.is_active);
-        const initialVariant =
-          activeVariants.find((v) => v.in_stock) ?? activeVariants[0] ?? null;
-        setSelectedVariantId(initialVariant?.id ?? null);
+        setSelectedImageIndex(getInitialImageIndex(data));
+        setSelectedVariantId(getInitialVariantId(data));
         setQuantity(1);
       })
       .catch((err) => {

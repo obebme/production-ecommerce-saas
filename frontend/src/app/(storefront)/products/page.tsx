@@ -1,7 +1,15 @@
 import * as React from "react";
 import type { Metadata } from "next";
+import {
+  CATALOG_DEFAULT_PAGE_SIZE,
+  fetchServerCategories,
+  fetchServerProducts,
+  parseCatalogSearchParams,
+} from "@/lib/api/server-catalog";
 import { CatalogView } from "@/components/storefront/catalog-view";
 import { ProductCardSkeleton } from "@/components/storefront/product-card";
+
+export const dynamic = "force-dynamic";
 
 export const metadata: Metadata = {
   title: "Shop All Products",
@@ -20,10 +28,35 @@ function CatalogFallback() {
   );
 }
 
-export default function ProductsPage() {
+export default async function ProductsPage({
+  searchParams,
+}: {
+  searchParams?: Promise<Record<string, string | string[] | undefined>>;
+}) {
+  const resolvedParams = (await searchParams) ?? {};
+  const parsed = parseCatalogSearchParams(resolvedParams);
+
+  const [categories, productsRes] = await Promise.all([
+    fetchServerCategories(),
+    fetchServerProducts({
+      category_slug: parsed.category_slug,
+      q: parsed.q,
+      min_price_cents: parsed.min_price_cents,
+      max_price_cents: parsed.max_price_cents,
+      in_stock: parsed.in_stock,
+      sort: parsed.sort,
+      page: parsed.page,
+      page_size: CATALOG_DEFAULT_PAGE_SIZE,
+    }),
+  ]);
+
   return (
     <React.Suspense fallback={<CatalogFallback />}>
-      <CatalogView />
+      <CatalogView
+        initialCategories={categories}
+        initialResults={productsRes}
+        initialQueryKey={parsed.queryKey}
+      />
     </React.Suspense>
   );
 }

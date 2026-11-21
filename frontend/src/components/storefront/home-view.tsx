@@ -11,52 +11,80 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 
-export function HomeView() {
-  const [categories, setCategories] = React.useState<CategoryPublicDTO[]>([]);
-  const [categoriesLoading, setCategoriesLoading] = React.useState(true);
+export interface HomeViewProps {
+  initialCategories?: CategoryPublicDTO[] | null;
+  initialProducts?: ProductSummaryDTO[] | null;
+}
 
-  const [products, setProducts] = React.useState<ProductSummaryDTO[]>([]);
-  const [productsLoading, setProductsLoading] = React.useState(true);
+export function HomeView({ initialCategories, initialProducts }: HomeViewProps = {}) {
+  const hasInitialCategories = initialCategories !== undefined && initialCategories !== null;
+  const hasInitialProducts = initialProducts !== undefined && initialProducts !== null;
+
+  const [categories, setCategories] = React.useState<CategoryPublicDTO[]>(() =>
+    hasInitialCategories ? initialCategories.slice(0, 4) : []
+  );
+  const [categoriesLoading, setCategoriesLoading] = React.useState<boolean>(
+    () => !hasInitialCategories
+  );
+
+  const [products, setProducts] = React.useState<ProductSummaryDTO[]>(() =>
+    hasInitialProducts ? initialProducts : []
+  );
+  const [productsLoading, setProductsLoading] = React.useState<boolean>(
+    () => !hasInitialProducts
+  );
   const [productsError, setProductsError] = React.useState<string | null>(null);
 
-  const loadHomeData = React.useCallback(async (signal?: AbortSignal) => {
-    setCategoriesLoading(true);
-    setProductsLoading(true);
-    setProductsError(null);
+  const skipInitialFetchRef = React.useRef<boolean>(
+    hasInitialCategories && hasInitialProducts
+  );
 
-    const [catResult, prodResult] = await Promise.allSettled([
-      catalogApi.listCategories(signal),
-      catalogApi.listProducts({ sort: "newest", page: 1, page_size: 8 }, signal),
-    ]);
+  const loadHomeData = React.useCallback(
+    async (signal?: AbortSignal, options?: { preserveCategories?: boolean }) => {
+      if (!options?.preserveCategories) {
+        setCategoriesLoading(true);
+      }
+      setProductsLoading(true);
+      setProductsError(null);
 
-    if (signal?.aborted) {
-      return;
-    }
+      const [catResult, prodResult] = await Promise.allSettled([
+        catalogApi.listCategories(signal),
+        catalogApi.listProducts({ sort: "newest", page: 1, page_size: 8 }, signal),
+      ]);
 
-    if (catResult.status === "fulfilled") {
-      setCategories(catResult.value.items.slice(0, 4));
-    }
-    setCategoriesLoading(false);
+      if (signal?.aborted) {
+        return;
+      }
 
-    if (prodResult.status === "fulfilled") {
-      setProducts(prodResult.value.items);
-    } else if (
-      !(prodResult.reason instanceof DOMException && prodResult.reason.name === "AbortError")
-    ) {
-      setProductsError(
-        prodResult.reason instanceof Error
-          ? prodResult.reason.message
-          : "Unable to load new arrivals right now."
-      );
-    }
-    setProductsLoading(false);
-  }, []);
+      if (catResult.status === "fulfilled") {
+        setCategories(catResult.value.items.slice(0, 4));
+      }
+      setCategoriesLoading(false);
+
+      if (prodResult.status === "fulfilled") {
+        setProducts(prodResult.value.items);
+      } else if (
+        !(prodResult.reason instanceof DOMException && prodResult.reason.name === "AbortError")
+      ) {
+        setProductsError(
+          prodResult.reason instanceof Error
+            ? prodResult.reason.message
+            : "Unable to load new arrivals right now."
+        );
+      }
+      setProductsLoading(false);
+    },
+    []
+  );
 
   React.useEffect(() => {
+    if (skipInitialFetchRef.current) {
+      return;
+    }
     const controller = new AbortController();
-    void loadHomeData(controller.signal);
+    void loadHomeData(controller.signal, { preserveCategories: hasInitialCategories });
     return () => controller.abort();
-  }, [loadHomeData]);
+  }, [loadHomeData, hasInitialCategories]);
 
   return (
     <div className="space-y-16 pb-20">
