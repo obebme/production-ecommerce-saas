@@ -6,7 +6,13 @@ import { Badge } from "@/components/ui/badge";
 import { Card } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 
-export function ProductCard({ product }: { product: ProductSummaryDTO }) {
+export function ProductCard({
+  product,
+  headingAs: Heading = "h3",
+}: {
+  product: ProductSummaryDTO;
+  headingAs?: "h2" | "h3";
+}) {
   const hasRange = product.min_price_cents !== product.max_price_cents;
   const formattedPrice = hasRange
     ? `From ${formatCents(product.min_price_cents, product.currency)}`
@@ -37,9 +43,9 @@ export function ProductCard({ product }: { product: ProductSummaryDTO }) {
           <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
             {product.category.name}
           </p>
-          <h3 className="line-clamp-2 text-sm font-semibold leading-snug text-foreground group-hover:text-accent">
+          <Heading className="line-clamp-2 text-sm font-semibold leading-snug text-foreground group-hover:text-accent">
             {product.title}
-          </h3>
+          </Heading>
           <p className="pt-0.5 text-sm font-medium text-foreground tabular-nums">
             {formattedPrice}
           </p>

@@ -477,11 +477,17 @@ test.describe("REM-P2-M09: Storefront SSR, Dynamic Metadata, HTTP 404 & Asset Re
       }
     }
 
+    const cartResponse = await page.request.get("/cart");
+    expect(cartResponse.status()).toBe(200);
+    expect(cartResponse.headers()["cache-control"]).toContain("no-store");
+
     const notFoundResponse = await page.request.get("/products/nonexistent-product-slug-404");
     expect(notFoundResponse.status()).toBe(404);
 
     await page.goto("/products");
-    await expect(page.getByRole("heading", { name: "Collection" })).toBeVisible();
+    await expect(page.getByRole("heading", { level: 1, name: "Collection" })).toBeVisible();
+    expect(await page.locator("main h2").count()).toBeGreaterThanOrEqual(8);
+    await expect(page.locator("main h3")).toHaveCount(0);
 
     for (const slug of SEEDED_PRODUCT_SLUGS) {
       const assetPath = `/assets/products/${slug}.png`;
@@ -500,5 +506,10 @@ test.describe("REM-P2-M09: Storefront SSR, Dynamic Metadata, HTTP 404 & Asset Re
       expect(assetResponse.status(), `Expected HTTP 200 for ${assetPath}`).toBe(200);
       expect(assetResponse.headers()["content-type"]).toContain("image/png");
     }
+
+    const notFoundPageResponse = await page.goto("/products/nonexistent-product-slug-404");
+    expect(notFoundPageResponse?.status()).toBe(404);
+    await expect(page.locator("main")).toHaveCount(1);
+    await expect(page.getByRole("heading", { level: 1, name: "Page not found" })).toBeVisible();
   });
 });

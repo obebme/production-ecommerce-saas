@@ -270,9 +270,12 @@ export function HomeView({ initialCategories, initialProducts }: HomeViewProps =
 
       {/* 4. Shipping & Sandbox Service Strip */}
       <section
-        aria-label="Storefront guarantees"
+        aria-labelledby="home-guarantees-heading"
         className="mx-auto max-w-[1440px] px-4 sm:px-6 lg:px-8"
       >
+        <h2 id="home-guarantees-heading" className="sr-only">
+          Storefront guarantees
+        </h2>
         <div className="grid gap-4 rounded-lg border border-border bg-surface p-6 md:grid-cols-3 md:gap-8">
           <div className="flex items-start gap-3">
             <Truck className="mt-0.5 h-5 w-5 shrink-0 text-accent" aria-hidden="true" />

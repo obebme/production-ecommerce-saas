@@ -195,9 +195,12 @@ def resolve_client_ip(
     trusted_networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
     for entry in proxies:
         try:
-            trusted_networks.append(ipaddress.ip_network(entry.strip(), strict=False))
+            network = ipaddress.ip_network(entry.strip(), strict=False)
         except ValueError:
             continue
+        if network.prefixlen == 0:
+            continue
+        trusted_networks.append(network)
     if not trusted_networks:
         return peer_ip
 
@@ -205,8 +208,11 @@ def resolve_client_ip(
     if not any(peer_addr in net for net in trusted_networks):
         return peer_ip
 
-    xff_raw = request.headers.get("x-forwarded-for", "")
-    if not xff_raw or not xff_raw.strip():
+    xff_headers = request.headers.getlist("x-forwarded-for")
+    if not xff_headers:
+        return peer_ip
+    xff_raw = ",".join(xff_headers)
+    if not xff_raw.strip():
         return peer_ip
 
     for raw_hop in reversed(xff_raw.split(",")):

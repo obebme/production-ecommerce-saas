@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { fetchServerProductBySlug } from "@/lib/api/server-catalog";
+import { sanitizeMediaUrl } from "@/lib/format";
 import { ProductDetailView } from "@/components/storefront/product-detail-view";
 
 export const dynamic = "force-dynamic";
@@ -17,7 +18,7 @@ function decodeAndValidateSlug(rawSlug: string): string | null {
   if (!PRODUCT_SLUG_RE.test(decodedSlug)) {
     return null;
   }
-  return decodedSlug;
+  return decodedSlug.toLowerCase();
 }
 
 export async function generateMetadata({
@@ -46,6 +47,7 @@ export async function generateMetadata({
     const { product } = result;
     const sortedImages = [...product.images].sort((a, b) => a.sort_order - b.sort_order);
     const primaryImage = sortedImages.find((img) => img.is_primary) ?? sortedImages[0] ?? null;
+    const safeImageUrl = sanitizeMediaUrl(primaryImage?.url);
     const description =
       product.description || `${product.title} — ${product.category.name} at Atelier.`;
 
@@ -55,9 +57,10 @@ export async function generateMetadata({
       openGraph: {
         title: product.title,
         description,
-        images: primaryImage
-          ? [{ url: primaryImage.url, alt: primaryImage.alt_text || product.title }]
-          : undefined,
+        images:
+          safeImageUrl && primaryImage
+            ? [{ url: safeImageUrl, alt: primaryImage.alt_text || product.title }]
+            : undefined,
       },
     };
   }

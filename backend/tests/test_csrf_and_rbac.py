@@ -599,3 +599,68 @@ def test_l02_origin_default_ports_accepted_and_referer_userinfo_rejected(
         )
         assert r_userinfo.status_code == 403
         assert r_userinfo.json()["error"]["code"] == "CSRF_INVALID"
+
+
+def test_sec_rem_p2_01_resolve_client_ip_multiline_xff_and_zero_cidr_rejection(
+    test_settings: Settings,
+) -> None:
+    """SEC-REM-P2-01: Multi-line X-Forwarded-For uses getlist() right-to-left & rejects /0 CIDRs."""
+    from starlette.requests import Request as StarletteRequest
+
+    def _make_multiline_req(
+        peer: str,
+        xff_lines: list[bytes],
+        proxies: list[str] | None = None,
+    ) -> StarletteRequest:
+        headers: list[tuple[bytes, bytes]] = [
+            (b"x-forwarded-for", line) for line in xff_lines
+        ]
+        app_obj = FastAPI()
+        if proxies is not None:
+            app_obj.state.settings = test_settings.model_copy(
+                update={"trusted_proxy_ips": proxies}
+            )
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/v1/health",
+            "headers": headers,
+            "client": (peer, 50000),
+            "app": app_obj,
+        }
+        return StarletteRequest(scope)
+
+    # Multi-line X-Forwarded-For from trusted proxy joins both lines right-to-left
+    req_multiline = _make_multiline_req(
+        peer="10.1.2.3",
+        xff_lines=[b"198.51.100.99", b"10.0.0.10"],
+        proxies=["10.0.0.0/8"],
+    )
+    assert resolve_client_ip(req_multiline) == "198.51.100.99"
+
+    # Spoofed leftmost entry on line 1 is skipped while right-to-left walk crosses line 2 -> line 1
+    req_multiline_spoof = _make_multiline_req(
+        peer="10.1.2.3",
+        xff_lines=[b"203.0.113.77, 198.51.100.99", b"10.0.0.10"],
+        proxies=["10.0.0.0/8"],
+    )
+    assert resolve_client_ip(req_multiline_spoof) == "198.51.100.99"
+
+    # Direct /0 CIDR passed in trusted_proxy_ips must be rejected (fall back safely to peer_ip)
+    req_v4_zero = _make_multiline_req(
+        peer="198.51.100.77",
+        xff_lines=[b"203.0.113.10"],
+    )
+    assert resolve_client_ip(req_v4_zero, trusted_proxy_ips=["0.0.0.0/0"]) == "198.51.100.77"
+
+    req_v6_zero = _make_multiline_req(
+        peer="2001:db8::1",
+        xff_lines=[b"203.0.113.10"],
+    )
+    assert resolve_client_ip(req_v6_zero, trusted_proxy_ips=["::/0"]) == "2001:db8::1"
+
+    # Mixed /0 with valid non-matching CIDR still ignores /0 and falls back to peer_ip
+    assert (
+        resolve_client_ip(req_v4_zero, trusted_proxy_ips=["0.0.0.0/0", "10.0.0.0/8"])
+        == "198.51.100.77"
+    )

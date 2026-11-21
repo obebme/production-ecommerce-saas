@@ -18,6 +18,7 @@ import type {
 const DEFAULT_API_BASE_URL = "http://localhost:8000/api/v1";
 const SERVER_FETCH_TIMEOUT_MS = 8_000;
 const CONTROL_CHAR_RE = /[\u0000-\u001F\u007F]/;
+const MAX_PAGINATION_PAGE = 1_000_000;
 
 export const CATALOG_DEFAULT_PAGE_SIZE = 20;
 
@@ -55,11 +56,12 @@ function resolveServerApiBaseUrl(): string {
     return DEFAULT_API_BASE_URL;
   }
 
+  if (CONTROL_CHAR_RE.test(trimmed)) {
+    throw new Error("Invalid server API base URL configuration.");
+  }
+
   if (trimmed.startsWith("/")) {
-    const isSafeRelativePath =
-      !trimmed.startsWith("//") &&
-      !trimmed.includes("\\") &&
-      !CONTROL_CHAR_RE.test(trimmed);
+    const isSafeRelativePath = !trimmed.startsWith("//") && !trimmed.includes("\\");
 
     if (isSafeRelativePath) {
       return DEFAULT_API_BASE_URL;
@@ -76,6 +78,14 @@ function resolveServerApiBaseUrl(): string {
 
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
     throw new Error("Server API base URL must use http:// or https://.");
+  }
+
+  if (parsed.username || parsed.password) {
+    throw new Error("Server API base URL must not include credentials.");
+  }
+
+  if (parsed.search || parsed.hash) {
+    throw new Error("Server API base URL must not include query or fragment.");
   }
 
   if (trimmed.endsWith("/api/v1")) {
@@ -150,7 +160,7 @@ export function parseCatalogSearchParams(
   const sort: ProductSortOrder = rawSort && VALID_SORTS.has(rawSort) ? rawSort : "newest";
 
   const parsedPage = parsePositiveInt(getFirstString(raw.page));
-  const page = parsedPage && parsedPage >= 1 ? parsedPage : 1;
+  const page = parsedPage && parsedPage >= 1 ? Math.min(parsedPage, MAX_PAGINATION_PAGE) : 1;
 
   const queryKey = buildCatalogQueryKey({
     category_slug,
@@ -267,9 +277,15 @@ async function fetchProductBySlugImpl(slug: string): Promise<ServerProductResult
     const product = (await res.json()) as ProductDetailDTO;
     return { status: "ok", product };
   } catch (err) {
+    if (
+      (err instanceof DOMException && err.name === "AbortError") ||
+      (err instanceof Error && err.name === "AbortError")
+    ) {
+      return { status: "error", message: "Product request timed out." };
+    }
     return {
       status: "error",
-      message: err instanceof Error ? err.message : "Unable to load product details.",
+      message: "Unable to load product details.",
     };
   }
 }

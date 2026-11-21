@@ -72,6 +72,10 @@ const nextConfig = {
         headers: [{ key: "Cache-Control", value: "no-store" }],
       },
       {
+        source: "/cart/:path*",
+        headers: [{ key: "Cache-Control", value: "no-store" }],
+      },
+      {
         source: "/orders/:path*",
         headers: [{ key: "Cache-Control", value: "no-store" }],
       },

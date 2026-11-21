@@ -7,7 +7,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import HomePage from "@/app/(storefront)/page";
 import ProductsPage from "@/app/(storefront)/products/page";
 import ProductDetailPage, { generateMetadata } from "@/app/(storefront)/products/[slug]/page";
+import { metadata as rootMetadata } from "@/app/layout";
 import { catalogApi } from "@/lib/api/client";
+import { resolveSiteUrl } from "@/lib/site-url";
 import {
   fetchServerCategories,
   fetchServerProductBySlug,
@@ -246,6 +248,10 @@ describe("REM-P2-M09: Storefront SSR, Metadata, 404 & Asset Integrity", () => {
     process.env = { ...originalEnv };
     delete process.env.INTERNAL_API_BASE_URL;
     delete process.env.NEXT_PUBLIC_API_BASE_URL;
+    delete process.env.NEXT_PUBLIC_SITE_URL;
+    delete process.env.NEXT_PUBLIC_APP_ENV;
+    delete process.env.APP_ENV;
+    delete process.env.ENVIRONMENT;
     mockPathname = "/products";
     mockSearchParams = new URLSearchParams();
     mockNotFound.mockClear();
@@ -326,9 +332,23 @@ describe("REM-P2-M09: Storefront SSR, Metadata, 404 & Asset Integrity", () => {
       const serverErrRes = await fetchServerProductBySlug("linen-overshirt");
       expect(serverErrRes).toEqual({ status: "error", message: "Database temporarily down." });
 
-      fetchMock.mockRejectedValueOnce(new Error("ECONNREFUSED"));
+      fetchMock.mockRejectedValueOnce(new Error("connect ECONNREFUSED 127.0.0.1:8000"));
       const networkErrRes = await fetchServerProductBySlug("linen-overshirt");
-      expect(networkErrRes).toEqual({ status: "error", message: "ECONNREFUSED" });
+      expect(networkErrRes).toEqual({
+        status: "error",
+        message: "Unable to load product details.",
+      });
+      if (networkErrRes.status === "error") {
+        expect(networkErrRes.message).not.toContain("ECONNREFUSED");
+        expect(networkErrRes.message).not.toContain("127.0.0.1:8000");
+      }
+
+      fetchMock.mockRejectedValueOnce(new DOMException("The operation was aborted.", "AbortError"));
+      const abortErrRes = await fetchServerProductBySlug("linen-overshirt");
+      expect(abortErrRes).toEqual({
+        status: "error",
+        message: "Product request timed out.",
+      });
     });
   });
 
@@ -644,6 +664,137 @@ describe("REM-P2-M09: Storefront SSR, Metadata, 404 & Asset Integrity", () => {
           fetchMock.mock.calls.some(([url]) => String(url).endsWith("/cart"))
         ).toBe(true);
       });
+    });
+
+    it("SEC-M09-01: generateMetadata emits https:// or /assets/products/ openGraph.images, omits unsafe URLs, and normalizes mixed-case slugs", async () => {
+      process.env.INTERNAL_API_BASE_URL = "http://127.0.0.1:8000/api/v1";
+
+      // 1. Valid https:// image URL + mixed-case slug normalization
+      const httpsProduct = makeProductDetail({
+        images: [
+          {
+            id: "img-https",
+            url: "https://cdn.example.com/products/linen-overshirt.png",
+            alt_text: "Linen Overshirt CDN",
+            sort_order: 0,
+            is_primary: true,
+          },
+        ],
+      });
+      fetchMock.mockResolvedValueOnce(jsonResponse(httpsProduct));
+
+      const mixedCaseMeta = await generateMetadata({
+        params: Promise.resolve({ slug: "Linen-Overshirt" }),
+      });
+      expect(String(fetchMock.mock.calls[0][0])).toBe(
+        "http://127.0.0.1:8000/api/v1/products/linen-overshirt"
+      );
+      expect(mixedCaseMeta.openGraph).toMatchObject({
+        images: [
+          {
+            url: "https://cdn.example.com/products/linen-overshirt.png",
+            alt: "Linen Overshirt CDN",
+          },
+        ],
+      });
+
+      // 2. Unsafe image schemes / relative traversal URLs are omitted from openGraph.images
+      for (const unsafeUrl of [
+        "http://cdn.example.com/insecure.png",
+        "javascript:alert(1)",
+        "../secret.png",
+      ]) {
+        const unsafeProduct = makeProductDetail({
+          images: [
+            {
+              id: "img-unsafe",
+              url: unsafeUrl,
+              alt_text: "Unsafe image",
+              sort_order: 0,
+              is_primary: true,
+            },
+          ],
+        });
+        fetchMock.mockResolvedValueOnce(jsonResponse(unsafeProduct));
+        const meta = await generateMetadata({
+          params: Promise.resolve({ slug: "linen-overshirt" }),
+        });
+        expect(meta.openGraph?.images).toBeUndefined();
+      }
+    });
+  });
+
+  describe("resolveSiteUrl & RootLayout metadataBase", () => {
+    it("defaults to http://localhost:3000 in local dev and exposes RootLayout metadata.metadataBase", () => {
+      const localUrl = resolveSiteUrl();
+      expect(localUrl.origin).toBe("http://localhost:3000");
+      expect(rootMetadata.metadataBase).toBeInstanceOf(URL);
+      expect(rootMetadata.metadataBase?.origin).toBe("http://localhost:3000");
+    });
+
+    it("rejects unset, http://, and loopback URLs in staging/production and normalizes https:// origin", () => {
+      for (const envName of ["staging", "production"] as const) {
+        process.env.ENVIRONMENT = envName;
+        delete process.env.NEXT_PUBLIC_SITE_URL;
+
+        expect(() => resolveSiteUrl()).toThrow(/NEXT_PUBLIC_SITE_URL/);
+        expect(() => resolveSiteUrl("http://shop.example.com")).toThrow(/https:\/\//);
+        expect(() => resolveSiteUrl("https://localhost:3000")).toThrow(/loopback|wildcard/);
+        expect(() => resolveSiteUrl("https://127.0.0.1:3000")).toThrow(/loopback|wildcard/);
+
+        process.env.NEXT_PUBLIC_SITE_URL = "https://shop.example.com/path";
+        const normalized = resolveSiteUrl();
+        expect(normalized.origin).toBe("https://shop.example.com");
+        expect(normalized.href).toBe("https://shop.example.com/");
+      }
+    });
+  });
+
+  describe("A11Y-M09-01: Storefront heading hierarchy", () => {
+    it("renders CatalogView product card titles as <h2> without skipped h1 -> h3 and renders HomeView guarantees <h2> above <h3>", async () => {
+      process.env.INTERNAL_API_BASE_URL = "http://127.0.0.1:8000/api/v1";
+
+      fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith("/categories")) {
+          return jsonResponse({ items: makeCategories() });
+        }
+        if (url.includes("/products")) {
+          return jsonResponse({
+            items: [makeProductSummary()],
+            total: 1,
+            page: 1,
+            page_size: 20,
+            has_next: false,
+          });
+        }
+        return errorResponse(404, "NOT_FOUND", `Unexpected ${url}`);
+      });
+
+      const catalogEl = await ProductsPage({
+        searchParams: Promise.resolve({}),
+      });
+      const { container: catalogContainer, unmount: unmountCatalog } = render(catalogEl);
+
+      const catalogH1 = screen.getByRole("heading", { level: 1, name: "Collection" });
+      expect(catalogH1).toBeInTheDocument();
+      const cardHeading = screen.getByRole("heading", {
+        level: 2,
+        name: "Atelier Linen Overshirt",
+      });
+      expect(cardHeading.tagName).toBe("H2");
+      expect(catalogContainer.querySelectorAll("h3")).toHaveLength(0);
+      unmountCatalog();
+
+      const homeEl = await HomePage();
+      const { container: homeContainer, unmount: unmountHome } = render(homeEl);
+      const guaranteesHeading = homeContainer.querySelector("h2#home-guarantees-heading");
+      expect(guaranteesHeading).not.toBeNull();
+      expect(guaranteesHeading).toHaveTextContent("Storefront guarantees");
+      expect(
+        screen.getByRole("heading", { level: 3, name: "Complimentary shipping over $100" })
+      ).toBeInTheDocument();
+      unmountHome();
     });
   });
 

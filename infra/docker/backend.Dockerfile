@@ -3,9 +3,9 @@
 # Build context: ./backend
 #
 # Dependency Strategy:
-#   Supports either `requirements.txt` (pinned pip requirements, preferred when
-#   present) or `pyproject.toml` (PEP 621 package install). Fails explicitly if
-#   neither manifest exists.
+#   Prefers hash-verified `requirements.lock` (pip --require-hashes, generated
+#   via `uv pip compile --universal --generate-hashes`), falling back to
+#   `requirements.txt` or `pyproject.toml`. Fails explicitly if none exist.
 # ==============================================================================
 
 FROM python:3.12-slim AS builder
@@ -23,15 +23,17 @@ RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /build
-COPY requirements.txt pyproject.toml /build/
+COPY requirements.txt pyproject.toml requirements.lock* /build/
 
 RUN python -m pip install --upgrade pip && \
-    if [ -f requirements.txt ]; then \
+    if [ -f requirements.lock ]; then \
+        pip install --no-cache-dir --require-hashes -r requirements.lock; \
+    elif [ -f requirements.txt ]; then \
         pip install --no-cache-dir -r requirements.txt; \
     elif [ -f pyproject.toml ]; then \
         pip install --no-cache-dir .; \
     else \
-        echo "ERROR: Expected backend/requirements.txt or backend/pyproject.toml in build context." >&2; \
+        echo "ERROR: Expected backend/requirements.lock, backend/requirements.txt, or backend/pyproject.toml in build context." >&2; \
         exit 1; \
     fi
 

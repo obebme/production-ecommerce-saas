@@ -108,6 +108,7 @@ jobs:
               "STANDARD_SHIPPING_CENTS",
               "TAX_RATE_BPS",
               "NEXT_PUBLIC_API_BASE_URL",
+              "NEXT_PUBLIC_SITE_URL",
               "INTERNAL_API_BASE_URL",
           ]
           env_values = {}
@@ -130,6 +131,11 @@ jobs:
                   raise SystemExit(f"{secret_var} in .env.example must use a CHANGE_ME_DEV_ONLY_ placeholder")
 
           print(f".env.example coverage verified ({len(required_vars)} required variables + TRUSTED_PROXY_IPS present)")
+
+          # 5. Verify hash-pinned backend lockfile exists
+          if not pathlib.Path("backend/requirements.lock").is_file():
+              raise SystemExit("ERROR: backend/requirements.lock must exist for hash-verified dependency installs")
+          print("Verified backend/requirements.lock exists.")
           PY
 
       - name: Validate Compose configuration with .env.example
@@ -147,6 +153,7 @@ jobs:
           docker build \
             --file infra/docker/frontend.Dockerfile \
             --build-arg NEXT_PUBLIC_API_BASE_URL=http://localhost:8000/api/v1 \
+            --build-arg NEXT_PUBLIC_SITE_URL=http://localhost:3000 \
             ./frontend
 
   backend-ci:
@@ -198,7 +205,9 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
+          if [ -f requirements.lock ]; then
+            pip install --require-hashes -r requirements.lock
+          elif [ -f requirements.txt ]; then
             pip install -r requirements.txt
             if [ -f requirements-dev.txt ]; then
               pip install -r requirements-dev.txt
@@ -206,11 +215,15 @@ jobs:
           elif [ -f pyproject.toml ]; then
             pip install -e ".[dev]" || pip install -e .
           fi
-          pip install ruff mypy pytest httpx
+          pip install ruff mypy pytest httpx pip-audit
 
       - name: Verify Python dependency consistency
         working-directory: backend
         run: python -m pip check
+
+      - name: Audit pinned backend dependencies for known vulnerabilities
+        working-directory: backend
+        run: pip-audit -r requirements.lock --disable-pip
 
       - name: Provision least-privilege PostgreSQL test role and database
         run: |
@@ -282,6 +295,7 @@ jobs:
       CI: "true"
       NEXT_TELEMETRY_DISABLED: "1"
       NEXT_PUBLIC_API_BASE_URL: http://localhost:8000/api/v1
+      NEXT_PUBLIC_SITE_URL: http://localhost:3000
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -304,6 +318,10 @@ jobs:
       - name: Verify frontend production dependency tree
         working-directory: frontend
         run: npm ls --omit=dev --depth=0
+
+      - name: Audit frontend dependencies for high/critical vulnerabilities
+        working-directory: frontend
+        run: npm audit --audit-level=high
 
       - name: Run ESLint
         working-directory: frontend
@@ -354,6 +372,7 @@ jobs:
       TAX_RATE_BPS: "800"
       NEXT_TELEMETRY_DISABLED: "1"
       NEXT_PUBLIC_API_BASE_URL: http://localhost:8000/api/v1
+      NEXT_PUBLIC_SITE_URL: http://localhost:3000
       INTERNAL_API_BASE_URL: http://127.0.0.1:8000/api/v1
       NO_PROXY: 127.0.0.1,localhost
     steps:
@@ -400,7 +419,9 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
+          if [ -f requirements.lock ]; then
+            pip install --require-hashes -r requirements.lock
+          elif [ -f requirements.txt ]; then
             pip install -r requirements.txt
           elif [ -f pyproject.toml ]; then
             pip install -e .

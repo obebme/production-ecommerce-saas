@@ -1,7 +1,11 @@
 import "@testing-library/jest-dom/vitest";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
 import * as React from "react";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import StorefrontNotFoundPage from "@/app/(storefront)/not-found";
+import NotFoundPage from "@/app/not-found";
 import { ApiError, cartApi, inventoryApi } from "@/lib/api/client";
 import type {
   CartDTO,
@@ -1036,5 +1040,40 @@ describe("StorefrontHeader", () => {
   it("renders REFUND_PENDING StatusBadge with warning label", () => {
     render(<StatusBadge domain="payment" value="REFUND_PENDING" />);
     expect(screen.getByText("Refund Pending")).toBeInTheDocument();
+  });
+});
+
+describe("SEC-M09-03 & Not-Found landmarks", () => {
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("SEC-M09-03: next.config.mjs headers() enforces Cache-Control: no-store on /cart/:path*", async () => {
+    const configUrl = pathToFileURL(path.resolve(__dirname, "..", "next.config.mjs")).href;
+    const mod = (await import(/* @vite-ignore */ configUrl)) as {
+      default: {
+        headers: () => Promise<Array<{ source: string; headers: Array<{ key: string; value: string }> }>>;
+      };
+    };
+
+    const rules = await mod.default.headers();
+    const cartRule = rules.find((rule) => rule.source === "/cart/:path*");
+    expect(cartRule).toBeDefined();
+    expect(cartRule?.headers).toContainEqual({
+      key: "Cache-Control",
+      value: "no-store",
+    });
+  });
+
+  it("renders root NotFoundPage with <main id='main-content'> and StorefrontNotFoundPage without a duplicate <main>", () => {
+    const { unmount: unmountRoot } = render(<NotFoundPage />);
+    const rootMain = screen.getByRole("main");
+    expect(rootMain).toHaveAttribute("id", "main-content");
+    expect(screen.getByRole("heading", { level: 1, name: "Page not found" })).toBeInTheDocument();
+    unmountRoot();
+
+    render(<StorefrontNotFoundPage />);
+    expect(screen.queryByRole("main")).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { level: 1, name: "Page not found" })).toBeInTheDocument();
   });
 });

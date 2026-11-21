@@ -1,4 +1,4 @@
-# Local Development, Container Topology & CI Runbook (`OPS-002` / `REM-P2-OPS`)
+# Local Development, Container Topology & CI Runbook (`OPS-002` / `REM-P2-OPS` / `REM-P3B-OPS`)
 
 > **Scope**: Reproducible Docker Compose setup, multi-stage Dockerfiles, environment templates, database migration and CLI administration workflows, local PostgreSQL/E2E runners, Windows subprocess operational safeguards, and GitHub Actions CI.  
 > **Baseline Constraint**: Minimum 4-service stack (`db`, `migrate`, `api`, `web`) with PostgreSQL 16 as single source of truth. Redis, Celery, Kubernetes, and external SaaS services are intentionally excluded per `ARCH-001`.
@@ -12,7 +12,7 @@
 | Area | Status | Notes / Evidence |
 | :--- | :--- | :--- |
 | `compose.yaml` & `.github/workflows/ci.yml` YAML parsing | **Verified** | Validated statically via Python `PyYAML` and `ops-validate` service assertions |
-| `.env.example` variable coverage & placeholder check | **Verified** | All 18 required keys + optional `TRUSTED_PROXY_IPS` match `Settings` in [config.py](../../backend/app/core/config.py) |
+| `.env.example` variable coverage & placeholder check | **Verified** | All 19 required keys + optional `TRUSTED_PROXY_IPS` match `Settings` / frontend URLs in [config.py](../../backend/app/core/config.py) and `.env.example` |
 | `docker compose --env-file .env.example config --quiet` | **Verified** | Validated locally via Docker Compose CLI |
 | Alembic migration head check (`alembic heads`) | **Verified (Host)** | Single linear head `0003_phase2_indexes_and_cleanup (head)` |
 | Phase 1 / Phase 2 full test & E2E suites | **Prior baseline verified (`REM-P1-QA`); `REM-P2-QA` pending** | Phase 1 verified (`173` SQLite / `177` PG 18.6, `64` Vitest, `4` Playwright E2E); Phase 2 (`0003` migration + hardening) awaits `REM-P2-QA` |
@@ -106,14 +106,15 @@ docker compose down -v
 - **Loopback-Only Dev Port Bindings (`L-05`)**:
   - `db`, `api`, and `web` bind strictly to `127.0.0.1` (`127.0.0.1:5432`, `127.0.0.1:8000`, `127.0.0.1:3000`) in [compose.yaml](../../compose.yaml) so local development/sandbox containers never listen on `0.0.0.0` LAN interfaces.
 - **Layer Caching (`L-04`) & Non-root Execution**:
-  - [backend.Dockerfile](../../infra/docker/backend.Dockerfile) copies `requirements.txt` and `pyproject.toml` and installs dependencies into `/opt/venv` **before** `COPY . /build`, preserving the Docker dependency layer cache when only application code changes. Runtime runs as `appuser` (`UID 10001`, `nologin`) without compilers.
+  - [backend.Dockerfile](../../infra/docker/backend.Dockerfile) copies `requirements.txt`, `pyproject.toml`, and `requirements.lock*`, installing hash-verified dependencies via `pip install --no-cache-dir --require-hashes -r requirements.lock` into `/opt/venv` **before** `COPY . /build`, preserving the Docker dependency layer cache when only application code changes. Runtime runs as `appuser` (`UID 10001`, `nologin`) without compilers.
   - [frontend.Dockerfile](../../infra/docker/frontend.Dockerfile) runs as `nextjs` (`UID 10001`) on `node:22-alpine`, copying the `output: "standalone"` runtime bundle (`server.js`, `.next/static`, `public`, and minimal traced `node_modules`) without shipping dev dependencies such as `vitest` or `@playwright/test`.
 - **Trusted Proxy IP & Uvicorn Proxy-Headers (`H-04`)**:
   - App-level `resolve_client_ip` in [security.py](../../backend/app/core/security.py) validates the TCP peer IP (`request.client.host`) against `TRUSTED_PROXY_IPS` before parsing `X-Forwarded-For` right-to-left, regardless of whether Uvicorn `--proxy-headers` is enabled.
   - Keep the default `CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]` (and **never** pass `--forwarded-allow-ips=*`, which overwrites `request.client.host` and bypasses peer-IP trust verification). If `--proxy-headers` is required behind a TLS-terminating reverse proxy for scheme/host forwarding, pass `--forwarded-allow-ips=<exact-proxy-ip-or-cidr>` matching `TRUSTED_PROXY_IPS`.
 - **No `curl` Required**: Health checks use Python `urllib.request` and Node `http.get` built-ins to keep minimal runtime images free of extra utilities.
-- **Browser vs. SSR URL Split**:
+- **Browser vs. SSR URL Split & `NEXT_PUBLIC_SITE_URL`**:
   - `NEXT_PUBLIC_API_BASE_URL=http://localhost:8000/api/v1` is passed as a Docker build arg (and CSP `connect-src` origin) so browser requests target `localhost:8000` (same-site as `localhost:3000` for `SameSite=Lax` HTTP-only cookies).
+  - `NEXT_PUBLIC_SITE_URL` sets the canonical public site origin for Next.js `metadataBase` and canonical metadata URLs (accepted as a build arg in [frontend.Dockerfile](../../infra/docker/frontend.Dockerfile) and passed both as a build arg and runtime env var in [compose.yaml](../../compose.yaml)). In local dev and CI, use `http://localhost:3000`; in staging/production, it **must** be set to a non-localhost `https://` origin (e.g., `https://shop.example.com`).
   - `INTERNAL_API_BASE_URL=http://api:8000/api/v1` is passed as a runtime env var for Next.js SSR fetches inside the Compose network (`http://127.0.0.1:8000/api/v1` when running on a single host outside Docker).
 - **Docker Build Context Hygiene (`H-07`)**:
   - [backend/.dockerignore](../../backend/.dockerignore) excludes `.venv/`, `__pycache__/`, `.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/`, `.env*`, and `tests/`.
@@ -315,20 +316,34 @@ The GitHub Actions workflow ([ci.yml](../../.github/workflows/ci.yml)) runs on `
 2. **`ops-validate`** (`needs: detect`):
    - Parses `compose.yaml` and `.github/workflows/ci.yml` with `PyYAML`.
    - Verifies `compose.yaml` defines only the 4 baseline services (`db`, `migrate`, `api`, `web`).
-   - Verifies `.env` is untracked in Git and `.env.example` defines all 18 required keys (plus optional `TRUSTED_PROXY_IPS`) with `CHANGE_ME_DEV_ONLY_` secret placeholders.
+   - Verifies `.env` is untracked in Git, `.env.example` defines all 19 required keys (plus optional `TRUSTED_PROXY_IPS`) with `CHANGE_ME_DEV_ONLY_` secret placeholders, and `backend/requirements.lock` exists.
    - Runs `docker compose --env-file .env.example config --quiet`.
-   - Builds `infra/docker/backend.Dockerfile` and `infra/docker/frontend.Dockerfile` (Node 22 Alpine).
+   - Builds `infra/docker/backend.Dockerfile` and `infra/docker/frontend.Dockerfile` (Node 22 Alpine, passing both `NEXT_PUBLIC_API_BASE_URL` and `NEXT_PUBLIC_SITE_URL` build args).
 3. **`backend-ci`** (`needs: detect`, `postgres:16-alpine` service):
+   - Installs hash-pinned backend dependencies via `pip install --require-hashes -r requirements.lock` (plus dev/audit tooling `ruff mypy pytest httpx pip-audit`).
    - Provisions least-privilege `ecom_test` role (`NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION`) and `ecom_test` database on PostgreSQL 16.
    - Exports both `DATABASE_URL` and `TEST_DATABASE_URL` (`postgresql+psycopg://ecom_test:ecom_test_password@localhost:5432/ecom_test`) so all live PostgreSQL 16 migration, constraint, concurrency, and analytics/INET tests execute instead of skipping.
-   - Runs `python -m pip check`, `ruff check .`, `mypy app tests/run_disposable_pg_pytest.py tests/test_admin_and_analytics.py`, single-head `alembic heads` check (`0003_phase2_indexes_and_cleanup`), `alembic upgrade head`, and `pytest -v`.
-4. **`frontend-ci`** (`needs: detect`, Node.js 22):
-   - Runs `npm ci`, `npm ls --omit=dev --depth=0`, `npm run lint`, `npx tsc --noEmit`, `npm run build`, and `npm test` (Vitest unit/component suite).
+   - Runs `python -m pip check`, `pip-audit -r requirements.lock --disable-pip`, `ruff check .`, `mypy app tests/run_disposable_pg_pytest.py tests/test_admin_and_analytics.py`, single-head `alembic heads` check (`0003_phase2_indexes_and_cleanup`), `alembic upgrade head`, and `pytest -v`.
+4. **`frontend-ci`** (`needs: detect`, Node.js 22, `NEXT_PUBLIC_SITE_URL=http://localhost:3000`):
+   - Runs `npm ci`, `npm ls --omit=dev --depth=0`, `npm audit --audit-level=high`, `npm run lint`, `npx tsc --noEmit`, `npm run build`, and `npm test` (Vitest unit/component suite).
 5. **`e2e-ci`** (`needs: [backend-ci, frontend-ci]`, `postgres:16-alpine` service, Python 3.12 + Node.js 22):
-   - Generates masked ephemeral CI HMAC secrets and demo passwords (`::add-mask::`), provisions least-privilege `ecom_test` on PostgreSQL 16, runs `alembic upgrade head`, and runs `python -m app.cli seed-demo --with-demo-users`.
-   - Installs frontend dependencies (`npm ci`), installs Playwright Chromium (`npx playwright install --with-deps chromium`), and builds the Next.js standalone bundle (`NEXT_PUBLIC_API_BASE_URL=http://localhost:8000/api/v1 npm run build`).
+   - Installs hash-pinned backend dependencies via `pip install --require-hashes -r requirements.lock`, generates masked ephemeral CI HMAC secrets and demo passwords (`::add-mask::`), provisions least-privilege `ecom_test` on PostgreSQL 16, runs `alembic upgrade head`, and runs `python -m app.cli seed-demo --with-demo-users`.
+   - Installs frontend dependencies (`npm ci`), installs Playwright Chromium (`npx playwright install --with-deps chromium`), and builds the Next.js standalone bundle (`NEXT_PUBLIC_API_BASE_URL=http://localhost:8000/api/v1`, `NEXT_PUBLIC_SITE_URL=http://localhost:3000`).
    - Launches FastAPI (`uvicorn app.main:app --host 127.0.0.1 --port 8000`) and Next.js standalone (`node .next/standalone/server.js` with `.next/static` and `public` copied into `.next/standalone/`, `HOSTNAME=127.0.0.1`, `PORT=3000`, `INTERNAL_API_BASE_URL=http://127.0.0.1:8000/api/v1`) using log-file redirection and `</dev/null`, polls `/api/v1/health` and `/` with bounded `curl --max-time 3` loops, and runs `npx playwright test` (`E2E_BASE_URL=http://localhost:3000`).
    - Uploads `frontend/test-results/` and `/tmp/e2e_*.log` on `failure()`, and stops background server PIDs unconditionally in `if: always()`.
+
+### Regenerating `backend/requirements.lock` & Supply-Chain Audits
+
+Whenever `backend/requirements.txt` changes, regenerate the universal hash-pinned lockfile from `backend/` before committing:
+
+```bash
+cd backend
+uv pip compile --universal --generate-hashes --python-version 3.12 requirements.txt -o requirements.lock
+```
+
+CI vulnerability audits run automatically on every PR and push to `main`:
+- **Backend**: `pip-audit -r requirements.lock --disable-pip` (in `backend-ci`, auditing the exact locked packages without relying on ambient environment state).
+- **Frontend**: `npm audit --audit-level=high` (in `frontend-ci`, failing on high or critical npm advisories).
 
 ### Local Static Validation Commands
 

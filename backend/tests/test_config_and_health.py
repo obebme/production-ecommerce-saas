@@ -567,3 +567,65 @@ def test_m07_sensitive_routes_no_store_headers_and_catalog_not_forced(
         pub_resp = client.get(public_path)
         assert pub_resp.status_code == 200
         assert pub_resp.headers.get("Cache-Control") != "no-store"
+
+
+@pytest.mark.parametrize(
+    "zero_cidr",
+    ["0.0.0.0/0", "::/0", ["0.0.0.0/0"], ["::/0"], "10.0.0.0/8, 0.0.0.0/0"],
+)
+def test_sec_rem_p2_02_settings_rejects_unrestricted_zero_cidr_proxies(
+    zero_cidr: str | list[str],
+) -> None:
+    """SEC-REM-P2-02: Settings rejects unrestricted /0 CIDRs in TRUSTED_PROXY_IPS."""
+    with pytest.raises(ValidationError, match="TRUSTED_PROXY_IPS"):
+        Settings(**_valid_prod_kwargs(trusted_proxy_ips=zero_cidr))
+
+
+@pytest.mark.parametrize("env_name", ["staging", "production"])
+@pytest.mark.parametrize(
+    "timeout_field",
+    [
+        "db_statement_timeout_ms",
+        "db_lock_timeout_ms",
+        "db_idle_in_transaction_timeout_ms",
+    ],
+)
+@pytest.mark.parametrize("bad_value", [0, -1])
+def test_sec_rem_p2_02_deployed_envs_reject_non_positive_db_timeouts(
+    env_name: str,
+    timeout_field: str,
+    bad_value: int,
+) -> None:
+    """SEC-REM-P2-02: Staging and production reject <= 0 DB statement/lock/idle timeouts."""
+    kwargs = _valid_prod_kwargs(
+        environment=env_name,
+        payment_sandbox_mode=(env_name == "staging"),
+        **{timeout_field: bad_value},
+    )
+    with pytest.raises(ValidationError):
+        Settings(**kwargs)
+
+
+@pytest.mark.parametrize("env_name", ["development", "test"])
+def test_sec_rem_p2_02_non_deployed_envs_allow_zero_db_timeouts_and_accept_site_url(
+    env_name: str,
+) -> None:
+    """SEC-REM-P2-02: Dev/test allow 0 DB timeouts and Settings accepts NEXT_PUBLIC_SITE_URL."""
+    settings = Settings(
+        database_url="sqlite:///./local_test.db",
+        environment=env_name,
+        cookie_secure=False,
+        allowed_origins=["http://localhost:3000"],
+        csrf_hmac_secret=_STRONG_SECRET_A,
+        guest_order_hmac_secret=_STRONG_SECRET_B,
+        payment_webhook_secret=_STRONG_SECRET_C,
+        payment_sandbox_mode=True,
+        db_statement_timeout_ms=0,
+        db_lock_timeout_ms=0,
+        db_idle_in_transaction_timeout_ms=0,
+        next_public_site_url="https://shop.example.com",
+    )
+    assert settings.db_statement_timeout_ms == 0
+    assert settings.db_lock_timeout_ms == 0
+    assert settings.db_idle_in_transaction_timeout_ms == 0
+    assert settings.next_public_site_url == "https://shop.example.com"

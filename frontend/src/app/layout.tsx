@@ -6,9 +6,11 @@ import "@fontsource/jetbrains-mono/500.css";
 import "./globals.css";
 import { ThemeProvider } from "@/components/shared/theme-provider";
 import { ToastProvider } from "@/components/ui/toast";
+import { resolveSiteUrl } from "@/lib/site-url";
 import { AuthProvider } from "@/providers/auth-provider";
 
 export const metadata: Metadata = {
+  metadataBase: resolveSiteUrl(),
   title: {
     default: "Atelier — Considered Everyday Goods",
     template: "%s | Atelier",

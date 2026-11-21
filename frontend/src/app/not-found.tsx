@@ -3,7 +3,10 @@ import { Button } from "@/components/ui/button";
 
 export default function NotFoundPage() {
   return (
-    <div className="flex min-h-screen flex-col items-center justify-center bg-background px-4 py-16 text-center text-foreground">
+    <main
+      id="main-content"
+      className="flex min-h-screen flex-col items-center justify-center bg-background px-4 py-16 text-center text-foreground"
+    >
       <p className="font-mono text-xs uppercase tracking-widest text-muted-foreground">404</p>
       <h1 className="mt-2 font-display text-3xl font-medium tracking-[-0.02em]">
         Page not found
@@ -19,6 +22,6 @@ export default function NotFoundPage() {
           <Link href="/products">Browse Catalog</Link>
         </Button>
       </div>
-    </div>
+    </main>
   );
 }

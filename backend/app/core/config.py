@@ -133,6 +133,7 @@ class Settings(BaseSettings):
 
     # Frontend URL references present in .env.example (optional on backend runtime)
     next_public_api_base_url: str | None = None
+    next_public_site_url: str | None = None
     internal_api_base_url: str | None = None
 
     @field_validator("allowed_origins", mode="before")
@@ -185,6 +186,10 @@ class Settings(BaseSettings):
                 raise ValueError(
                     f"TRUSTED_PROXY_IPS entry '{entry}' is not a valid IP or CIDR network."
                 ) from exc
+            if network.prefixlen == 0:
+                raise ValueError(
+                    f"TRUSTED_PROXY_IPS cannot contain an unrestricted /0 network ('{entry}')."
+                )
             validated.append(str(network))
         return list(dict.fromkeys(validated))
 
@@ -276,6 +281,17 @@ class Settings(BaseSettings):
                     "CSRF_HMAC_SECRET, GUEST_ORDER_HMAC_SECRET, and PAYMENT_WEBHOOK_SECRET "
                     f"must be distinct when ENVIRONMENT={env_label}."
                 )
+
+            for timeout_field in (
+                "db_statement_timeout_ms",
+                "db_lock_timeout_ms",
+                "db_idle_in_transaction_timeout_ms",
+            ):
+                if getattr(self, timeout_field) <= 0:
+                    raise ValueError(
+                        f"{timeout_field.upper()} must be greater than 0 "
+                        f"when ENVIRONMENT={env_label}."
+                    )
 
         return self
 
