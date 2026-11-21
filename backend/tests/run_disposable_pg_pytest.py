@@ -137,7 +137,8 @@ def _is_pid_running(pid: int) -> bool:
                 finally:
                     kernel32.CloseHandle(handle)
             else:
-                last_error = int(ctypes.get_last_error())
+                get_last_error = getattr(ctypes, "get_last_error", None)
+                last_error = int(get_last_error()) if get_last_error is not None else 0
                 if last_error == _ERROR_INVALID_PARAMETER:
                     return False
 
