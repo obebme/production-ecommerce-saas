@@ -3,7 +3,15 @@
 import * as React from "react";
 import Image from "next/image";
 import Link from "next/link";
-import { ArrowRight, Award, RotateCcw, ShieldCheck, Truck } from "lucide-react";
+import {
+  ArrowRight,
+  ChevronLeft,
+  ChevronRight,
+  Clock,
+  PackageCheck,
+  RotateCcw,
+  Truck,
+} from "lucide-react";
 import { catalogApi } from "@/lib/api/client";
 import type { CategoryPublicDTO, ProductSummaryDTO } from "@/lib/api/types";
 import { cn } from "@/lib/utils";
@@ -188,21 +196,64 @@ export function HomeView({ initialCategories, initialProducts }: HomeViewProps =
     };
   }, []);
 
+  const categoriesRailRef = React.useRef<HTMLDivElement | null>(null);
+  const [canScrollCategoriesLeft, setCanScrollCategoriesLeft] = React.useState(false);
+  const [canScrollCategoriesRight, setCanScrollCategoriesRight] = React.useState(false);
+
+  const syncCategoriesRailControls = React.useCallback(() => {
+    const rail = categoriesRailRef.current;
+    if (!rail) {
+      setCanScrollCategoriesLeft(false);
+      setCanScrollCategoriesRight(false);
+      return;
+    }
+    const maxScrollLeft = rail.scrollWidth - rail.clientWidth;
+    setCanScrollCategoriesLeft(rail.scrollLeft > 4);
+    setCanScrollCategoriesRight(maxScrollLeft - rail.scrollLeft > 4);
+  }, []);
+
+  React.useEffect(() => {
+    const rail = categoriesRailRef.current;
+    syncCategoriesRailControls();
+    if (!rail) {
+      return;
+    }
+    rail.addEventListener("scroll", syncCategoriesRailControls, { passive: true });
+    window.addEventListener("resize", syncCategoriesRailControls);
+    return () => {
+      rail.removeEventListener("scroll", syncCategoriesRailControls);
+      window.removeEventListener("resize", syncCategoriesRailControls);
+    };
+  }, [categoriesLoading, categories.length, syncCategoriesRailControls]);
+
+  const scrollCategoriesRail = React.useCallback((direction: -1 | 1) => {
+    const rail = categoriesRailRef.current;
+    if (!rail) {
+      return;
+    }
+    const firstCard = rail.firstElementChild as HTMLElement | null;
+    const step = firstCard
+      ? firstCard.getBoundingClientRect().width + 12
+      : Math.max(rail.clientWidth * 0.74, 240);
+    rail.scrollBy({ left: direction * step, behavior: "smooth" });
+  }, []);
+
   return (
-    <div className="space-y-14 pb-20">
+    <div className="space-y-12 pb-12 sm:space-y-14 sm:pb-16">
       {/* 1. Architectural Hero Banner */}
       <section className="mx-auto max-w-[1440px] px-4 pt-6 sm:px-6 lg:px-8">
-        <div className="relative overflow-hidden rounded-[20px] border border-border bg-gradient-to-br from-[#EFEAE0] via-[#FAF8F3] to-[#E6DFD2] p-8 sm:p-12 lg:p-14 dark:from-[#16191F] dark:via-[#111419] dark:to-[#0B0D0F]">
+        <div className="relative overflow-hidden rounded-[20px] border border-border bg-gradient-to-br from-[#EFEAE0] via-[#FAF8F3] to-[#E6DFD2] dark:from-[#0B0D0F] dark:via-[#111419] dark:to-[#0B0D0F]">
           <div
             aria-hidden="true"
             className="pointer-events-none absolute -right-24 -top-24 h-80 w-80 rounded-full bg-accent/15 blur-3xl"
           />
-          <div className="relative grid items-center gap-10 lg:grid-cols-12 lg:gap-12">
-            <div className="space-y-6 lg:col-span-6">
+
+          <div className="relative flex flex-col lg:min-h-[460px] lg:justify-center">
+            <div className="relative z-10 space-y-5 px-6 py-8 sm:space-y-6 sm:px-10 sm:py-12 lg:max-w-[54%] lg:px-14 lg:py-16">
               <p className="inline-flex items-center gap-2 rounded-full border border-accent/30 bg-accent-subtle px-3.5 py-1 text-xs font-semibold uppercase tracking-[0.16em] text-accent">
                 Curated Studio Collection
               </p>
-              <h1 className="text-3xl font-bold leading-[1.08] tracking-[-0.025em] text-foreground sm:text-5xl">
+              <h1 className="text-4xl font-bold leading-[1.05] tracking-[-0.03em] text-foreground sm:text-5xl lg:text-[3.25rem]">
                 Considered pieces crafted for everyday utility.
               </h1>
               <p className="max-w-xl text-base leading-relaxed text-muted-foreground">
@@ -230,34 +281,31 @@ export function HomeView({ initialCategories, initialProducts }: HomeViewProps =
                   <Link href="/products?in_stock=true">In-Stock Ready</Link>
                 </Button>
               </div>
-              <div className="flex items-center gap-2 pt-2" aria-hidden="true">
-                <span className="h-1.5 w-6 rounded-full bg-accent" />
-                <span className="h-1.5 w-1.5 rounded-full bg-border-control" />
-                <span className="h-1.5 w-1.5 rounded-full bg-border-control" />
-              </div>
             </div>
 
-            <div className="lg:col-span-6">
-              <div className="relative aspect-[4/3] w-full overflow-hidden rounded-[16px] border border-border bg-[#0E1115] shadow-md">
-                <Image
-                  src="/assets/products/hero-showcase.png"
-                  alt="Vellora Store studio composition featuring ceramic table lamp, leather weekender bag, and wool throw blanket"
-                  fill
-                  sizes="(max-width: 1024px) 100vw, 50vw"
-                  priority
-                  unoptimized
-                  className="object-cover object-center"
-                />
-                <div
-                  aria-hidden="true"
-                  className="pointer-events-none absolute inset-0 bg-gradient-to-t from-[#0B0D0F]/70 via-transparent to-transparent"
-                />
-                <div className="absolute bottom-4 left-4 right-4 flex items-center justify-between gap-3">
-                  <span className="inline-flex items-center gap-2 rounded-full border border-white/15 bg-[#0B0D0F]/75 px-3.5 py-1.5 text-xs font-medium text-[#F5F3EE] backdrop-blur-md">
-                    <span className="h-2 w-2 rounded-full bg-[#34D399]" aria-hidden="true" />
-                    Live Studio Inventory · Verified Per SKU
-                  </span>
-                </div>
+            <div className="relative aspect-[16/10] w-full overflow-hidden bg-[#0E1115] lg:absolute lg:inset-y-0 lg:right-0 lg:aspect-auto lg:w-[58%]">
+              <Image
+                src="/assets/products/hero-showcase.png"
+                alt="Vellora Store studio composition featuring ceramic table lamp, leather weekender bag, and wool throw blanket"
+                fill
+                sizes="(max-width: 1024px) 100vw, 58vw"
+                priority
+                unoptimized
+                className="object-cover object-center"
+              />
+              <div
+                aria-hidden="true"
+                className="pointer-events-none absolute inset-y-0 left-0 hidden w-44 bg-gradient-to-r from-[#FAF8F3] via-[#FAF8F3]/65 to-transparent lg:block dark:from-[#0B0D0F] dark:via-[#0D1014]/90 dark:to-transparent"
+              />
+              <div
+                aria-hidden="true"
+                className="pointer-events-none absolute inset-0 bg-gradient-to-t from-[#0B0D0F]/75 via-transparent to-transparent"
+              />
+              <div className="absolute bottom-4 left-4 sm:bottom-6 sm:left-6 lg:left-auto lg:right-6">
+                <span className="inline-flex items-center gap-2 rounded-full border border-white/15 bg-[#0B0D0F]/80 px-3.5 py-1.5 text-xs font-medium text-[#F5F3EE] backdrop-blur-md">
+                  <span className="h-2 w-2 rounded-full bg-[#34D399]" aria-hidden="true" />
+                  Live Studio Inventory · Verified Per SKU
+                </span>
               </div>
             </div>
           </div>
@@ -287,12 +335,24 @@ export function HomeView({ initialCategories, initialProducts }: HomeViewProps =
 
           <div className="flex items-start gap-3.5">
             <div className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-border bg-accent-subtle text-accent">
-              <Award className="h-5 w-5" aria-hidden="true" />
+              <PackageCheck className="h-5 w-5" aria-hidden="true" />
             </div>
             <div>
-              <h3 className="text-sm font-semibold text-foreground">24-Month Quality Guarantee</h3>
+              <h3 className="text-sm font-semibold text-foreground">Live Per-SKU Inventory</h3>
               <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-                Crafted from durable textiles, ceramics, and solid hardware.
+                Availability is verified in real time against warehouse stock.
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-start gap-3.5">
+            <div className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-border bg-accent-subtle text-accent">
+              <Clock className="h-5 w-5" aria-hidden="true" />
+            </div>
+            <div>
+              <h3 className="text-sm font-semibold text-foreground">15-Minute Checkout Hold</h3>
+              <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                Order placement reserves inventory during sandbox payment.
               </p>
             </div>
           </div>
@@ -302,21 +362,9 @@ export function HomeView({ initialCategories, initialProducts }: HomeViewProps =
               <RotateCcw className="h-5 w-5" aria-hidden="true" />
             </div>
             <div>
-              <h3 className="text-sm font-semibold text-foreground">14-Day Easy Returns</h3>
+              <h3 className="text-sm font-semibold text-foreground">Self-Service Cancellation</h3>
               <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-                Self-service order cancellation and straightforward return support.
-              </p>
-            </div>
-          </div>
-
-          <div className="flex items-start gap-3.5">
-            <div className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-border bg-accent-subtle text-accent">
-              <ShieldCheck className="h-5 w-5" aria-hidden="true" />
-            </div>
-            <div>
-              <h3 className="text-sm font-semibold text-foreground">Secure Checkout Hold</h3>
-              <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-                15-minute server-locked inventory hold during sandbox checkout.
+                Cancel unpaid pending orders during the checkout hold from your order page.
               </p>
             </div>
           </div>
@@ -341,48 +389,88 @@ export function HomeView({ initialCategories, initialProducts }: HomeViewProps =
                 Browse active collections arranged by studio department.
               </p>
             </div>
-            <Link
-              href="/products"
-              className="inline-flex items-center gap-1.5 text-sm font-medium text-accent underline-offset-4 hover:underline"
-            >
-              View all
-              <ArrowRight className="h-4 w-4" aria-hidden="true" />
-            </Link>
+            <div className="flex shrink-0 items-center gap-2 sm:gap-3">
+              {!categoriesLoading && categories.length > 1 ? (
+                <div className="flex items-center gap-1.5 md:hidden">
+                  <button
+                    type="button"
+                    onClick={() => scrollCategoriesRail(-1)}
+                    disabled={!canScrollCategoriesLeft}
+                    aria-label="Scroll categories left"
+                    aria-controls="home-categories-rail"
+                    className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-border-control bg-card text-foreground shadow-sm transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-40"
+                  >
+                    <ChevronLeft className="h-4 w-4" aria-hidden="true" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => scrollCategoriesRail(1)}
+                    disabled={!canScrollCategoriesRight}
+                    aria-label="Scroll categories right"
+                    aria-controls="home-categories-rail"
+                    className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-border-control bg-card text-foreground shadow-sm transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-40"
+                  >
+                    <ChevronRight className="h-4 w-4" aria-hidden="true" />
+                  </button>
+                </div>
+              ) : null}
+              <Link
+                href="/products"
+                className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap text-sm font-medium text-accent underline-offset-4 hover:underline"
+              >
+                View all
+                <ArrowRight className="h-4 w-4" aria-hidden="true" />
+              </Link>
+            </div>
           </div>
 
           {categoriesLoading ? (
-            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-              {[1, 2, 3, 4].map((idx) => (
-                <Card key={idx} className="overflow-hidden rounded-[12px] p-4">
-                  <Skeleton className="aspect-[4/3] w-full rounded-lg" />
-                  <Skeleton className="mx-auto mt-4 h-5 w-28" />
+            <div className="flex snap-x snap-mandatory gap-3 overflow-x-auto pb-2 scroll-smooth [scrollbar-width:none] [&::-webkit-scrollbar]:hidden md:grid md:grid-cols-3 md:gap-5 md:overflow-visible md:pb-0">
+              {[1, 2, 3].map((idx) => (
+                <Card
+                  key={idx}
+                  className="w-[74%] shrink-0 snap-start overflow-hidden rounded-[12px] p-2.5 sm:w-[46%] sm:p-3 md:w-auto"
+                >
+                  <Skeleton className="aspect-[4/3] w-full rounded-lg sm:aspect-[16/10]" />
+                  <Skeleton className="mx-auto mt-3.5 h-5 w-28" />
                   <Skeleton className="mx-auto mt-2 h-3.5 w-36" />
                 </Card>
               ))}
             </div>
           ) : (
-            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            <div
+              id="home-categories-rail"
+              ref={categoriesRailRef}
+              role="region"
+              aria-label="Popular categories"
+              className="flex snap-x snap-mandatory gap-3 overflow-x-auto pb-2 scroll-smooth [scrollbar-width:none] [&::-webkit-scrollbar]:hidden md:grid md:grid-cols-3 md:gap-5 md:overflow-visible md:pb-0"
+            >
               {categories.map((category) => {
                 const previewUrl = resolveCategoryPreviewUrl(category, allProductsCache);
                 return (
                   <Link
                     key={category.id}
                     href={`/products?category_slug=${encodeURIComponent(category.slug)}`}
-                    className="group block rounded-[12px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    className="group block w-[74%] shrink-0 snap-start rounded-[12px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:w-[46%] md:w-auto"
                   >
-                    <Card className="flex h-full flex-col overflow-hidden rounded-[12px] border border-border bg-card p-3 transition-all duration-200 group-hover:-translate-y-0.5 group-hover:border-accent/60 group-hover:shadow-sm">
-                      <div className="relative aspect-[4/3] w-full overflow-hidden rounded-lg bg-muted bg-[radial-gradient(circle_at_50%_35%,rgba(216,195,161,0.12),transparent_70%)]">
+                    <Card className="flex h-full flex-col overflow-hidden rounded-[12px] border border-border bg-card p-2.5 transition-all duration-200 group-hover:-translate-y-0.5 group-hover:border-accent/60 group-hover:shadow-sm sm:p-3">
+                      <div className="relative aspect-[4/3] w-full overflow-hidden rounded-lg bg-[#0E1115] sm:aspect-[16/10]">
                         <ProductImage
                           src={previewUrl}
                           alt={category.name}
                           fallbackLabel={category.name}
-                          sizes="(max-width: 640px) 100vw, (max-width: 1024px) 50vw, 25vw"
+                          sizes="(max-width: 640px) 74vw, (max-width: 768px) 46vw, 33vw"
+                          loading="eager"
                           className="bg-transparent"
                           imgClassName="transition-transform duration-300 group-hover:scale-[1.04]"
                         />
+                        <div
+                          aria-hidden="true"
+                          className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_35%,rgba(216,195,161,0.12),transparent_70%)] ring-1 ring-inset ring-black/10 dark:ring-white/5"
+                        />
                       </div>
-                      <div className="flex flex-1 flex-col items-center justify-center px-2 py-4 text-center">
-                        <h3 className="text-base font-semibold text-foreground transition-colors group-hover:text-accent">
+                      <div className="flex flex-1 flex-col items-center justify-center px-1.5 py-2.5 text-center sm:px-2 sm:py-3.5">
+                        <h3 className="text-sm font-semibold text-foreground transition-colors group-hover:text-accent sm:text-base">
                           {category.name}
                         </h3>
                         <p className="mt-1 line-clamp-1 text-xs text-muted-foreground">
@@ -474,7 +562,7 @@ export function HomeView({ initialCategories, initialProducts }: HomeViewProps =
           <div
             role="status"
             aria-label="Loading featured collection"
-            className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-4"
+            className="grid grid-cols-2 gap-3 sm:gap-5 lg:grid-cols-4"
           >
             {Array.from({ length: 8 }, (_, idx) => (
               <ProductCardSkeleton key={idx} />
@@ -515,7 +603,7 @@ export function HomeView({ initialCategories, initialProducts }: HomeViewProps =
             }
           />
         ) : (
-          <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-4">
+          <div className="grid grid-cols-2 gap-3 sm:gap-5 lg:grid-cols-4">
             {products.map((product) => (
               <ProductCard key={product.id} product={product} />
             ))}

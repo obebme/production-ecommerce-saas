@@ -12,7 +12,7 @@ export default function StorefrontLayout({
 }>) {
   return (
     <CartProvider>
-      <div className="storefront-theme flex min-h-screen flex-col bg-background text-foreground pb-16 lg:pb-0">
+      <div className="storefront-theme flex min-h-screen flex-col bg-background text-foreground">
         <SkipLink />
         <StorefrontHeader />
         <main id="main-content" className="flex-1">

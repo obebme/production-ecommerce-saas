@@ -13,6 +13,7 @@ export interface ProductImageProps {
   imgClassName?: string;
   sizes?: string;
   priority?: boolean;
+  loading?: "eager" | "lazy";
 }
 
 export function ProductImage({
@@ -23,6 +24,7 @@ export function ProductImage({
   imgClassName,
   sizes = "(max-width: 768px) 50vw, 25vw",
   priority = false,
+  loading = "eager",
 }: ProductImageProps) {
   const safeUrl = sanitizeMediaUrl(src);
   const [failedUrl, setFailedUrl] = React.useState<string | null>(null);
@@ -51,6 +53,7 @@ export function ProductImage({
         fill
         sizes={sizes}
         priority={priority}
+        {...(!priority ? { loading } : {})}
         unoptimized
         onError={() => setFailedUrl(safeUrl)}
         className={cn("object-cover object-center", imgClassName)}
