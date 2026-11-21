@@ -22,7 +22,9 @@ import type {
   ProductDetailDTO,
   ProductSummaryDTO,
 } from "@/lib/api/types";
+import { ProductImage } from "@/components/shared/product-image";
 import { ThemeProvider } from "@/components/shared/theme-provider";
+import { CatalogView } from "@/components/storefront/catalog-view";
 import { HomeView } from "@/components/storefront/home-view";
 import { ToastProvider } from "@/components/ui/toast";
 import { AuthProvider } from "@/providers/auth-provider";
@@ -895,6 +897,67 @@ describe("REM-P2-M09: Storefront SSR, Metadata, 404 & Asset Integrity", () => {
         expect(bytes.length).toBeGreaterThan(100);
         expect(Array.from(bytes.subarray(0, 8))).toEqual(pngSignature);
       }
+    });
+  });
+
+  describe("FE-4C-UI: Honest trust strip, 2-col mobile grid & eager ProductImage", () => {
+    it("renders honest commerce trust strip items in HomeView and omits fabricated claims", () => {
+      render(
+        <HomeView
+          initialCategories={makeCategories().slice(0, 4)}
+          initialProducts={[makeProductSummary()]}
+        />
+      );
+
+      expect(
+        screen.getByRole("heading", { level: 3, name: "Live Per-SKU Inventory" })
+      ).toBeInTheDocument();
+      expect(
+        screen.getByRole("heading", { level: 3, name: "15-Minute Checkout Hold" })
+      ).toBeInTheDocument();
+      expect(
+        screen.getByRole("heading", { level: 3, name: "Self-Service Cancellation" })
+      ).toBeInTheDocument();
+
+      expect(screen.queryByText(/24-Month Quality Guarantee/i)).not.toBeInTheDocument();
+      expect(screen.queryByText(/14-Day Easy Returns/i)).not.toBeInTheDocument();
+    });
+
+    it("renders CatalogView product grid with grid-cols-2 responsive class and ProductImage with eager loading when priority is false", () => {
+      const initialResults: PaginatedResponse<ProductSummaryDTO> = {
+        items: [makeProductSummary()],
+        total: 1,
+        page: 1,
+        page_size: 20,
+        has_next: false,
+      };
+
+      const { container, unmount } = render(
+        <CatalogView
+          initialCategories={makeCategories().slice(0, 3)}
+          initialResults={initialResults}
+          initialQueryKey="sort=newest&page=1&page_size=20"
+        />
+      );
+
+      const cardLink = screen.getByRole("link", { name: /Atelier Linen Overshirt/i });
+      const gridContainer = cardLink.closest("div.grid");
+      expect(gridContainer).not.toBeNull();
+      expect(gridContainer).toHaveClass("grid-cols-2");
+
+      const catalogImg = container.querySelector("img");
+      expect(catalogImg).not.toBeNull();
+      expect(catalogImg).toHaveAttribute("loading", "eager");
+      unmount();
+
+      render(
+        <ProductImage
+          src="/assets/products/linen-overshirt.png"
+          alt="Direct ProductImage eager default"
+        />
+      );
+      const directImg = screen.getByRole("img", { name: "Direct ProductImage eager default" });
+      expect(directImg).toHaveAttribute("loading", "eager");
     });
   });
 });

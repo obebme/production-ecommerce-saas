@@ -4,8 +4,8 @@ import * as React from "react";
 import Link from "next/link";
 import {
   AlertCircle,
-  Award,
   ChevronRight,
+  Clock,
   Minus,
   Plus,
   RotateCcw,
@@ -427,7 +427,7 @@ export function ProductDetailView({
         <Skeleton className="mb-6 h-4 w-56" />
         <div className="grid gap-10 lg:grid-cols-12">
           <div className="lg:col-span-7">
-            <Skeleton className="aspect-[4/5] w-full" />
+            <Skeleton className="aspect-square w-full sm:aspect-[4/5] lg:max-h-[620px]" />
           </div>
           <div className="space-y-4 lg:col-span-5">
             <Skeleton className="h-8 w-3/4" />
@@ -500,9 +500,9 @@ export function ProductDetailView({
       </nav>
 
       {/* Main 2-Col PDP */}
-      <div className="grid gap-10 lg:grid-cols-12 lg:gap-12">
+      <div className="grid gap-8 lg:grid-cols-12 lg:gap-12">
         {/* Gallery (55% -> 7/12) */}
-        <div className="flex flex-col-reverse gap-4 lg:col-span-7 lg:flex-row">
+        <div className="flex flex-col-reverse gap-4 lg:col-span-7 lg:flex-row lg:items-start">
           {sortedImages.length > 1 ? (
             <ul
               aria-label="Product gallery thumbnails"
@@ -522,7 +522,7 @@ export function ProductDetailView({
                       onClick={() => setSelectedImageIndex(idx)}
                       onKeyDown={(e) => handleThumbnailKeyDown(e, idx)}
                       className={cn(
-                        "relative aspect-[4/5] w-16 overflow-hidden rounded-xl border bg-card transition-all lg:w-20",
+                        "relative aspect-[4/5] w-16 overflow-hidden rounded-xl border bg-[#0E1115] transition-all lg:w-20",
                         isSelected
                           ? "border-accent ring-2 ring-accent ring-offset-2 ring-offset-background"
                           : "border-border opacity-75 hover:opacity-100"
@@ -542,7 +542,7 @@ export function ProductDetailView({
             </ul>
           ) : null}
 
-          <div className="relative aspect-[4/5] flex-1 overflow-hidden rounded-[20px] border border-border bg-card bg-[radial-gradient(circle_at_50%_30%,rgba(216,195,161,0.12),transparent_70%)]">
+          <div className="relative aspect-square w-full flex-1 overflow-hidden rounded-[20px] border border-border bg-[#0E1115] bg-[radial-gradient(circle_at_50%_30%,rgba(216,195,161,0.12),transparent_70%)] sm:aspect-[4/5] lg:max-h-[620px]">
             <ProductImage
               src={activeImage?.url}
               alt={activeImage?.alt_text || product.title}
@@ -555,7 +555,7 @@ export function ProductDetailView({
         </div>
 
         {/* Buy Box (45% -> 5/12) */}
-        <div className="space-y-6 lg:col-span-5">
+        <div className="space-y-6 lg:sticky lg:top-24 lg:col-span-5 lg:self-start">
           <div className="space-y-3 border-b border-border pb-6">
             <div className="flex flex-wrap items-center gap-2">
               <Badge variant="outline" className="rounded-full px-3 py-0.5 text-[11px] uppercase tracking-wider">
@@ -884,12 +884,12 @@ export function ProductDetailView({
               <span className="font-medium text-foreground">Free Shipping Over $100</span>
             </div>
             <div className="flex items-center gap-3 px-4 py-3 text-sm">
-              <Award className="h-4 w-4 shrink-0 text-accent" aria-hidden="true" />
-              <span className="font-medium text-foreground">24-Month Quality Guarantee</span>
+              <Clock className="h-4 w-4 shrink-0 text-accent" aria-hidden="true" />
+              <span className="font-medium text-foreground">15-Minute Checkout Stock Hold</span>
             </div>
             <div className="flex items-center gap-3 px-4 py-3 text-sm">
               <RotateCcw className="h-4 w-4 shrink-0 text-accent" aria-hidden="true" />
-              <span className="font-medium text-foreground">14-Day Easy Returns</span>
+              <span className="font-medium text-foreground">Self-Service Unpaid Order Cancellation</span>
             </div>
           </div>
 

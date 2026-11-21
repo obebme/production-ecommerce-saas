@@ -28,8 +28,8 @@ export function StorefrontFooter() {
 
   return (
     <footer className="border-t border-border bg-surface text-foreground dark:bg-[#14171B]">
-      <div className="mx-auto grid max-w-[1440px] gap-10 px-4 py-12 sm:px-6 md:grid-cols-4 lg:px-8">
-        <div className="space-y-3">
+      <div className="mx-auto grid max-w-[1440px] grid-cols-1 gap-6 px-4 py-8 sm:px-6 md:grid-cols-4 lg:gap-8 lg:px-8 lg:py-10">
+        <div className="space-y-2.5">
           <Link
             href="/"
             className="inline-flex rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
@@ -42,69 +42,71 @@ export function StorefrontFooter() {
           </p>
         </div>
 
-        <div className="space-y-3">
-          <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-            Shop
-          </h2>
-          <ul className="space-y-2 text-sm">
-            <li>
-              <Link href="/products" className="text-foreground transition-colors hover:text-accent">
-                All Products
-              </Link>
-            </li>
-            {categories.map((category) => (
-              <li key={category.id}>
-                <Link
-                  href={`/products?category_slug=${encodeURIComponent(category.slug)}`}
-                  className="text-muted-foreground transition-colors hover:text-accent"
-                >
-                  {category.name}
+        <div className="grid grid-cols-2 gap-6 md:col-span-2 lg:gap-8">
+          <div className="space-y-2.5">
+            <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+              Shop
+            </h2>
+            <ul className="space-y-1.5 text-sm">
+              <li>
+                <Link href="/products" className="text-foreground transition-colors hover:text-accent">
+                  All Products
                 </Link>
               </li>
-            ))}
-          </ul>
+              {categories.map((category) => (
+                <li key={category.id}>
+                  <Link
+                    href={`/products?category_slug=${encodeURIComponent(category.slug)}`}
+                    className="text-muted-foreground transition-colors hover:text-accent"
+                  >
+                    {category.name}
+                  </Link>
+                </li>
+              ))}
+            </ul>
+          </div>
+
+          <div className="space-y-2.5">
+            <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+              Customer
+            </h2>
+            <ul className="space-y-1.5 text-sm">
+              <li>
+                <Link href="/account" className="text-foreground transition-colors hover:text-accent">
+                  My Account
+                </Link>
+              </li>
+              <li>
+                <Link href="/orders" className="text-foreground transition-colors hover:text-accent">
+                  My Orders
+                </Link>
+              </li>
+              <li>
+                <Link href="/cart" className="text-muted-foreground transition-colors hover:text-accent">
+                  Shopping Bag
+                </Link>
+              </li>
+              <li>
+                <Link href="/login" className="text-muted-foreground transition-colors hover:text-accent">
+                  Sign In
+                </Link>
+              </li>
+              <li>
+                <Link
+                  href="/register"
+                  className="text-muted-foreground transition-colors hover:text-accent"
+                >
+                  Create Account
+                </Link>
+              </li>
+              <li className="pt-0.5 text-xs text-muted-foreground">
+                Complimentary standard shipping on orders over $100.00.
+              </li>
+            </ul>
+          </div>
         </div>
 
-        <div className="space-y-3">
-          <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-            Customer
-          </h2>
-          <ul className="space-y-2 text-sm">
-            <li>
-              <Link href="/account" className="text-foreground transition-colors hover:text-accent">
-                My Account
-              </Link>
-            </li>
-            <li>
-              <Link href="/orders" className="text-foreground transition-colors hover:text-accent">
-                My Orders
-              </Link>
-            </li>
-            <li>
-              <Link href="/cart" className="text-muted-foreground transition-colors hover:text-accent">
-                Shopping Bag
-              </Link>
-            </li>
-            <li>
-              <Link href="/login" className="text-muted-foreground transition-colors hover:text-accent">
-                Sign In
-              </Link>
-            </li>
-            <li>
-              <Link
-                href="/register"
-                className="text-muted-foreground transition-colors hover:text-accent"
-              >
-                Create Account
-              </Link>
-            </li>
-            <li className="text-xs text-muted-foreground">
-              Complimentary standard shipping on orders over $100.00.
-            </li>
-          </ul>
-        </div>
-
-        <div className="space-y-3">
+        <div className="space-y-2.5">
           <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
             Environment Notice
           </h2>
@@ -129,7 +131,7 @@ export function StorefrontFooter() {
           )}
         </div>
       </div>
-      <div className="border-t border-border px-4 py-4 text-center text-xs text-muted-foreground sm:px-6 lg:px-8">
+      <div className="border-t border-border px-4 py-3.5 text-center text-xs text-muted-foreground sm:px-6 lg:px-8">
         © {new Date().getFullYear()} Vellora Store. All prices in USD.
       </div>
     </footer>

@@ -2,7 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import * as React from "react";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import StorefrontNotFoundPage from "@/app/(storefront)/not-found";
 import NotFoundPage from "@/app/not-found";
@@ -1169,5 +1169,131 @@ describe("FE-REDESIGN-001: ThemeProvider, ThemeToggle (pill) & MobileBottomNav",
     await waitFor(() => {
       expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith("/cart"))).toBe(true);
     });
+  });
+
+  it("renders MobileBottomNav on /, /products, /account, /orders and returns empty on /checkout, /cart, /login, /register", async () => {
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/auth/me")) {
+        return errorResponse(401, "AUTH_REQUIRED", "Authentication required.");
+      }
+      if (url.endsWith("/cart")) {
+        return jsonResponse(makeEmptyCart());
+      }
+      return errorResponse(404, "NOT_FOUND", `Unexpected ${url}`);
+    });
+
+    for (const visiblePath of ["/", "/products", "/account", "/orders"] as const) {
+      mockPathname = visiblePath;
+      const { unmount } = renderWithAppProviders(
+        <div data-testid="mobile-nav-slot">
+          <MobileBottomNav />
+        </div>
+      );
+      expect(
+        screen.getByRole("navigation", { name: "Mobile bottom navigation" }),
+        `Expected MobileBottomNav to render on ${visiblePath}`
+      ).toBeInTheDocument();
+      await waitFor(() => {
+        expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith("/cart"))).toBe(true);
+      });
+      unmount();
+      fetchMock.mockClear();
+    }
+
+    for (const hiddenPath of ["/checkout", "/cart", "/login", "/register"] as const) {
+      mockPathname = hiddenPath;
+      const { unmount } = renderWithAppProviders(
+        <div data-testid="mobile-nav-slot">
+          <MobileBottomNav />
+        </div>
+      );
+      expect(
+        screen.queryByRole("navigation", { name: "Mobile bottom navigation" }),
+        `Expected MobileBottomNav to be hidden on ${hiddenPath}`
+      ).not.toBeInTheDocument();
+      expect(screen.getByTestId("mobile-nav-slot")).toBeEmptyDOMElement();
+      await waitFor(() => {
+        expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith("/cart"))).toBe(true);
+      });
+      unmount();
+      fetchMock.mockClear();
+    }
+  });
+
+  it("hides MobileBottomNav when window.visualViewport shrinks below 78% of window.innerHeight and restores when closed", async () => {
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/auth/me")) {
+        return errorResponse(401, "AUTH_REQUIRED", "Authentication required.");
+      }
+      if (url.endsWith("/cart")) {
+        return jsonResponse(makeEmptyCart());
+      }
+      return errorResponse(404, "NOT_FOUND", `Unexpected ${url}`);
+    });
+
+    const originalInnerHeightDesc = Object.getOwnPropertyDescriptor(window, "innerHeight");
+    const originalVisualViewportDesc = Object.getOwnPropertyDescriptor(window, "visualViewport");
+
+    const mockVisualViewport = Object.assign(new EventTarget(), {
+      height: 844,
+      width: 390,
+      scale: 1,
+      offsetLeft: 0,
+      offsetTop: 0,
+      pageLeft: 0,
+      pageTop: 0,
+    });
+
+    Object.defineProperty(window, "innerHeight", {
+      configurable: true,
+      writable: true,
+      value: 844,
+    });
+    Object.defineProperty(window, "visualViewport", {
+      configurable: true,
+      value: mockVisualViewport,
+    });
+
+    try {
+      mockPathname = "/";
+      renderWithAppProviders(<MobileBottomNav />);
+
+      expect(
+        screen.getByRole("navigation", { name: "Mobile bottom navigation" })
+      ).toBeInTheDocument();
+
+      // Virtual keyboard opens: visualViewport.height drops to 500 (< 844 * 0.78 = 658.32)
+      act(() => {
+        mockVisualViewport.height = 500;
+        mockVisualViewport.dispatchEvent(new Event("resize"));
+      });
+      expect(
+        screen.queryByRole("navigation", { name: "Mobile bottom navigation" })
+      ).not.toBeInTheDocument();
+
+      // Virtual keyboard closes: visualViewport.height returns to 844
+      act(() => {
+        mockVisualViewport.height = 844;
+        mockVisualViewport.dispatchEvent(new Event("resize"));
+      });
+      expect(
+        screen.getByRole("navigation", { name: "Mobile bottom navigation" })
+      ).toBeInTheDocument();
+
+      await waitFor(() => {
+        expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith("/cart"))).toBe(true);
+      });
+    } finally {
+      if (originalInnerHeightDesc) {
+        Object.defineProperty(window, "innerHeight", originalInnerHeightDesc);
+      }
+      if (originalVisualViewportDesc) {
+        Object.defineProperty(window, "visualViewport", originalVisualViewportDesc);
+      } else {
+        delete (window as { visualViewport?: unknown }).visualViewport;
+      }
+    }
   });
 });

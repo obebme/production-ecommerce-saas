@@ -590,7 +590,7 @@ export function CatalogView({
             <div
               role="status"
               aria-label="Loading catalog products"
-              className="grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"
+              className="grid grid-cols-2 gap-3 sm:gap-5 lg:grid-cols-3 xl:grid-cols-4"
             >
               {Array.from({ length: 8 }, (_, idx) => (
                 <ProductCardSkeleton key={idx} />
@@ -622,7 +622,7 @@ export function CatalogView({
             />
           ) : (
             <>
-              <div className="grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+              <div className="grid grid-cols-2 gap-3 sm:gap-5 lg:grid-cols-3 xl:grid-cols-4">
                 {items.map((product) => (
                   <ProductCard key={product.id} product={product} headingAs="h2" />
                 ))}

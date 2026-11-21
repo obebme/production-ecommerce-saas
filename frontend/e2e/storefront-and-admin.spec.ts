@@ -463,10 +463,55 @@ const SEEDED_PRODUCT_SLUGS = [
   "wool-throw-blanket",
 ] as const;
 
+async function assertAllMainImagesLoaded(page: Page, contextLabel: string): Promise<number> {
+  const mainImages = page.locator("main img");
+  await expect
+    .poll(async () => await mainImages.count(), {
+      message: `Expected at least 1 rendered <img> inside <main> (${contextLabel})`,
+    })
+    .toBeGreaterThan(0);
+
+  const count = await mainImages.count();
+  await expect
+    .poll(
+      async () =>
+        mainImages.evaluateAll((imgs) =>
+          imgs.every((img) => {
+            const el = img as HTMLImageElement;
+            return el.complete && el.naturalWidth > 0;
+          })
+        ),
+      { message: `Expected all ${count} main <img> elements to load cleanly (${contextLabel})` }
+    )
+    .toBe(true);
+  return count;
+}
+
+async function assertElementUnobstructed(
+  locator: ReturnType<Page["locator"]>,
+  label: string
+): Promise<void> {
+  await locator.scrollIntoViewIfNeeded();
+  await expect(locator, `Expected ${label} to be visible`).toBeVisible();
+  const hitOk = await locator.evaluate((el) => {
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) {
+      return false;
+    }
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    const topEl = document.elementFromPoint(cx, cy);
+    return topEl !== null && (el === topEl || el.contains(topEl) || topEl.contains(el));
+  });
+  expect(hitOk, `Expected ${label} to be unobstructed by fixed overlays`).toBe(true);
+}
+
 test.describe("REM-P2-M09 & FE-REDESIGN-001: Storefront SSR, Metadata, Theme, Assets & Mobile Nav", () => {
   test("5. Raw HTTP SSR HTML, dynamic PDP <title>, theme toggle/persistence, hero & all 8 PNGs, HTTP 404 & mobile nav", async ({
     page,
   }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+
     for (const route of ["/", "/products", "/products/linen-overshirt"] as const) {
       const response = await page.request.get(route);
       expect(response.status(), `Expected HTTP 200 for ${route}`).toBe(200);
@@ -484,7 +529,7 @@ test.describe("REM-P2-M09 & FE-REDESIGN-001: Storefront SSR, Metadata, Theme, As
     const notFoundResponse = await page.request.get("/products/nonexistent-product-slug-404");
     expect(notFoundResponse.status()).toBe(404);
 
-    // Home (/): default dark mode, hero showcase PNG, and Light/Dark pill persistence
+    // Home (/) Desktop 1440x900: default dark mode, hero showcase PNG, all main imgs loaded, and Light/Dark pill persistence
     await page.goto("/");
     await expect(page.locator("html")).toHaveClass(/\bdark\b/);
     await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
@@ -498,6 +543,8 @@ test.describe("REM-P2-M09 & FE-REDESIGN-001: Storefront SSR, Metadata, Theme, As
         { message: "Expected naturalWidth > 0 for /assets/products/hero-showcase.png" }
       )
       .toBe(true);
+    await assertAllMainImagesLoaded(page, "desktop /");
+
     const heroAssetRes = await page.request.get("/assets/products/hero-showcase.png");
     expect(heroAssetRes.status()).toBe(200);
     expect(heroAssetRes.headers()["content-type"]).toContain("image/png");
@@ -528,6 +575,7 @@ test.describe("REM-P2-M09 & FE-REDESIGN-001: Storefront SSR, Metadata, Theme, As
     await expect(page.locator("html")).toHaveClass(/\bdark\b/);
     await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
 
+    // Catalog (/products) Desktop 1440x900: heading hierarchy + all 8 seeded PNGs loaded
     await page.goto("/products");
     await expect(page.getByRole("heading", { level: 1, name: "Collection" })).toBeVisible();
     expect(await page.locator("main h2").count()).toBeGreaterThanOrEqual(8);
@@ -550,24 +598,106 @@ test.describe("REM-P2-M09 & FE-REDESIGN-001: Storefront SSR, Metadata, Theme, As
       expect(assetResponse.status(), `Expected HTTP 200 for ${assetPath}`).toBe(200);
       expect(assetResponse.headers()["content-type"]).toContain("image/png");
     }
+    await assertAllMainImagesLoaded(page, "desktop /products");
 
     const notFoundPageResponse = await page.goto("/products/nonexistent-product-slug-404");
     expect(notFoundPageResponse?.status()).toBe(404);
     await expect(page.locator("main")).toHaveCount(1);
     await expect(page.getByRole("heading", { level: 1, name: "Page not found" })).toBeVisible();
 
-    // Mobile viewport (390x844) on /: visible bottom nav links and zero horizontal overflow
+    // Mobile viewport (390x844): images, MobileBottomNav visibility, scroll clearance & hidden routes
     await page.setViewportSize({ width: 390, height: 844 });
+    const mobileNavSelector = 'nav[aria-label="Mobile bottom navigation"]';
+
+    // 1. Mobile /
     await page.goto("/");
-    const mobileNav = page.getByRole("navigation", { name: "Mobile bottom navigation" });
+    const mobileNav = page.locator(mobileNavSelector);
     await expect(mobileNav).toBeVisible();
     for (const label of ["Home", "Catalog", "Cart", "Account"] as const) {
       await expect(mobileNav.getByRole("link", { name: label })).toBeVisible();
     }
-    const mobileOverflow = await page.evaluate(() => ({
-      scrollWidth: document.documentElement.scrollWidth,
-      innerWidth: window.innerWidth,
-    }));
-    expect(mobileOverflow.scrollWidth).toBeLessThanOrEqual(mobileOverflow.innerWidth);
+    await expect(page.locator('main img[src$="/assets/products/hero-showcase.png"]')).toBeVisible();
+    await assertAllMainImagesLoaded(page, "mobile /");
+
+    await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+    const homeMobileLayout = await page.evaluate((navSel) => {
+      const footer = document.querySelector("footer");
+      const nav = document.querySelector(navSel);
+      return {
+        scrollWidth: document.documentElement.scrollWidth,
+        innerWidth: window.innerWidth,
+        scrollY: window.scrollY,
+        footerBottom: footer?.getBoundingClientRect().bottom ?? 0,
+        navTop: nav?.getBoundingClientRect().top ?? 0,
+      };
+    }, mobileNavSelector);
+    expect(homeMobileLayout.scrollWidth).toBeLessThanOrEqual(homeMobileLayout.innerWidth);
+    expect(homeMobileLayout.scrollY).toBeGreaterThan(0);
+    expect(homeMobileLayout.footerBottom).toBeLessThanOrEqual(homeMobileLayout.navTop + 1);
+
+    // 2. Mobile /products (all 8 PNGs + MobileBottomNav visible + zero horizontal overflow + scroll clearance)
+    await page.goto("/products");
+    await expect(mobileNav).toBeVisible();
+    for (const slug of SEEDED_PRODUCT_SLUGS) {
+      const assetPath = `/assets/products/${slug}.png`;
+      await expect(page.locator(`main img[src$="${assetPath}"]`)).toBeVisible();
+    }
+    await assertAllMainImagesLoaded(page, "mobile /products");
+
+    await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+    const catalogMobileLayout = await page.evaluate((navSel) => {
+      const footer = document.querySelector("footer");
+      const nav = document.querySelector(navSel);
+      return {
+        scrollWidth: document.documentElement.scrollWidth,
+        innerWidth: window.innerWidth,
+        scrollY: window.scrollY,
+        footerBottom: footer?.getBoundingClientRect().bottom ?? 0,
+        navTop: nav?.getBoundingClientRect().top ?? 0,
+      };
+    }, mobileNavSelector);
+    expect(catalogMobileLayout.scrollWidth).toBeLessThanOrEqual(catalogMobileLayout.innerWidth);
+    expect(catalogMobileLayout.scrollY).toBeGreaterThan(0);
+    expect(catalogMobileLayout.footerBottom).toBeLessThanOrEqual(catalogMobileLayout.navTop + 1);
+
+    // Add 1 item to guest cart so /cart and /checkout render full interactive CTAs & form fields
+    await page.goto("/products/merino-crewneck");
+    await page.getByRole("button", { name: "Add to Cart" }).click();
+    await expect(page.getByRole("link", { name: "View Full Cart" })).toBeVisible();
+
+    // 3. Mobile /cart: MobileBottomNav absent + CTA unobstructed
+    await page.goto("/cart");
+    await expect(page.locator(mobileNavSelector)).toHaveCount(0);
+    await assertElementUnobstructed(
+      page.getByRole("link", { name: "Proceed to Checkout" }),
+      "Cart Proceed to Checkout CTA"
+    );
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)
+    ).toBe(true);
+
+    // 4. Mobile /checkout: MobileBottomNav absent + inputs & CTA unobstructed
+    await page.goto("/checkout");
+    await expect(page.locator(mobileNavSelector)).toHaveCount(0);
+    await assertElementUnobstructed(page.locator("#checkout-email"), "Checkout email input");
+    await assertElementUnobstructed(
+      page.getByRole("button", { name: /Place Order/i }),
+      "Checkout Place Order CTA"
+    );
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)
+    ).toBe(true);
+
+    // 5. Mobile /login: MobileBottomNav absent + #login-email & Sign In button unobstructed
+    await page.goto("/login");
+    await expect(page.locator(mobileNavSelector)).toHaveCount(0);
+    await assertElementUnobstructed(page.locator("#login-email"), "Login email input");
+    await assertElementUnobstructed(
+      page.getByRole("button", { name: "Sign In", exact: true }),
+      "Login Sign In button"
+    );
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)
+    ).toBe(true);
   });
 });
