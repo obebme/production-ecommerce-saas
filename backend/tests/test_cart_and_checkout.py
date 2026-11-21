@@ -245,19 +245,38 @@ def test_cart_get_guest_cookie_creation_reuse_and_auth_fail_closed(
     db_session: Session,
     login_as: Callable[..., AuthenticatedSession],
 ) -> None:
-    """GET /cart issues hashed HttpOnly guest cookie, binds one user cart, and fails closed."""
-    # 1. Anonymous GET /cart issues ecom_guest_cart cookie and hashes token in DB
-    guest_resp = client.get("/api/v1/cart")
-    assert guest_resp.status_code == 200, guest_resp.text
-    guest_body = guest_resp.json()
-    assert guest_body["currency"] == "USD"
-    assert guest_body["items"] == []
-    assert guest_body["item_count"] == 0
-    assert guest_body["subtotal_cents"] == 0
-    assert guest_body["estimated_shipping_cents"] == 0
-    assert guest_body["estimated_total_cents"] == 0
+    """H-05: GET /cart is read-only; POST /cart/items sets guest cookie; auth fails closed."""
+    _, _, var, _ = _seed_variant(db_session, sku="CART-INIT", on_hand=10)
 
-    cookies_by_name = _set_cookie_headers_by_name(guest_resp.headers.get_list("set-cookie"))
+    # 1. Anonymous GET /cart is read-only: returns zero-UUID empty CartDTO, 0 DB rows, 0 cookies
+    guest_get = client.get("/api/v1/cart")
+    assert guest_get.status_code == 200, guest_get.text
+    assert guest_get.json() == {
+        "id": str(uuid.UUID(int=0)),
+        "currency": "USD",
+        "items": [],
+        "item_count": 0,
+        "subtotal_cents": 0,
+        "estimated_shipping_cents": 0,
+        "estimated_total_cents": 0,
+    }
+    assert GUEST_CART_COOKIE_NAME not in _set_cookie_headers_by_name(
+        guest_get.headers.get_list("set-cookie")
+    )
+    assert list(db_session.scalars(select(Cart)).all()) == []
+
+    # 2. First POST /cart/items creates persistent guest Cart row and sets ecom_guest_cart cookie
+    guest_add = client.post(
+        "/api/v1/cart/items",
+        json={"variant_id": str(var.id), "quantity": 1},
+        headers={"Origin": DEFAULT_ORIGIN},
+    )
+    assert guest_add.status_code == 200, guest_add.text
+    guest_body = guest_add.json()
+    assert guest_body["id"] != str(uuid.UUID(int=0))
+    assert guest_body["item_count"] == 1
+
+    cookies_by_name = _set_cookie_headers_by_name(guest_add.headers.get_list("set-cookie"))
     guest_cookie_header = cookies_by_name[GUEST_CART_COOKIE_NAME]
     assert "httponly" in guest_cookie_header.lower()
     assert "samesite=lax" in guest_cookie_header.lower()
@@ -274,7 +293,7 @@ def test_cart_get_guest_cookie_creation_reuse_and_auth_fail_closed(
     assert db_guest_cart.user_id is None
     assert db_guest_cart.status == "ACTIVE"
 
-    # 2. Subsequent GET /cart reuses existing guest cart without re-issuing cookie
+    # 3. Subsequent GET /cart reuses existing guest cart without re-issuing cookie
     reuse_resp = client.get("/api/v1/cart")
     assert reuse_resp.status_code == 200
     assert reuse_resp.json()["id"] == guest_body["id"]
@@ -282,22 +301,22 @@ def test_cart_get_guest_cookie_creation_reuse_and_auth_fail_closed(
         reuse_resp.headers.get_list("set-cookie")
     )
 
-    # 3. Expired guest cart transitions to ABANDONED and issues a fresh ACTIVE cart
+    # 4. Expired guest cart transitions to ABANDONED on GET /cart with 0 new rows or cookies
     db_guest_cart.expires_at = datetime.now(UTC) - timedelta(minutes=1)
     db_session.commit()
-    renewed_resp = client.get("/api/v1/cart")
-    assert renewed_resp.status_code == 200
-    assert renewed_resp.json()["id"] != guest_body["id"]
-    assert GUEST_CART_COOKIE_NAME in _set_cookie_headers_by_name(
-        renewed_resp.headers.get_list("set-cookie")
+    expired_resp = client.get("/api/v1/cart")
+    assert expired_resp.status_code == 200
+    assert expired_resp.json()["id"] == str(uuid.UUID(int=0))
+    assert expired_resp.json()["items"] == []
+    assert GUEST_CART_COOKIE_NAME not in _set_cookie_headers_by_name(
+        expired_resp.headers.get_list("set-cookie")
     )
-    renewed_guest_token = client.cookies.get(GUEST_CART_COOKIE_NAME)
-    assert renewed_guest_token is not None
     db_session.expire_all()
     expired_old = db_session.get(Cart, db_guest_cart.id)
     assert expired_old is not None and expired_old.status == "ABANDONED"
+    assert len(list(db_session.scalars(select(Cart)).all())) == 1
 
-    # 4. Stale/invalid ecom_session fails closed (401 + clears auth cookies) even with guest cart
+    # 5. Stale/invalid ecom_session fails closed (401 + clears auth cookies)
     client.cookies.set(SESSION_COOKIE_NAME, "stale-invalid-session-token")
     stale_resp = client.get("/api/v1/cart")
     assert stale_resp.status_code == 401
@@ -306,14 +325,22 @@ def test_cart_get_guest_cookie_creation_reuse_and_auth_fail_closed(
     assert SESSION_COOKIE_NAME in cleared
     assert CSRF_COOKIE_NAME in cleared
 
-    # 5. Authenticated user gets single ACTIVE cart and no guest cookie
+    # 6. Authenticated user gets zero-UUID empty DTO before mutation, then single ACTIVE cart
     auth_session = login_as(client, role="customer")
-    user_cart_resp = client.get("/api/v1/cart")
-    assert user_cart_resp.status_code == 200
-    user_cart_id = user_cart_resp.json()["id"]
+    empty_user_cart_resp = client.get("/api/v1/cart")
+    assert empty_user_cart_resp.status_code == 200
+    assert empty_user_cart_resp.json()["id"] == str(uuid.UUID(int=0))
     assert GUEST_CART_COOKIE_NAME not in _set_cookie_headers_by_name(
-        user_cart_resp.headers.get_list("set-cookie")
+        empty_user_cart_resp.headers.get_list("set-cookie")
     )
+    user_add_resp = client.post(
+        "/api/v1/cart/items",
+        json={"variant_id": str(var.id), "quantity": 1},
+        headers=_csrf_headers(auth_session),
+    )
+    assert user_add_resp.status_code == 200
+    user_cart_id = user_add_resp.json()["id"]
+    assert user_cart_id != str(uuid.UUID(int=0))
     assert client.get("/api/v1/cart").json()["id"] == user_cart_id
     db_user_carts = list(
         db_session.scalars(
@@ -325,6 +352,69 @@ def test_cart_get_guest_cookie_creation_reuse_and_auth_fail_closed(
     )
     assert len(db_user_carts) == 1
     assert db_user_carts[0].guest_token_hash is None
+
+
+def test_h05_anonymous_get_cart_creates_zero_rows_and_cleans_expired_abandonment(
+    client: TestClient,
+    db_session: Session,
+    login_as: Callable[..., AuthenticatedSession],
+) -> None:
+    """H-05: Repeated anonymous GET /cart creates 0 DB rows/cookies; expired carts still abandon."""
+    _, _, var, _ = _seed_variant(db_session, sku="H05-CART", on_hand=5)
+
+    for _ in range(5):
+        resp = client.get("/api/v1/cart")
+        assert resp.status_code == 200
+        assert resp.json()["id"] == str(uuid.UUID(int=0))
+        assert resp.headers.get_list("set-cookie") == []
+
+    assert len(list(db_session.scalars(select(Cart)).all())) == 0
+
+    # Create persistent guest cart via mutation, expire it, and verify cleanup on GET /cart
+    add_resp = client.post(
+        "/api/v1/cart/items",
+        json={"variant_id": str(var.id), "quantity": 1},
+        headers={"Origin": DEFAULT_ORIGIN},
+    )
+    assert add_resp.status_code == 200
+    guest_cart_id = uuid.UUID(add_resp.json()["id"])
+    db_cart = db_session.get(Cart, guest_cart_id)
+    assert db_cart is not None
+    db_cart.expires_at = datetime.now(UTC) - timedelta(seconds=5)
+    db_session.commit()
+
+    cleanup_resp = client.get("/api/v1/cart")
+    assert cleanup_resp.status_code == 200
+    assert cleanup_resp.json()["id"] == str(uuid.UUID(int=0))
+    assert cleanup_resp.headers.get_list("set-cookie") == []
+
+    db_session.expire_all()
+    reloaded = db_session.get(Cart, guest_cart_id)
+    assert reloaded is not None and reloaded.status == "ABANDONED"
+    assert len(list(db_session.scalars(select(Cart)).all())) == 1
+
+    # Also verify authenticated expired cart abandonment without creating a replacement row
+    client.cookies.clear()
+    session = login_as(client, role="customer", email="h05-user@example.com")
+    user_add = client.post(
+        "/api/v1/cart/items",
+        json={"variant_id": str(var.id), "quantity": 1},
+        headers=_csrf_headers(session),
+    )
+    assert user_add.status_code == 200
+    user_cart_id = uuid.UUID(user_add.json()["id"])
+    db_user_cart = db_session.get(Cart, user_cart_id)
+    assert db_user_cart is not None
+    db_user_cart.expires_at = datetime.now(UTC) - timedelta(seconds=5)
+    db_session.commit()
+
+    user_cleanup = client.get("/api/v1/cart")
+    assert user_cleanup.status_code == 200
+    assert user_cleanup.json()["id"] == str(uuid.UUID(int=0))
+    db_session.expire_all()
+    reloaded_user_cart = db_session.get(Cart, user_cart_id)
+    assert reloaded_user_cart is not None and reloaded_user_cart.status == "ABANDONED"
+    assert len(list(db_session.scalars(select(Cart)).all())) == 2
 
 
 def test_cart_get_bounded_sql_query_budget_and_lazy_reclaim(
@@ -446,6 +536,15 @@ def test_cart_mutations_csrf_origin_and_availability_guards(
     assert null_guest_origin.json()["error"]["code"] == "CSRF_INVALID"
 
     # Guest carrying cookie without Origin/Referer is rejected
+    assert (
+        client.post(
+            "/api/v1/cart/items",
+            json={"variant_id": str(active_var.id), "quantity": 1},
+            headers={"Origin": DEFAULT_ORIGIN},
+        ).status_code
+        == 200
+    )
+    assert client.cookies.get(GUEST_CART_COOKIE_NAME) is not None
     missing_origin_with_cookie = client.post(
         "/api/v1/cart/items",
         json={"variant_id": str(active_var.id), "quantity": 1},
@@ -745,9 +844,19 @@ def test_cart_merge_auth_csrf_idempotent_noop_and_stock_clamping(
             == 200
         )
 
-    # Switch to anonymous guest to create an empty guest cart first
+    # Switch to anonymous guest, create an empty persistent guest cart (add + clear)
     client.cookies.clear()
-    assert client.get("/api/v1/cart").status_code == 200
+    assert (
+        client.post(
+            "/api/v1/cart/items",
+            json={"variant_id": str(var_guest_only.id), "quantity": 1},
+            headers={"Origin": DEFAULT_ORIGIN},
+        ).status_code
+        == 200
+    )
+    assert (
+        client.delete("/api/v1/cart", headers={"Origin": DEFAULT_ORIGIN}).status_code == 200
+    )
     empty_guest_token = client.cookies.get(GUEST_CART_COOKIE_NAME)
     assert empty_guest_token is not None
 
@@ -1437,7 +1546,7 @@ def test_checkout_guest_max_3_active_pending_orders_and_tracker_isolation(
         )
         assert retry_4th.status_code == 201
 
-    # Separate app_factory() / TestClient instance gets a fresh app.state.guest_pending_tracker
+    # Separate app_factory() / TestClient instance shares DB-backed guest_client_key_hash cap -> 429
     with TestClient(app_factory()) as separate_client:
         assert (
             separate_client.post(
@@ -1452,7 +1561,8 @@ def test_checkout_guest_max_3_active_pending_orders_and_tracker_isolation(
             json=_checkout_payload(email="separate@example.com"),
             headers={"Origin": DEFAULT_ORIGIN, "Idempotency-Key": uuid.uuid4().hex},
         )
-        assert sep_resp.status_code == 201
+        assert sep_resp.status_code == 429
+        assert sep_resp.json()["error"]["code"] == "RATE_LIMIT_EXCEEDED"
 
 
 @pytest.mark.parametrize("bad_city", ["Bad\x00City", "Line1\nLine2", "   "])
@@ -1582,7 +1692,12 @@ def test_checkout_forged_guest_orders_cookie_pair_does_not_count_toward_cap(
     assert ga_resp.status_code == 201
     ord_ga = str(ga_resp.json()["order"]["order_number"])
 
-    # Clear IP pending-order tracker & Guest A cookies so only forged cookie carries ORD-GA
+    # Re-attribute Guest A's order to a distinct client IP hash & clear cookies so only forged
+    # cookie carries ORD-GA into Guest B's cap evaluation
+    db_ord_ga = db_session.scalar(select(Order).where(Order.order_number == ord_ga))
+    assert db_ord_ga is not None
+    db_ord_ga.guest_client_key_hash = hash_token("guest_ip:198.51.100.42")
+    db_session.commit()
     tracker = app.state.guest_pending_tracker
     assert isinstance(tracker, GuestPendingOrderTracker)
     tracker.reset()

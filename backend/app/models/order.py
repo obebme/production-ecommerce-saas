@@ -24,7 +24,7 @@ from app.models.types import CHAR3, CHAR64, TIMESTAMPTZ, JSONBType, UUIDType
 if TYPE_CHECKING:
     from app.models.identity import User
     from app.models.inventory import InventoryReservation
-    from app.models.payment import PaymentIntent
+    from app.models.payment import PaymentIntent, PaymentRefundRequest
 
 
 class Order(Base):
@@ -52,6 +52,7 @@ class Order(Base):
     guest_access_expires_at: Mapped[datetime | None] = mapped_column(
         TIMESTAMPTZ, nullable=True
     )
+    guest_client_key_hash: Mapped[str | None] = mapped_column(CHAR64, nullable=True)
     status: Mapped[str] = mapped_column(String(24), nullable=False)
     payment_status: Mapped[str] = mapped_column(String(24), nullable=False)
     fulfillment_status: Mapped[str] = mapped_column(String(24), nullable=False)
@@ -96,6 +97,7 @@ class Order(Base):
     )
     reservations: Mapped[list[InventoryReservation]] = relationship(back_populates="order")
     payment_intents: Mapped[list[PaymentIntent]] = relationship(back_populates="order")
+    refund_requests: Mapped[list[PaymentRefundRequest]] = relationship(back_populates="order")
 
     __table_args__ = (
         UniqueConstraint("order_number", name="uq_orders_order_number"),
@@ -109,7 +111,9 @@ class Order(Base):
             name="status_valid",
         ),
         CheckConstraint(
-            "payment_status IN ('REQUIRES_PAYMENT','PAID','FAILED','REFUNDED','CANCELLED')",
+            "payment_status IN ("
+            "'REQUIRES_PAYMENT','PAID','FAILED','REFUND_PENDING','REFUNDED','CANCELLED'"
+            ")",
             name="payment_status_valid",
         ),
         CheckConstraint(
@@ -136,6 +140,18 @@ class Order(Base):
             placed_at.desc(),
             postgresql_where=text("user_id IS NOT NULL"),
             sqlite_where=text("user_id IS NOT NULL"),
+        ),
+        Index(
+            "idx_orders_guest_pending_client",
+            "guest_client_key_hash",
+            postgresql_where=text(
+                "user_id IS NULL AND status = 'PENDING_PAYMENT' "
+                "AND guest_client_key_hash IS NOT NULL"
+            ),
+            sqlite_where=text(
+                "user_id IS NULL AND status = 'PENDING_PAYMENT' "
+                "AND guest_client_key_hash IS NOT NULL"
+            ),
         ),
         Index("idx_orders_status_placed", "status", placed_at.desc()),
         Index("idx_orders_analytics_paid_at", "paid_at", "status", "payment_status"),

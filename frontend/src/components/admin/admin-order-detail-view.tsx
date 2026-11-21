@@ -60,7 +60,27 @@ const INTENT_STATUS_BADGE: Record<
   SUCCEEDED: { label: "Succeeded", variant: "success" },
   FAILED: { label: "Failed", variant: "destructive" },
   CANCELLED: { label: "Cancelled", variant: "secondary" },
+  REFUND_PENDING: { label: "Refund Pending", variant: "warning" },
   REFUNDED: { label: "Refunded", variant: "destructive" },
+};
+
+const EVENT_LABELS: Record<string, string> = {
+  ORDER_PLACED: "Order Placed",
+  PAYMENT_SUCCEEDED: "Payment Succeeded",
+  PAYMENT_FAILED: "Payment Failed",
+  ORDER_CANCELLED: "Order Cancelled",
+  ORDER_PROCESSING_STARTED: "Processing Started",
+  PROCESSING_STARTED: "Processing Started",
+  ORDER_SHIPPED: "Order Shipped",
+  ORDER_COMPLETED: "Order Completed",
+  PAYMENT_REFUNDED: "Payment Refunded",
+  ORDER_REFUNDED: "Order Refunded",
+  DUPLICATE_PAYMENT_REFUNDED: "Duplicate Payment Refunded",
+  DUPLICATE_PAYMENT_REFUND_PENDING: "Duplicate Payment Refund Pending",
+  STALE_INTENT_PAYMENT_REFUND_PENDING: "Stale Payment Refund Pending",
+  PAYMENT_SUCCEEDED_OUT_OF_STOCK: "Payment Refunded (Stock Expired)",
+  PAYMENT_SUCCEEDED_AFTER_CANCEL: "Payment Refunded (Order Cancelled)",
+  PAYMENT_INTENT_REFUNDED: "Payment Intent Refunded",
 };
 
 const RESERVATION_STATUS_BADGE: Record<ReservationStatus, BadgeProps["variant"]> = {
@@ -71,6 +91,9 @@ const RESERVATION_STATUS_BADGE: Record<ReservationStatus, BadgeProps["variant"]>
 };
 
 function formatEventTitle(eventType: string): string {
+  if (EVENT_LABELS[eventType]) {
+    return EVENT_LABELS[eventType];
+  }
   return eventType
     .toLowerCase()
     .replace(/_/g, " ")
@@ -527,6 +550,17 @@ export function AdminOrderDetailView({ orderNumber }: { orderNumber: string }) {
           ) : null}
           {order.status === "COMPLETED" ? (
             <p className="text-xs font-medium text-success">Order fulfilled and delivered.</p>
+          ) : null}
+          {order.payment_status === "REFUND_PENDING" ||
+          order.payment_intents.some((intent) => intent.status === "REFUND_PENDING") ? (
+            <Alert variant="warning" role="status">
+              <AlertTriangle className="h-4 w-4" aria-hidden="true" />
+              <AlertTitle>Refund pending settlement</AlertTitle>
+              <AlertDescription>
+                A refund is pending settlement for this order or one of its payment intents.
+                Fulfillment and additional refund actions remain disabled while pending.
+              </AlertDescription>
+            </Alert>
           ) : null}
           {order.status === "CANCELLED" || order.status === "REFUNDED" ? (
             <div className="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">

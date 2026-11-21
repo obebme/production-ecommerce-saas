@@ -110,9 +110,10 @@ class Settings(BaseSettings):
     guest_order_hmac_secret: str = Field(..., min_length=1, repr=False)
     payment_webhook_secret: str = Field(..., min_length=1, repr=False)
 
-    # Sandbox payments and session lifetime
+    # Sandbox payments, session lifetime, and reservation sweeper
     payment_sandbox_mode: bool = True
     session_ttl_hours: int = Field(default=168, ge=1, le=8760)
+    reservation_sweeper_interval_seconds: int = Field(default=60, ge=0, le=3600)
 
     # Server-authoritative shipping & tax configuration
     free_shipping_threshold_cents: int = Field(default=10000, ge=0)

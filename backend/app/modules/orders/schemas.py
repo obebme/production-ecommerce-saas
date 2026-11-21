@@ -24,6 +24,7 @@ PaymentStatus = Literal[
     "REQUIRES_PAYMENT",
     "PAID",
     "FAILED",
+    "REFUND_PENDING",
     "REFUNDED",
     "CANCELLED",
 ]

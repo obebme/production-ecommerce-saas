@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import logging
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -14,7 +17,7 @@ from sqlalchemy.orm import Session
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.core.config import Settings, get_app_settings, get_settings
-from app.core.database import check_db_connection, get_db, get_engine
+from app.core.database import check_db_connection, get_db, get_engine, get_session_factory
 from app.core.errors import (
     RequestIDMiddleware,
     ServiceUnavailableError,
@@ -32,8 +35,29 @@ from app.modules.catalog.router import router as catalog_router
 from app.modules.identity.dependencies import require_valid_origin
 from app.modules.identity.router import router as identity_router
 from app.modules.inventory.router import router as inventory_router
+from app.modules.inventory.service import reclaim_all_expired_reservations
 from app.modules.orders.router import router as orders_router
 from app.modules.payments.router import router as payments_router
+
+logger = logging.getLogger(__name__)
+
+
+def _sweep_expired_reservations_once(settings: Settings) -> int:
+    factory = get_session_factory(settings)
+    with factory() as db:
+        return reclaim_all_expired_reservations(db, batch_size=100, max_batches=20)
+
+
+async def _run_reservation_sweeper_loop(settings: Settings) -> None:
+    interval = settings.reservation_sweeper_interval_seconds
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await asyncio.to_thread(_sweep_expired_reservations_once, settings)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Periodic expired reservation sweeper tick failed.")
 
 
 class HealthResponse(BaseModel):
@@ -95,7 +119,23 @@ def create_app(
         )
         fastapi_app.state.settings = active_settings
         get_engine(active_settings)
-        yield
+
+        sweeper_task: asyncio.Task[None] | None = None
+        if (
+            active_settings.environment != "test"
+            and active_settings.reservation_sweeper_interval_seconds > 0
+        ):
+            sweeper_task = asyncio.create_task(
+                _run_reservation_sweeper_loop(active_settings),
+                name="expired-reservation-sweeper",
+            )
+        try:
+            yield
+        finally:
+            if sweeper_task is not None:
+                sweeper_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await sweeper_task
 
     is_production = (
         settings.environment == "production"

@@ -8,7 +8,7 @@ import re
 import time
 import uuid
 from datetime import UTC, datetime
-from typing import Any, NoReturn
+from typing import Any, Literal, NoReturn
 
 from pydantic import ValidationError
 from sqlalchemy import select, text
@@ -42,6 +42,7 @@ from app.modules.catalog.schemas import ensure_utc_datetime
 from app.modules.identity.dependencies import AuthContext
 from app.modules.inventory.service import reclaim_expired_reservations_for_variants
 from app.modules.orders.service import (
+    ADVISORY_LOCK_NS_PAYMENT_INTENT,
     SANDBOX_PROVIDER,
     authorize_order_access,
     compute_payment_intent_fingerprint,
@@ -76,11 +77,15 @@ def _normalize_valid_provider_intent_id_or_none(raw_id: str | None) -> str | Non
     return raw_id
 
 
-def _acquire_advisory_xact_lock(db: Session, scoped_key: str) -> None:
+def _acquire_advisory_xact_lock(
+    db: Session,
+    namespace: int,
+    scoped_key: str,
+) -> None:
     if db.get_bind().dialect.name == "postgresql":
         db.execute(
-            text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
-            {"key": scoped_key},
+            text("SELECT pg_advisory_xact_lock(:ns, hashtext(:key))"),
+            {"ns": namespace, "key": scoped_key},
         )
 
 
@@ -142,7 +147,7 @@ def create_payment_intent(
         ) > 0:
             db.commit()
 
-    _acquire_advisory_xact_lock(db, scoped_key)
+    _acquire_advisory_xact_lock(db, ADVISORY_LOCK_NS_PAYMENT_INTENT, scoped_key)
 
     existing_intent = db.scalar(
         select(PaymentIntent)
@@ -205,7 +210,7 @@ def create_payment_intent(
         )
 
     for prior_intent in order_intents:
-        if prior_intent.status in ("REQUIRES_ACTION", "FAILED"):
+        if prior_intent.status in ("REQUIRES_ACTION", "PROCESSING", "FAILED"):
             prior_intent.status = "CANCELLED"
 
     new_intent = PaymentIntent(
@@ -347,26 +352,28 @@ def _verify_and_parse_webhook(
         ) from exc
 
 
-def _insert_webhook_event_dedup(
+def _claim_webhook_event_for_processing(
     db: Session,
     *,
     provider: str,
     payload: WebhookPayload,
     now: datetime,
-) -> uuid.UUID | None:
-    """Insert verified webhook event idempotently via ON CONFLICT DO NOTHING."""
+) -> tuple[Literal["CLAIMED", "IGNORED_DUPLICATE"], uuid.UUID | None]:
+    """Claim a webhook event for processing, allowing safe retries of FAILED events."""
     event_row_id = uuid.uuid4()
+    payload_dict = payload.model_dump(mode="json")
     values: dict[str, Any] = {
         "id": event_row_id,
         "provider": provider,
         "provider_event_id": payload.event_id,
         "event_type": payload.event_type,
         "signature_verified": True,
-        "payload_json": payload.model_dump(mode="json"),
+        "payload_json": payload_dict,
         "status": "PROCESSING",
         "received_at": now,
     }
     dialect_name = db.get_bind().dialect.name
+    inserted_id: uuid.UUID | None = None
     if dialect_name == "postgresql":
         stmt = (
             pg_insert(PaymentWebhookEvent)
@@ -376,8 +383,7 @@ def _insert_webhook_event_dedup(
         )
         inserted_id = db.scalar(stmt)
         db.flush()
-        return inserted_id
-    if dialect_name == "sqlite":
+    elif dialect_name == "sqlite":
         stmt_sqlite = (
             sqlite_insert(PaymentWebhookEvent)
             .values(**values)
@@ -386,19 +392,55 @@ def _insert_webhook_event_dedup(
         )
         inserted_id = db.scalar(stmt_sqlite)
         db.flush()
-        return inserted_id
+    else:
+        existing_id = db.scalar(
+            select(PaymentWebhookEvent.id).where(
+                PaymentWebhookEvent.provider == provider,
+                PaymentWebhookEvent.provider_event_id == payload.event_id,
+            )
+        )
+        if existing_id is None:
+            db.add(PaymentWebhookEvent(**values))
+            db.flush()
+            inserted_id = event_row_id
+
+    if inserted_id is not None:
+        return "CLAIMED", inserted_id
 
     existing = db.scalar(
-        select(PaymentWebhookEvent.id).where(
+        select(PaymentWebhookEvent)
+        .where(
             PaymentWebhookEvent.provider == provider,
             PaymentWebhookEvent.provider_event_id == payload.event_id,
         )
+        .with_for_update()
+        .execution_options(populate_existing=True)
     )
-    if existing is not None:
-        return None
-    db.add(PaymentWebhookEvent(**values))
+    if existing is None:
+        db.rollback()
+        return "IGNORED_DUPLICATE", None
+
+    if existing.status == "PROCESSED":
+        db.rollback()
+        return "IGNORED_DUPLICATE", None
+
+    if existing.status == "PROCESSING":
+        db.rollback()
+        raise ConflictError(
+            code="WEBHOOK_IN_PROGRESS",
+            message="Webhook event is currently being processed.",
+        )
+
+    # status == "FAILED": reclaim for retry in this transaction.
+    existing.status = "PROCESSING"
+    existing.error_message = None
+    existing.processed_at = None
+    existing.received_at = now
+    existing.event_type = payload.event_type
+    existing.signature_verified = True
+    existing.payload_json = payload_dict
     db.flush()
-    return event_row_id
+    return "CLAIMED", existing.id
 
 
 def _record_webhook_failure_and_raise(
@@ -424,6 +466,61 @@ def _record_webhook_failure_and_raise(
     )
 
 
+def _persist_webhook_unexpected_failure(
+    db: Session,
+    *,
+    webhook_event_id: uuid.UUID,
+    provider: str,
+    payload: WebhookPayload,
+    error_message: str,
+    now: datetime,
+) -> None:
+    """Best-effort persistence of FAILED webhook status after rollback of an unexpected error."""
+    truncated = (error_message or "Unexpected webhook processing failure.")[:500]
+    try:
+        event_row = db.scalar(
+            select(PaymentWebhookEvent)
+            .where(PaymentWebhookEvent.id == webhook_event_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if event_row is None:
+            event_row = db.scalar(
+                select(PaymentWebhookEvent)
+                .where(
+                    PaymentWebhookEvent.provider == provider,
+                    PaymentWebhookEvent.provider_event_id == payload.event_id,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        if event_row is not None:
+            if event_row.status in ("PROCESSED", "PROCESSING"):
+                db.rollback()
+                return
+            event_row.status = "FAILED"
+            event_row.error_message = truncated
+            event_row.processed_at = now
+        else:
+            db.add(
+                PaymentWebhookEvent(
+                    id=webhook_event_id,
+                    provider=provider,
+                    provider_event_id=payload.event_id,
+                    event_type=payload.event_type,
+                    signature_verified=True,
+                    payload_json=payload.model_dump(mode="json"),
+                    status="FAILED",
+                    received_at=now,
+                    processed_at=now,
+                    error_message=truncated,
+                )
+            )
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
 def _process_verified_webhook_tx(
     db: Session,
     *,
@@ -433,22 +530,21 @@ def _process_verified_webhook_tx(
 ) -> tuple[WebhookResponse, Order | None]:
     """Execute steps 5 and 6 of webhook processing inside the active DB transaction."""
     now = datetime.now(UTC)
-    webhook_event_id = _insert_webhook_event_dedup(
+    claim_status, webhook_event_id = _claim_webhook_event_for_processing(
         db,
         provider=provider,
         payload=payload,
         now=now,
     )
-    if webhook_event_id is None:
-        db.rollback()
+    if claim_status == "IGNORED_DUPLICATE" or webhook_event_id is None:
         return WebhookResponse(received=True, status="IGNORED_DUPLICATE"), None
 
-    # Step 6: Universal lock hierarchy:
-    # PaymentIntent (id ASC) -> Order -> InventoryReservation -> InventoryStock.
-    sibling_intents: list[PaymentIntent] = []
-    intent = prelocked_intent
-    if intent is None:
-        if payload.event_type == "charge.refunded":
+    try:
+        # Step 6: Universal lock hierarchy:
+        # PaymentIntent (id ASC) -> Order -> InventoryReservation -> InventoryStock.
+        sibling_intents: list[PaymentIntent] = []
+        intent = prelocked_intent
+        if intent is None:
             target_order_id = db.scalar(
                 select(PaymentIntent.order_id).where(
                     PaymentIntent.provider == provider,
@@ -474,143 +570,164 @@ def _process_verified_webhook_tx(
                         intent = candidate_intent
                         break
         else:
-            intent = db.scalar(
-                select(PaymentIntent)
-                .where(
-                    PaymentIntent.provider == provider,
-                    PaymentIntent.provider_intent_id == payload.data.provider_intent_id,
-                )
-                .with_for_update()
-                .execution_options(populate_existing=True)
+            other_siblings = list(
+                db.scalars(
+                    select(PaymentIntent)
+                    .where(
+                        PaymentIntent.order_id == intent.order_id,
+                        PaymentIntent.id != intent.id,
+                    )
+                    .order_by(PaymentIntent.id.asc())
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                ).all()
             )
-    else:
-        sibling_intents = [intent]
-    if intent is None:
-        _record_webhook_failure_and_raise(
-            db,
-            webhook_event_id=webhook_event_id,
-            error_message=(
-                f"Payment intent '{payload.data.provider_intent_id}' "
-                f"not found for provider '{provider}'."
-            ),
-            now=now,
-        )
+            sibling_intents = sorted(
+                [intent, *other_siblings],
+                key=lambda item: item.id,
+            )
 
-    order = db.scalar(
-        select(Order)
-        .where(Order.id == intent.order_id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )
-    if order is None:
-        _record_webhook_failure_and_raise(
-            db,
-            webhook_event_id=webhook_event_id,
-            error_message="Order associated with payment intent was not found.",
-            now=now,
-        )
+        if intent is None:
+            _record_webhook_failure_and_raise(
+                db,
+                webhook_event_id=webhook_event_id,
+                error_message=(
+                    f"Payment intent '{payload.data.provider_intent_id}' "
+                    f"not found for provider '{provider}'."
+                ),
+                now=now,
+            )
 
-    if payload.data.order_number != order.order_number:
-        _record_webhook_failure_and_raise(
-            db,
-            webhook_event_id=webhook_event_id,
-            error_message="Webhook order_number does not match payment intent order.",
-            now=now,
-        )
-    if (
-        payload.data.amount_cents != order.total_cents
-        or payload.data.amount_cents != intent.amount_cents
-    ):
-        _record_webhook_failure_and_raise(
-            db,
-            webhook_event_id=webhook_event_id,
-            error_message="Webhook amount_cents does not match authoritative order total.",
-            now=now,
-        )
-    if payload.data.currency != order.currency or payload.data.currency != intent.currency:
-        _record_webhook_failure_and_raise(
-            db,
-            webhook_event_id=webhook_event_id,
-            error_message="Webhook currency does not match authoritative order currency.",
-            now=now,
-        )
-
-    reservations = list(
-        db.scalars(
-            select(InventoryReservation)
-            .where(InventoryReservation.order_id == order.id)
-            .order_by(InventoryReservation.id.asc())
+        order = db.scalar(
+            select(Order)
+            .where(Order.id == intent.order_id)
             .with_for_update()
             .execution_options(populate_existing=True)
-        ).all()
-    )
-    variant_ids = sorted({res.variant_id for res in reservations})
+        )
+        if order is None:
+            _record_webhook_failure_and_raise(
+                db,
+                webhook_event_id=webhook_event_id,
+                error_message="Order associated with payment intent was not found.",
+                now=now,
+            )
 
-    stocks_by_variant: dict[uuid.UUID, InventoryStock] = {}
-    variants_by_id: dict[uuid.UUID, tuple[ProductVariant, Product, Category]] = {}
-    if variant_ids:
-        stocks_by_variant = {
-            stock.variant_id: stock
-            for stock in db.scalars(
-                select(InventoryStock)
-                .where(InventoryStock.variant_id.in_(variant_ids))
-                .order_by(InventoryStock.variant_id.asc())
+        if payload.data.order_number != order.order_number:
+            _record_webhook_failure_and_raise(
+                db,
+                webhook_event_id=webhook_event_id,
+                error_message="Webhook order_number does not match payment intent order.",
+                now=now,
+            )
+        if (
+            payload.data.amount_cents != order.total_cents
+            or payload.data.amount_cents != intent.amount_cents
+        ):
+            _record_webhook_failure_and_raise(
+                db,
+                webhook_event_id=webhook_event_id,
+                error_message="Webhook amount_cents does not match authoritative order total.",
+                now=now,
+            )
+        if payload.data.currency != order.currency or payload.data.currency != intent.currency:
+            _record_webhook_failure_and_raise(
+                db,
+                webhook_event_id=webhook_event_id,
+                error_message="Webhook currency does not match authoritative order currency.",
+                now=now,
+            )
+
+        reservations = list(
+            db.scalars(
+                select(InventoryReservation)
+                .where(InventoryReservation.order_id == order.id)
+                .order_by(InventoryReservation.id.asc())
                 .with_for_update()
                 .execution_options(populate_existing=True)
             ).all()
-        }
-        variant_rows = db.execute(
-            select(ProductVariant, Product, Category)
-            .join(Product, Product.id == ProductVariant.product_id)
-            .join(Category, Category.id == Product.category_id)
-            .where(ProductVariant.id.in_(variant_ids))
-            .order_by(ProductVariant.id.asc())
-        ).all()
-        variants_by_id = {
-            variant.id: (variant, product, category)
-            for variant, product, category in variant_rows
-        }
-
-    if payload.event_type == "payment_intent.succeeded":
-        mark_order_paid(
-            db,
-            order=order,
-            intent=intent,
-            reservations=reservations,
-            stocks_by_variant=stocks_by_variant,
-            variants_by_id=variants_by_id,
-            event_id=payload.event_id,
-            now=now,
         )
-    elif payload.event_type == "payment_intent.failed":
-        mark_order_payment_failed(
-            db,
-            order=order,
-            intent=intent,
-            event_id=payload.event_id,
-            failure_code=payload.data.failure_code,
-            failure_message=payload.data.failure_message,
-        )
-    elif payload.event_type == "charge.refunded":
-        mark_order_refunded(
-            db,
-            order=order,
-            intent=intent,
-            sibling_intents=sibling_intents,
-            reservations=reservations,
-            stocks_by_variant=stocks_by_variant,
-            event_id=payload.event_id,
-        )
+        variant_ids = sorted({res.variant_id for res in reservations})
 
-    webhook_row = db.scalar(
-        select(PaymentWebhookEvent).where(PaymentWebhookEvent.id == webhook_event_id)
-    )
-    if webhook_row is not None:
-        webhook_row.status = "PROCESSED"
-        webhook_row.processed_at = now
+        stocks_by_variant: dict[uuid.UUID, InventoryStock] = {}
+        variants_by_id: dict[uuid.UUID, tuple[ProductVariant, Product, Category]] = {}
+        if variant_ids:
+            stocks_by_variant = {
+                stock.variant_id: stock
+                for stock in db.scalars(
+                    select(InventoryStock)
+                    .where(InventoryStock.variant_id.in_(variant_ids))
+                    .order_by(InventoryStock.variant_id.asc())
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                ).all()
+            }
+            variant_rows = db.execute(
+                select(ProductVariant, Product, Category)
+                .join(Product, Product.id == ProductVariant.product_id)
+                .join(Category, Category.id == Product.category_id)
+                .where(ProductVariant.id.in_(variant_ids))
+                .order_by(ProductVariant.id.asc())
+            ).all()
+            variants_by_id = {
+                variant.id: (variant, product, category)
+                for variant, product, category in variant_rows
+            }
 
-    db.commit()
-    return WebhookResponse(received=True, status="PROCESSED"), order
+        if payload.event_type == "payment_intent.succeeded":
+            mark_order_paid(
+                db,
+                order=order,
+                intent=intent,
+                sibling_intents=sibling_intents,
+                reservations=reservations,
+                stocks_by_variant=stocks_by_variant,
+                variants_by_id=variants_by_id,
+                event_id=payload.event_id,
+                now=now,
+            )
+        elif payload.event_type == "payment_intent.failed":
+            mark_order_payment_failed(
+                db,
+                order=order,
+                intent=intent,
+                event_id=payload.event_id,
+                failure_code=payload.data.failure_code,
+                failure_message=payload.data.failure_message,
+            )
+        elif payload.event_type == "charge.refunded":
+            mark_order_refunded(
+                db,
+                order=order,
+                intent=intent,
+                sibling_intents=sibling_intents,
+                reservations=reservations,
+                stocks_by_variant=stocks_by_variant,
+                event_id=payload.event_id,
+                now=now,
+            )
+
+        webhook_row = db.scalar(
+            select(PaymentWebhookEvent).where(PaymentWebhookEvent.id == webhook_event_id)
+        )
+        if webhook_row is not None:
+            webhook_row.status = "PROCESSED"
+            webhook_row.processed_at = now
+
+        db.commit()
+        return WebhookResponse(received=True, status="PROCESSED"), order
+    except Exception as exc:
+        if isinstance(exc, ValidationAppError) and exc.code == "WEBHOOK_PAYLOAD_MISMATCH":
+            raise
+        db.rollback()
+        _persist_webhook_unexpected_failure(
+            db,
+            webhook_event_id=webhook_event_id,
+            provider=provider,
+            payload=payload,
+            error_message=str(exc) or exc.__class__.__name__,
+            now=datetime.now(UTC),
+        )
+        raise
 
 
 def process_webhook_bytes(
@@ -733,12 +850,23 @@ def simulate_sandbox_payment(
         skip_guest_rate_limit=applied_guest_rate_limit,
     )
 
-    # Lock PaymentIntent FOR UPDATE first in canonical lock hierarchy.
-    locked_intent = db.scalar(
-        select(PaymentIntent)
-        .where(PaymentIntent.provider_intent_id == valid_intent_id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
+    # Lock all PaymentIntent rows for order_id in id ASC order first in canonical hierarchy.
+    order_intents = list(
+        db.scalars(
+            select(PaymentIntent)
+            .where(PaymentIntent.order_id == order.id)
+            .order_by(PaymentIntent.id.asc())
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).all()
+    )
+    locked_intent = next(
+        (
+            candidate
+            for candidate in order_intents
+            if candidate.provider_intent_id == valid_intent_id
+        ),
+        None,
     )
     if locked_intent is None:
         raise NotFoundError(

@@ -45,13 +45,18 @@ from app.models.catalog import Category, Product, ProductImage
 from app.models.identity import AuditLog, User
 from app.models.inventory import (
     InventoryLedgerEntry,
+    InventoryReservation,
     InventoryStock,
     ProductVariant,
 )
 from app.models.order import Order, OrderEvent, OrderItem
-from app.models.payment import PaymentIntent
+from app.models.payment import PaymentIntent, PaymentRefundRequest
 from app.modules.admin import service as admin_service
-from app.modules.admin.schemas import UpdateUserRoleRequest, UpdateUserStatusRequest
+from app.modules.admin.schemas import (
+    RefundOrderRequest,
+    UpdateUserRoleRequest,
+    UpdateUserStatusRequest,
+)
 from app.modules.orders.service import SANDBOX_PROVIDER
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
@@ -2220,6 +2225,341 @@ def test_cli_create_user_and_seed_demo(
         "customer@atelier.example",
         "staff@atelier.example",
     ]
+
+
+def test_h01_admin_analytics_inventory_health_and_admin_orders_reclaim_expired(
+    client: TestClient,
+    db_session: Session,
+    login_as: Callable[..., AuthenticatedSession],
+) -> None:
+    """H-01: GET /admin/analytics/inventory-health and GET /admin/orders reclaim expired holds."""
+    _, _, var_health, stock_health = _seed_variant(
+        db_session,
+        sku="H01-HLTH",
+        on_hand=1,
+        reserved=0,
+        low_stock_threshold=5,
+    )
+    _, _, var_ord, stock_ord = _seed_variant(
+        db_session,
+        sku="H01-AORD",
+        on_hand=2,
+        reserved=0,
+        low_stock_threshold=5,
+    )
+    customer = login_as(client, role="customer", email="h01-adm-cust@example.com")
+    o1 = _place_checkout_order(client, items=[(var_health.id, 1)], session=customer, pay=False)
+    o2 = _place_checkout_order(client, items=[(var_ord.id, 2)], session=customer, pay=False)
+
+    # Expire both reservations
+    past_exp = datetime.now(UTC) - timedelta(minutes=15)
+    for oid_str in (o1["order"]["id"], o2["order"]["id"]):
+        res = db_session.scalar(
+            select(InventoryReservation).where(
+                InventoryReservation.order_id == uuid.UUID(oid_str)
+            )
+        )
+        assert res is not None
+        res.expires_at = past_exp
+    db_session.commit()
+
+    # 1. GET /admin/analytics/inventory-health reclaims expired holds -> available=1 (low_stock)
+    _use_auth_cookies(client, login_as(client, role="admin", email="h01-adm@example.com"))
+    health_resp = client.get("/api/v1/admin/analytics/inventory-health")
+    assert health_resp.status_code == 200, health_resp.text
+    health_body = health_resp.json()
+    assert health_body["summary"]["out_of_stock_count"] == 0
+    assert health_body["summary"]["low_stock_count"] == 2
+    assert health_body["summary"]["total_reserved_units"] == 0
+    items_by_sku = {row["sku"]: row for row in health_body["alerts"]["items"]}
+    assert items_by_sku["H01-HLTH"]["available_quantity"] == 1
+    assert items_by_sku["H01-AORD"]["available_quantity"] == 2
+
+    # 2. Seed another expired order and verify GET /admin/orders reclaims it to CANCELLED
+    _use_auth_cookies(client, customer)
+    o3 = _place_checkout_order(client, items=[(var_ord.id, 1)], session=customer, pay=False)
+    o3_id = uuid.UUID(o3["order"]["id"])
+    res3 = db_session.scalar(
+        select(InventoryReservation).where(InventoryReservation.order_id == o3_id)
+    )
+    assert res3 is not None
+    res3.expires_at = past_exp
+    db_session.commit()
+
+    _use_auth_cookies(client, login_as(client, role="staff", email="h01-staff@example.com"))
+    orders_resp = client.get("/api/v1/admin/orders", params={"q": o3["order"]["order_number"]})
+    assert orders_resp.status_code == 200, orders_resp.text
+    assert orders_resp.json()["items"][0]["status"] == "CANCELLED"
+
+    db_session.expire_all()
+    db_session.refresh(stock_health)
+    db_session.refresh(stock_ord)
+    assert stock_health.reserved == 0
+    assert stock_ord.reserved == 0
+    reloaded_o3 = db_session.get(Order, o3_id)
+    assert reloaded_o3 is not None and reloaded_o3.cancellation_reason == "RESERVATION_EXPIRED"
+
+
+def test_h02_m01_admin_refund_3phase_gateway_failure_rollback_retry_and_sibling_cancel(
+    client: TestClient,
+    db_session: Session,
+    login_as: Callable[..., AuthenticatedSession],
+) -> None:
+    """H-02/M-01: 3-phase refund reverts to PAID/SUCCEEDED on gateway failure & retries."""
+
+    class _FailingRefundGateway:
+        def refund_intent(
+            self,
+            *,
+            provider: str,
+            provider_intent_id: str,
+            amount_cents: int,
+            currency: str,
+            reason: str | None,
+        ) -> str:
+            raise RuntimeError("Simulated gateway timeout")
+
+    class _SucceedingRefundGateway:
+        def refund_intent(
+            self,
+            *,
+            provider: str,
+            provider_intent_id: str,
+            amount_cents: int,
+            currency: str,
+            reason: str | None,
+        ) -> str:
+            return f"re_retry_{provider_intent_id}"
+
+    _, _, var, stock = _seed_variant(db_session, sku="M01-REF", price_cents=7500, on_hand=10)
+    customer = login_as(client, role="customer", email="m01-buyer@example.com")
+    placed = _place_checkout_order(client, items=[(var.id, 2)], session=customer, pay=True)
+    order_id = uuid.UUID(placed["order"]["id"])
+    order_number = str(placed["order"]["order_number"])
+
+    # Add open sibling intents (REQUIRES_ACTION & PROCESSING) to verify M-01 cancels them
+    sib_req = PaymentIntent(
+        order_id=order_id,
+        provider=SANDBOX_PROVIDER,
+        provider_intent_id=f"pi_sib_req_{uuid.uuid4().hex[:10]}",
+        idempotency_key=uuid.uuid4().hex.ljust(64, "c")[:64],
+        request_fingerprint=uuid.uuid4().hex.ljust(64, "d")[:64],
+        amount_cents=int(placed["order"]["total_cents"]),
+        currency="USD",
+        status="REQUIRES_ACTION",
+    )
+    sib_proc = PaymentIntent(
+        order_id=order_id,
+        provider=SANDBOX_PROVIDER,
+        provider_intent_id=f"pi_sib_proc_{uuid.uuid4().hex[:10]}",
+        idempotency_key=uuid.uuid4().hex.ljust(64, "e")[:64],
+        request_fingerprint=uuid.uuid4().hex.ljust(64, "f")[:64],
+        amount_cents=int(placed["order"]["total_cents"]),
+        currency="USD",
+        status="PROCESSING",
+    )
+    db_session.add_all([sib_req, sib_proc])
+    db_session.commit()
+
+    admin_session = login_as(client, role="admin", email="m01-admin@example.com")
+    admin_uid = uuid.UUID(admin_session.user_id)
+
+    # Phase B fails -> order/intent revert to PAID/SUCCEEDED, req == FAILED, siblings CANCELLED
+    with pytest.raises(RuntimeError, match="Simulated gateway timeout"):
+        admin_service.refund_admin_order(
+            db_session,
+            order_number=order_number,
+            payload=RefundOrderRequest(reason="Customer return", restock=True),
+            actor_user_id=admin_uid,
+            ip_address="203.0.113.20",
+            refund_gateway=_FailingRefundGateway(),
+        )
+
+    db_session.expire_all()
+    reloaded_order = db_session.get(Order, order_id)
+    assert reloaded_order is not None
+    assert reloaded_order.status == "CONFIRMED"
+    assert reloaded_order.payment_status == "PAID"
+
+    winning_intent = db_session.get(PaymentIntent, uuid.UUID(placed["payment_intent"]["id"]))
+    assert winning_intent is not None and winning_intent.status == "SUCCEEDED"
+
+    reloaded_req = db_session.scalar(
+        select(PaymentRefundRequest).where(
+            PaymentRefundRequest.payment_intent_id == winning_intent.id
+        )
+    )
+    assert reloaded_req is not None
+    assert reloaded_req.status == "FAILED"
+    assert (
+        reloaded_req.error_message is not None
+        and "Simulated gateway timeout" in reloaded_req.error_message
+    )
+
+    db_session.refresh(sib_req)
+    db_session.refresh(sib_proc)
+    assert sib_req.status == "CANCELLED"
+    assert sib_proc.status == "CANCELLED"
+
+    # Stock must NOT have been restocked on failed refund
+    db_session.refresh(stock)
+    assert stock.on_hand == 8
+
+    # Retry with succeeding gateway -> REFUNDED + restocked + RefundRequest == SUCCEEDED
+    detail_dto = admin_service.refund_admin_order(
+        db_session,
+        order_number=order_number,
+        payload=RefundOrderRequest(reason="Customer return retry", restock=True),
+        actor_user_id=admin_uid,
+        ip_address="203.0.113.20",
+        refund_gateway=_SucceedingRefundGateway(),
+    )
+    assert detail_dto.status == "REFUNDED"
+    assert detail_dto.payment_status == "REFUNDED"
+
+    db_session.expire_all()
+    db_session.refresh(reloaded_req)
+    db_session.refresh(winning_intent)
+    db_session.refresh(sib_req)
+    db_session.refresh(sib_proc)
+    db_session.refresh(stock)
+    assert reloaded_req.status == "SUCCEEDED"
+    assert reloaded_req.error_message is None
+    assert reloaded_req.provider_refund_id == f"re_retry_{winning_intent.provider_intent_id}"
+    assert winning_intent.status == "REFUNDED"
+    assert sib_req.status == "CANCELLED"
+    assert sib_proc.status == "CANCELLED"
+    assert stock.on_hand == 10
+
+
+def test_sec_rem_p1_02_admin_refund_failure_preserves_duplicate_pending_sibling(
+    client: TestClient,
+    db_session: Session,
+    login_as: Callable[..., AuthenticatedSession],
+) -> None:
+    """SEC-REM-P1-02: Failed admin refund reverts only ADMIN_REFUND, not DUPLICATE_PAYMENT."""
+
+    class _FailingRefundGateway:
+        def refund_intent(
+            self,
+            *,
+            provider: str,
+            provider_intent_id: str,
+            amount_cents: int,
+            currency: str,
+            reason: str | None,
+        ) -> str:
+            raise RuntimeError("Gateway failure mid-refund")
+
+    _, _, var, _ = _seed_variant(db_session, sku="SEC02-ADM", price_cents=5500, on_hand=10)
+    customer = login_as(client, role="customer", email="sec02-adm-buyer@example.com")
+    placed = _place_checkout_order(client, items=[(var.id, 1)], session=customer, pay=True)
+    order_id = uuid.UUID(placed["order"]["id"])
+    order_number = str(placed["order"]["order_number"])
+    winning_intent_id = uuid.UUID(placed["payment_intent"]["id"])
+
+    # Pre-existing DUPLICATE_PAYMENT sibling in REFUND_PENDING + PENDING PaymentRefundRequest
+    dup_intent = PaymentIntent(
+        order_id=order_id,
+        provider=SANDBOX_PROVIDER,
+        provider_intent_id=f"pi_dup_sib_{uuid.uuid4().hex[:10]}",
+        idempotency_key=uuid.uuid4().hex.ljust(64, "g")[:64],
+        request_fingerprint=uuid.uuid4().hex.ljust(64, "h")[:64],
+        amount_cents=int(placed["order"]["total_cents"]),
+        currency="USD",
+        status="REFUND_PENDING",
+    )
+    db_session.add(dup_intent)
+    db_session.flush()
+    dup_req = PaymentRefundRequest(
+        order_id=order_id,
+        payment_intent_id=dup_intent.id,
+        provider=SANDBOX_PROVIDER,
+        provider_intent_id=dup_intent.provider_intent_id,
+        amount_cents=dup_intent.amount_cents,
+        currency="USD",
+        reason="Duplicate payment captured after order was already paid",
+        trigger_source="DUPLICATE_PAYMENT",
+        status="PENDING",
+    )
+    db_session.add(dup_req)
+    db_session.commit()
+
+    admin_session = login_as(client, role="admin", email="sec02-admin@example.com")
+    with pytest.raises(RuntimeError, match="Gateway failure mid-refund"):
+        admin_service.refund_admin_order(
+            db_session,
+            order_number=order_number,
+            payload=RefundOrderRequest(reason="Admin refund attempt", restock=False),
+            actor_user_id=uuid.UUID(admin_session.user_id),
+            ip_address="203.0.113.21",
+            refund_gateway=_FailingRefundGateway(),
+        )
+
+    db_session.expire_all()
+    reloaded_order = db_session.get(Order, order_id)
+    reloaded_win = db_session.get(PaymentIntent, winning_intent_id)
+    reloaded_dup = db_session.get(PaymentIntent, dup_intent.id)
+    reloaded_dup_req = db_session.get(PaymentRefundRequest, dup_req.id)
+    admin_req = db_session.scalar(
+        select(PaymentRefundRequest).where(
+            PaymentRefundRequest.payment_intent_id == winning_intent_id
+        )
+    )
+
+    assert reloaded_order is not None and reloaded_order.payment_status == "PAID"
+    assert reloaded_win is not None and reloaded_win.status == "SUCCEEDED"
+    assert admin_req is not None and admin_req.status == "FAILED"
+    assert reloaded_dup is not None and reloaded_dup.status == "REFUND_PENDING"
+    assert reloaded_dup_req is not None
+    assert reloaded_dup_req.status == "PENDING"
+    assert reloaded_dup_req.trigger_source == "DUPLICATE_PAYMENT"
+
+
+def test_sec_rem_p1_03_admin_refund_rejects_concurrent_pending_within_60s(
+    client: TestClient,
+    db_session: Session,
+    login_as: Callable[..., AuthenticatedSession],
+) -> None:
+    """SEC-REM-P1-03: Fresh <60s ADMIN_REFUND PENDING rejects with 409 REFUND_IN_PROGRESS."""
+    _, _, var, _ = _seed_variant(db_session, sku="SEC03-CONC", price_cents=6500, on_hand=10)
+    customer = login_as(client, role="customer", email="sec03-buyer@example.com")
+    placed = _place_checkout_order(client, items=[(var.id, 1)], session=customer, pay=True)
+    order_id = uuid.UUID(placed["order"]["id"])
+    order_number = str(placed["order"]["order_number"])
+    intent_id = uuid.UUID(placed["payment_intent"]["id"])
+
+    db_order = db_session.get(Order, order_id)
+    db_intent = db_session.get(PaymentIntent, intent_id)
+    assert db_order is not None and db_intent is not None
+    db_order.payment_status = "REFUND_PENDING"
+    db_intent.status = "REFUND_PENDING"
+    now = datetime.now(UTC)
+    db_session.add(
+        PaymentRefundRequest(
+            order_id=order_id,
+            payment_intent_id=intent_id,
+            provider=db_intent.provider,
+            provider_intent_id=db_intent.provider_intent_id,
+            amount_cents=db_intent.amount_cents,
+            currency=db_intent.currency,
+            reason="In-flight refund",
+            trigger_source="ADMIN_REFUND",
+            status="PENDING",
+            updated_at=now - timedelta(seconds=10),
+        )
+    )
+    db_session.commit()
+
+    admin_session = login_as(client, role="admin", email="sec03-admin@example.com")
+    _use_auth_cookies(client, admin_session)
+    resp = client.post(
+        f"/api/v1/admin/orders/{order_number}/refund",
+        json={"reason": "Duplicate concurrent click", "restock": False},
+        headers=_csrf_headers(admin_session),
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["code"] == "REFUND_IN_PROGRESS"
 
 
 @pytest.mark.skipif(

@@ -33,7 +33,9 @@ import { AdminOrderDetailView } from "@/components/admin/admin-order-detail-view
 import { AdminOrdersView } from "@/components/admin/admin-orders-view";
 import { AdminProductEditorView } from "@/components/admin/admin-product-editor-view";
 import { AdminProductsView } from "@/components/admin/admin-products-view";
+import { AdminShell } from "@/components/admin/admin-shell";
 import { AdminUsersView } from "@/components/admin/admin-users-view";
+import { ThemeProvider } from "@/components/shared/theme-provider";
 import { ToastProvider } from "@/components/ui/toast";
 import { AuthProvider } from "@/providers/auth-provider";
 import { CartProvider } from "@/providers/cart-provider";
@@ -1449,8 +1451,9 @@ describe("AdminInventoryView (SKU Prefill, Stock Invariants, CSRF & Append-Only 
       note: "Restock PO-1042",
     });
 
-    // Open Append-Only Stock Ledger drawer
-    fireEvent.click(screen.getByRole("button", { name: "View Ledger" }));
+    // Open Append-Only Stock Ledger drawer (wait for post-adjust inventory reload to finish)
+    const viewLedgerButton = await screen.findByRole("button", { name: "View Ledger" });
+    fireEvent.click(viewLedgerButton);
     const ledgerDialog = await screen.findByRole("dialog");
     expect(within(ledgerDialog).getByText("Stock Ledger — TEE-CHR-M")).toBeInTheDocument();
     expect(within(ledgerDialog).getByText("Append-Only Stock Ledger")).toBeInTheDocument();
@@ -2025,5 +2028,167 @@ describe("AdminUsersView & AdminAuditLogsView (Admin-Only Guard, Session Revocat
     expect(within(diffSheet2).getByText('"CONFIRMED"')).toBeInTheDocument();
     expect(within(diffSheet2).getAllByText('"REFUNDED"')).toHaveLength(2);
     expect(within(diffSheet2).getAllByText('"[REDACTED]"')).toHaveLength(2);
+  });
+});
+
+describe("Phase 1 Remediation (REM-P1-FE: AdminShell without CartProvider & REFUND_PENDING UI)", () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    mockPathname = "/admin/orders";
+    mockSearchParams = new URLSearchParams();
+    setMemoryCsrfToken(null);
+    registerAuthInvalidationListener(null);
+    clearCsrfCookie();
+    fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    installDomPolyfills();
+  });
+
+  afterEach(() => {
+    cleanup();
+    setMemoryCsrfToken(null);
+    registerAuthInvalidationListener(null);
+    clearCsrfCookie();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it("renders AdminShell + AdminOrdersView without CartProvider and issues ZERO /cart fetch calls", async () => {
+    const pendingRefundOrder: AdminOrderListItemDTO = {
+      id: "ord-ref-pend",
+      order_number: "ORD-20261121-REFPND",
+      user_id: "cust-1",
+      customer_email: "buyer@example.com",
+      status: "CANCELLED",
+      payment_status: "REFUND_PENDING",
+      fulfillment_status: "CANCELLED",
+      currency: "USD",
+      subtotal_cents: 9000,
+      discount_cents: 0,
+      shipping_cents: 1000,
+      tax_cents: 720,
+      total_cents: 10720,
+      item_count: 1,
+      placed_at: "2026-11-21T10:00:00Z",
+      paid_at: null,
+      shipped_at: null,
+      completed_at: null,
+      cancelled_at: "2026-11-21T10:05:00Z",
+    };
+
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/auth/me")) {
+        return jsonResponse({ user: makeUser("admin"), csrf_token: "csrf-admin-nocart" });
+      }
+      if (url.includes("/admin/orders")) {
+        return jsonResponse({
+          items: [pendingRefundOrder],
+          total: 1,
+          page: 1,
+          page_size: 20,
+          has_next: false,
+        });
+      }
+      return errorResponse(404, "NOT_FOUND", `Unexpected ${url}`);
+    });
+
+    // Deliberately omit CartProvider to match RootLayout + AdminLayout tree
+    render(
+      <ThemeProvider>
+        <ToastProvider>
+          <AuthProvider>
+            <AdminShell>
+              <AdminOrdersView />
+            </AdminShell>
+          </AuthProvider>
+        </ToastProvider>
+      </ThemeProvider>
+    );
+
+    expect(await screen.findByText("ORD-20261121-REFPND")).toBeInTheDocument();
+    const row = screen.getByText("ORD-20261121-REFPND").closest("tr") as HTMLTableRowElement;
+    expect(within(row).getByText("Refund Pending")).toBeInTheDocument();
+
+    // Payment status filter includes REFUND_PENDING option
+    const paymentFilter = screen.getByLabelText("Payment Status");
+    fireEvent.click(paymentFilter);
+    expect(await screen.findByRole("option", { name: "REFUND_PENDING" })).toBeInTheDocument();
+
+    const cartCalls = fetchMock.mock.calls.filter(([url]) => String(url).includes("/cart"));
+    expect(cartCalls).toHaveLength(0);
+  });
+
+  it("renders REFUND_PENDING alert, intent badge, and pending-refund event label in AdminOrderDetailView", async () => {
+    mockPathname = "/admin/orders/ORD-20261121-REFPND";
+    const order = makeAdminOrderDetail({
+      order_number: "ORD-20261121-REFPND",
+      status: "CONFIRMED",
+      payment_status: "REFUND_PENDING",
+      fulfillment_status: "ALLOCATED",
+      payment_intent: {
+        id: "pi-ref-pend",
+        provider: "sandbox_simpay",
+        provider_intent_id: "pi_sandbox_refpend",
+        amount_cents: 10720,
+        currency: "USD",
+        status: "REFUND_PENDING",
+        failure_code: null,
+        failure_message: null,
+        created_at: "2026-11-21T10:00:00Z",
+      },
+      payment_intents: [
+        {
+          id: "pi-ref-pend",
+          provider: "sandbox_simpay",
+          provider_intent_id: "pi_sandbox_refpend",
+          amount_cents: 10720,
+          currency: "USD",
+          status: "REFUND_PENDING",
+          failure_code: null,
+          failure_message: null,
+          created_at: "2026-11-21T10:00:00Z",
+        },
+      ],
+      events: [
+        {
+          id: "evt-dup-pend",
+          actor_user_id: null,
+          event_type: "DUPLICATE_PAYMENT_REFUND_PENDING",
+          from_status: "CONFIRMED",
+          to_status: "CONFIRMED",
+          metadata: { provider_intent_id: "pi_sandbox_refpend" },
+          created_at: "2026-11-21T10:06:00Z",
+        },
+      ],
+    });
+
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/auth/me")) {
+        return jsonResponse({ user: makeUser("admin"), csrf_token: "csrf-admin-detail" });
+      }
+      if (url.endsWith("/admin/orders/ORD-20261121-REFPND")) {
+        return jsonResponse(order);
+      }
+      return errorResponse(404, "NOT_FOUND", `Unexpected ${url}`);
+    });
+
+    render(
+      <ToastProvider>
+        <AuthProvider>
+          <AdminOrderDetailView orderNumber="ORD-20261121-REFPND" />
+        </AuthProvider>
+      </ToastProvider>
+    );
+
+    expect(await screen.findByText("Refund pending settlement")).toBeInTheDocument();
+    expect(screen.getAllByText("Refund Pending").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText("Duplicate Payment Refund Pending")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Issue Refund" })).not.toBeInTheDocument();
+
+    const cartCalls = fetchMock.mock.calls.filter(([url]) => String(url).includes("/cart"));
+    expect(cartCalls).toHaveLength(0);
   });
 });

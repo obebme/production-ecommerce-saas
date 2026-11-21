@@ -294,6 +294,7 @@ export type PaymentStatus =
   | "REQUIRES_PAYMENT"
   | "PAID"
   | "FAILED"
+  | "REFUND_PENDING"
   | "REFUNDED"
   | "CANCELLED";
 
@@ -311,6 +312,7 @@ export type PaymentIntentStatus =
   | "SUCCEEDED"
   | "FAILED"
   | "CANCELLED"
+  | "REFUND_PENDING"
   | "REFUNDED";
 
 export type SandboxSimulateOutcome = "succeeded" | "failed";

@@ -136,6 +136,7 @@ const PAYMENT_STATUS_MAP: Record<string, { label: string; variant: BadgeProps["v
   REQUIRES_PAYMENT: { label: "Requires Payment", variant: "warning" },
   PAID: { label: "Paid", variant: "success" },
   FAILED: { label: "Failed", variant: "destructive" },
+  REFUND_PENDING: { label: "Refund Pending", variant: "warning" },
   REFUNDED: { label: "Refunded", variant: "destructive" },
   CANCELLED: { label: "Cancelled", variant: "secondary" },
 };

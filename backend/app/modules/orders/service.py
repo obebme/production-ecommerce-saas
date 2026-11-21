@@ -7,8 +7,10 @@ import hmac
 import json
 import re
 import secrets
+import threading
 import uuid
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, cast
@@ -46,7 +48,7 @@ from app.models.inventory import (
     ProductVariant,
 )
 from app.models.order import Order, OrderEvent, OrderItem
-from app.models.payment import PaymentIntent
+from app.models.payment import PaymentIntent, PaymentRefundRequest
 from app.modules.catalog.schemas import ensure_utc_datetime
 from app.modules.identity.dependencies import AuthContext
 from app.modules.inventory.service import reclaim_expired_reservations_for_variants
@@ -75,6 +77,13 @@ SANDBOX_PROVIDER = "sandbox_simpay"
 _ORDER_NUMBER_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 _ORDER_NUMBER_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 _INT32_MAX = 2_147_483_647
+
+ADVISORY_LOCK_NS_CHECKOUT = 1
+ADVISORY_LOCK_NS_GUEST_PENDING_CAP = 2
+ADVISORY_LOCK_NS_PAYMENT_INTENT = 3
+
+_SQLITE_GUEST_CAP_LOCKS_GUARD = threading.Lock()
+_SQLITE_GUEST_CAP_LOCKS: dict[str, threading.Lock] = {}
 
 
 def validate_idempotency_key(raw_key: str | None) -> str:
@@ -191,13 +200,35 @@ def _generate_order_number(now: datetime) -> str:
     return f"ORD-{date_part}-{suffix}"
 
 
-def _acquire_advisory_xact_lock(db: Session, scoped_key: str) -> None:
+def _acquire_advisory_xact_lock(
+    db: Session,
+    namespace: int,
+    scoped_key: str,
+) -> None:
     bind = db.get_bind()
     if bind.dialect.name == "postgresql":
         db.execute(
-            text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
-            {"key": scoped_key},
+            text("SELECT pg_advisory_xact_lock(:ns, hashtext(:key))"),
+            {"ns": namespace, "key": scoped_key},
         )
+
+
+@contextmanager
+def _sqlite_guest_cap_guard(
+    db: Session,
+    guest_client_key_hash: str | None,
+) -> Iterator[None]:
+    """Serialize SQLite guest-cap checks per client hash to match PG advisory locks in tests."""
+    if guest_client_key_hash is None or db.get_bind().dialect.name == "postgresql":
+        yield
+        return
+    with _SQLITE_GUEST_CAP_LOCKS_GUARD:
+        lock = _SQLITE_GUEST_CAP_LOCKS.get(guest_client_key_hash)
+        if lock is None:
+            lock = threading.Lock()
+            _SQLITE_GUEST_CAP_LOCKS[guest_client_key_hash] = lock
+    with lock:
+        yield
 
 
 def to_order_item_dto(item: OrderItem) -> OrderItemDTO:
@@ -400,25 +431,26 @@ def _find_actor_active_cart(
     return cart
 
 
-def _enforce_guest_pending_order_cap(
+def _find_matching_guest_pending_order_ids(
     db: Session,
-    tracker: GuestPendingOrderTracker,
     *,
-    client_ip_key: str,
+    guest_client_key_hash: str,
     guest_orders_cookie: str | None,
     settings: Settings,
-) -> None:
-    tracked_ids = tracker.get_ids(client_ip_key)
+    now: datetime,
+) -> list[uuid.UUID]:
+    """Return PENDING_PAYMENT guest order IDs matching client IP hash or valid cookie tokens."""
     cookie_token_map = dict(parse_guest_orders_cookie(guest_orders_cookie))
     cookie_order_numbers = list(cookie_token_map.keys())
-    if not tracked_ids and not cookie_order_numbers:
-        return
 
-    match_clauses = []
-    if tracked_ids:
-        match_clauses.append(Order.id.in_(tracked_ids))
-    if cookie_order_numbers:
-        match_clauses.append(Order.order_number.in_(cookie_order_numbers))
+    match_clause = (
+        or_(
+            Order.guest_client_key_hash == guest_client_key_hash,
+            Order.order_number.in_(cookie_order_numbers),
+        )
+        if cookie_order_numbers
+        else (Order.guest_client_key_hash == guest_client_key_hash)
+    )
 
     candidate_rows = db.execute(
         select(
@@ -426,18 +458,19 @@ def _enforce_guest_pending_order_cap(
             Order.order_number,
             Order.guest_token_version,
             Order.guest_access_expires_at,
-        ).where(
+            Order.guest_client_key_hash,
+        )
+        .where(
             Order.user_id.is_(None),
             Order.status == "PENDING_PAYMENT",
-            or_(*match_clauses),
+            match_clause,
         )
+        .execution_options(populate_existing=True)
     ).all()
 
-    now = datetime.now(UTC)
-    tracked_id_set = set(tracked_ids)
     candidate_order_ids: list[uuid.UUID] = []
-    for oid, order_num, guest_ver, guest_exp in candidate_rows:
-        if oid in tracked_id_set:
+    for oid, order_num, guest_ver, guest_exp, row_client_hash in candidate_rows:
+        if row_client_hash == guest_client_key_hash:
             candidate_order_ids.append(oid)
             continue
         cookie_token = cookie_token_map.get(order_num)
@@ -454,13 +487,30 @@ def _enforce_guest_pending_order_cap(
             )
         ):
             candidate_order_ids.append(oid)
+    return candidate_order_ids
 
+
+def _reclaim_expired_guest_pending_orders(
+    db: Session,
+    *,
+    guest_client_key_hash: str,
+    guest_orders_cookie: str | None,
+    settings: Settings,
+    now: datetime,
+) -> None:
+    """Lazily reclaim expired reservations for matching guest PENDING_PAYMENT orders pre-lock."""
+    candidate_order_ids = _find_matching_guest_pending_order_ids(
+        db,
+        guest_client_key_hash=guest_client_key_hash,
+        guest_orders_cookie=guest_orders_cookie,
+        settings=settings,
+        now=now,
+    )
     if not candidate_order_ids:
-        tracker.retain_active(client_ip_key, set())
         return
+
     res_rows = db.execute(
         select(
-            InventoryReservation.order_id,
             InventoryReservation.variant_id,
             InventoryReservation.expires_at,
         ).where(
@@ -468,37 +518,56 @@ def _enforce_guest_pending_order_cap(
             InventoryReservation.status == "ACTIVE",
         )
     ).all()
+    expired_variants = [
+        vid for vid, exp in res_rows if ensure_utc_datetime(exp) < now
+    ]
+    if expired_variants and reclaim_expired_reservations_for_variants(
+        db, expired_variants, now=now
+    ) > 0:
+        db.commit()
 
-    expired_variants: list[uuid.UUID] = []
-    for _oid, vid, exp in res_rows:
-        if ensure_utc_datetime(exp) < now:
-            expired_variants.append(vid)
 
-    if expired_variants:
-        if reclaim_expired_reservations_for_variants(db, expired_variants, now=now) > 0:
-            db.commit()
-        now = datetime.now(UTC)
-        res_rows = db.execute(
-            select(
-                InventoryReservation.order_id,
-                InventoryReservation.variant_id,
-                InventoryReservation.expires_at,
-            )
-            .join(Order, Order.id == InventoryReservation.order_id)
-            .where(
-                Order.id.in_(candidate_order_ids),
-                Order.status == "PENDING_PAYMENT",
-                InventoryReservation.status == "ACTIVE",
-            )
-        ).all()
+def _enforce_guest_pending_order_cap_tx(
+    db: Session,
+    tracker: GuestPendingOrderTracker,
+    *,
+    client_ip_key: str,
+    guest_client_key_hash: str,
+    guest_orders_cookie: str | None,
+    settings: Settings,
+) -> None:
+    """Enforce DB-backed MAX_ACTIVE_GUEST_PENDING_ORDERS inside the locked checkout TX."""
+    now = datetime.now(UTC)
+    candidate_order_ids = _find_matching_guest_pending_order_ids(
+        db,
+        guest_client_key_hash=guest_client_key_hash,
+        guest_orders_cookie=guest_orders_cookie,
+        settings=settings,
+        now=now,
+    )
+    if not candidate_order_ids:
+        tracker.retain_active(client_ip_key, set())
+        return
 
-    active_pending_ids: set[uuid.UUID] = set()
-    for oid, _vid, exp in res_rows:
-        if ensure_utc_datetime(exp) >= now:
-            active_pending_ids.add(oid)
+    res_rows = db.execute(
+        select(
+            InventoryReservation.order_id,
+            InventoryReservation.expires_at,
+        )
+        .join(Order, Order.id == InventoryReservation.order_id)
+        .where(
+            Order.id.in_(candidate_order_ids),
+            Order.status == "PENDING_PAYMENT",
+            InventoryReservation.status == "ACTIVE",
+        )
+    ).all()
 
+    active_pending_ids = {
+        oid for oid, exp in res_rows if ensure_utc_datetime(exp) >= now
+    }
     tracker.retain_active(client_ip_key, active_pending_ids)
     if len(active_pending_ids) >= MAX_ACTIVE_GUEST_PENDING_ORDERS:
+        db.rollback()
         raise RateLimitExceededError(
             code="RATE_LIMIT_EXCEEDED",
             message=(
@@ -527,6 +596,7 @@ def create_checkout_order(
     """
     now = datetime.now(UTC)
     guest_token_hash: str | None = None
+    guest_client_key_hash: str | None = None
     if auth is not None:
         actor_scope = f"user:{auth.user.id}"
     else:
@@ -536,11 +606,13 @@ def create_checkout_order(
                 message="Your cart is empty.",
             )
         guest_token_hash = hash_token(raw_guest_cart_token)
+        guest_client_key_hash = hash_token(f"guest_ip:{client_ip_key}")
         actor_scope = f"guest:{guest_token_hash}"
 
     scoped_key = hash_token(f"{actor_scope}:{idempotency_key}")
 
-    # Pre-step: lazily reclaim expired reservations for cart items before taking checkout locks.
+    # Pre-step: lazily reclaim expired reservations for cart items and matching guest
+    # pending orders before acquiring checkout transaction locks.
     pre_cart = _find_actor_active_cart(
         db,
         user_id=auth.user.id if auth is not None else None,
@@ -558,21 +630,53 @@ def create_checkout_order(
         ) > 0:
             db.commit()
 
-    if auth is None and db.scalar(
-        select(Order.id).where(Order.idempotency_key == scoped_key)
-    ) is None:
-        _enforce_guest_pending_order_cap(
+    if guest_client_key_hash is not None:
+        _reclaim_expired_guest_pending_orders(
             db,
-            tracker,
-            client_ip_key=client_ip_key,
+            guest_client_key_hash=guest_client_key_hash,
             guest_orders_cookie=guest_orders_cookie,
             settings=settings,
+            now=datetime.now(UTC),
         )
 
+    with _sqlite_guest_cap_guard(db, guest_client_key_hash):
+        return _create_checkout_order_tx(
+            db,
+            auth=auth,
+            guest_token_hash=guest_token_hash,
+            guest_client_key_hash=guest_client_key_hash,
+            guest_orders_cookie=guest_orders_cookie,
+            scoped_key=scoped_key,
+            payload=payload,
+            settings=settings,
+            tracker=tracker,
+            client_ip_key=client_ip_key,
+        )
+
+
+def _create_checkout_order_tx(
+    db: Session,
+    *,
+    auth: AuthContext | None,
+    guest_token_hash: str | None,
+    guest_client_key_hash: str | None,
+    guest_orders_cookie: str | None,
+    scoped_key: str,
+    payload: CreateCheckoutOrderRequest,
+    settings: Settings,
+    tracker: GuestPendingOrderTracker,
+    client_ip_key: str,
+) -> tuple[CheckoutOrderResponseDTO, bool]:
     shipping_dict = payload.shipping_address.model_dump()
     billing_dict = payload.effective_billing_address().model_dump()
 
-    _acquire_advisory_xact_lock(db, scoped_key)
+    if guest_client_key_hash is not None:
+        _acquire_advisory_xact_lock(
+            db,
+            ADVISORY_LOCK_NS_GUEST_PENDING_CAP,
+            guest_client_key_hash,
+        )
+    _acquire_advisory_xact_lock(db, ADVISORY_LOCK_NS_CHECKOUT, scoped_key)
 
     existing_order = db.scalar(
         select(Order)
@@ -599,6 +703,16 @@ def create_checkout_order(
                 settings=settings,
             ),
             True,
+        )
+
+    if guest_client_key_hash is not None:
+        _enforce_guest_pending_order_cap_tx(
+            db,
+            tracker,
+            client_ip_key=client_ip_key,
+            guest_client_key_hash=guest_client_key_hash,
+            guest_orders_cookie=guest_orders_cookie,
+            settings=settings,
         )
 
     if active_cart is None:
@@ -756,6 +870,7 @@ def create_checkout_order(
         customer_email=payload.customer_email,
         guest_token_version=1,
         guest_access_expires_at=guest_access_expires_at,
+        guest_client_key_hash=guest_client_key_hash,
         status="PENDING_PAYMENT",
         payment_status="REQUIRES_PAYMENT",
         fulfillment_status="UNFULFILLED",
@@ -1507,11 +1622,63 @@ def _expire_locked_order_inline(
         )
 
 
+def _create_pending_refund_request(
+    db: Session,
+    *,
+    order: Order,
+    intent: PaymentIntent,
+    trigger_source: str,
+    reason: str | None,
+    actor_user_id: uuid.UUID | None = None,
+    restock_on_confirm: bool = False,
+) -> PaymentRefundRequest:
+    """Idempotently create a PENDING PaymentRefundRequest row for an automated/admin refund."""
+    existing = db.scalar(
+        select(PaymentRefundRequest)
+        .where(PaymentRefundRequest.payment_intent_id == intent.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if existing is not None:
+        return existing
+
+    refund_request = PaymentRefundRequest(
+        order_id=order.id,
+        payment_intent_id=intent.id,
+        provider=intent.provider,
+        provider_intent_id=intent.provider_intent_id,
+        amount_cents=intent.amount_cents,
+        currency=intent.currency,
+        reason=reason[:255] if reason else None,
+        trigger_source=trigger_source,
+        status="PENDING",
+        actor_user_id=actor_user_id,
+        restock_on_confirm=restock_on_confirm,
+    )
+    db.add(refund_request)
+    db.flush()
+    return refund_request
+
+
+def _cancel_other_open_intents(
+    intent: PaymentIntent,
+    sibling_intents: Sequence[PaymentIntent],
+) -> None:
+    for other in sibling_intents:
+        if other.id != intent.id and other.status in (
+            "REQUIRES_ACTION",
+            "PROCESSING",
+            "FAILED",
+        ):
+            other.status = "CANCELLED"
+
+
 def mark_order_paid(
     db: Session,
     *,
     order: Order,
     intent: PaymentIntent,
+    sibling_intents: Sequence[PaymentIntent] = (),
     reservations: Sequence[InventoryReservation],
     stocks_by_variant: dict[uuid.UUID, InventoryStock],
     variants_by_id: dict[uuid.UUID, tuple[ProductVariant, Product, Category]],
@@ -1520,13 +1687,20 @@ def mark_order_paid(
 ) -> None:
     """Apply payment_intent.succeeded state transition matrix under existing row locks."""
     if order.payment_status == "PAID":
-        if intent.status != "SUCCEEDED":
-            intent.status = "REFUNDED"
+        if intent.status not in ("SUCCEEDED", "REFUND_PENDING", "REFUNDED"):
+            intent.status = "REFUND_PENDING"
+            _create_pending_refund_request(
+                db,
+                order=order,
+                intent=intent,
+                trigger_source="DUPLICATE_PAYMENT",
+                reason="Duplicate payment captured after order was already paid",
+            )
             append_order_event(
                 db,
                 order_id=order.id,
                 actor_user_id=None,
-                event_type="DUPLICATE_PAYMENT_REFUNDED",
+                event_type="DUPLICATE_PAYMENT_REFUND_PENDING",
                 from_status=order.status,
                 to_status=order.status,
                 metadata_json={
@@ -1538,9 +1712,34 @@ def mark_order_paid(
         return
 
     if order.status == "PENDING_PAYMENT":
+        if intent.status == "CANCELLED":
+            intent.status = "REFUND_PENDING"
+            _create_pending_refund_request(
+                db,
+                order=order,
+                intent=intent,
+                trigger_source="STALE_INTENT_CAPTURE",
+                reason="Captured payment intent had already been cancelled",
+            )
+            append_order_event(
+                db,
+                order_id=order.id,
+                actor_user_id=None,
+                event_type="STALE_INTENT_PAYMENT_REFUND_PENDING",
+                from_status=order.status,
+                to_status=order.status,
+                metadata_json={
+                    "provider_intent_id": intent.provider_intent_id,
+                    "event_id": event_id,
+                },
+                now=now,
+            )
+            return
+
         intent.status = "SUCCEEDED"
         intent.failure_code = None
         intent.failure_message = None
+        _cancel_other_open_intents(intent, sibling_intents)
         order.status = "CONFIRMED"
         order.payment_status = "PAID"
         order.fulfillment_status = "ALLOCATED"
@@ -1614,6 +1813,7 @@ def mark_order_paid(
                 intent.status = "SUCCEEDED"
                 intent.failure_code = None
                 intent.failure_message = None
+                _cancel_other_open_intents(intent, sibling_intents)
                 order.status = "CONFIRMED"
                 order.payment_status = "PAID"
                 order.fulfillment_status = "ALLOCATED"
@@ -1656,18 +1856,23 @@ def mark_order_paid(
                 )
                 return
 
-            intent.status = "REFUNDED"
-            order.status = "REFUNDED"
-            order.payment_status = "REFUNDED"
+            intent.status = "REFUND_PENDING"
+            order.payment_status = "REFUND_PENDING"
             order.fulfillment_status = "CANCELLED"
-            order.paid_at = now
+            _create_pending_refund_request(
+                db,
+                order=order,
+                intent=intent,
+                trigger_source="LATE_PAYMENT_OUT_OF_STOCK",
+                reason="Late payment succeeded after reservation expired and stock was unavailable",
+            )
             append_order_event(
                 db,
                 order_id=order.id,
                 actor_user_id=None,
                 event_type="PAYMENT_SUCCEEDED_OUT_OF_STOCK",
                 from_status="CANCELLED",
-                to_status="REFUNDED",
+                to_status="CANCELLED",
                 metadata_json={
                     "provider_intent_id": intent.provider_intent_id,
                     "event_id": event_id,
@@ -1676,19 +1881,24 @@ def mark_order_paid(
             )
             return
 
-        # Explicit cancel (RELEASED reservations) -> auto-refund.
-        intent.status = "REFUNDED"
-        order.status = "REFUNDED"
-        order.payment_status = "REFUNDED"
+        # Explicit cancel (RELEASED reservations) -> pending refund, order remains CANCELLED.
+        intent.status = "REFUND_PENDING"
+        order.payment_status = "REFUND_PENDING"
         order.fulfillment_status = "CANCELLED"
-        order.paid_at = now
+        _create_pending_refund_request(
+            db,
+            order=order,
+            intent=intent,
+            trigger_source="LATE_PAYMENT_AFTER_CANCEL",
+            reason="Late payment succeeded after order was cancelled",
+        )
         append_order_event(
             db,
             order_id=order.id,
             actor_user_id=None,
             event_type="PAYMENT_SUCCEEDED_AFTER_CANCEL",
             from_status="CANCELLED",
-            to_status="REFUNDED",
+            to_status="CANCELLED",
             metadata_json={
                 "provider_intent_id": intent.provider_intent_id,
                 "event_id": event_id,
@@ -1697,13 +1907,20 @@ def mark_order_paid(
         )
         return
 
-    if intent.status not in ("SUCCEEDED", "REFUNDED"):
-        intent.status = "REFUNDED"
+    if intent.status not in ("SUCCEEDED", "REFUND_PENDING", "REFUNDED"):
+        intent.status = "REFUND_PENDING"
+        _create_pending_refund_request(
+            db,
+            order=order,
+            intent=intent,
+            trigger_source="DUPLICATE_PAYMENT",
+            reason="Payment captured on order in non-payable terminal state",
+        )
         append_order_event(
             db,
             order_id=order.id,
             actor_user_id=None,
-            event_type="DUPLICATE_PAYMENT_REFUNDED",
+            event_type="DUPLICATE_PAYMENT_REFUND_PENDING",
             from_status=order.status,
             to_status=order.status,
             metadata_json={
@@ -1724,7 +1941,10 @@ def mark_order_payment_failed(
     failure_message: str | None,
 ) -> None:
     """Apply payment_intent.failed state transition under existing row locks."""
-    if order.status != "PENDING_PAYMENT" or intent.status == "SUCCEEDED":
+    if (
+        order.status != "PENDING_PAYMENT"
+        or intent.status not in ("REQUIRES_ACTION", "PROCESSING")
+    ):
         return
 
     intent.status = "FAILED"
@@ -1757,21 +1977,61 @@ def mark_order_refunded(
     reservations: Sequence[InventoryReservation],
     stocks_by_variant: dict[uuid.UUID, InventoryStock],
     event_id: str,
+    now: datetime | None = None,
 ) -> None:
     """Apply charge.refunded webhook transition under existing row locks."""
+    current_time = now if now is not None else datetime.now(UTC)
+    refund_request = db.scalar(
+        select(PaymentRefundRequest)
+        .where(PaymentRefundRequest.payment_intent_id == intent.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if refund_request is not None and refund_request.status != "SUCCEEDED":
+        refund_request.status = "SUCCEEDED"
+        refund_request.error_message = None
+        refund_request.completed_at = current_time
+
     if order.status == "REFUNDED" and order.payment_status == "REFUNDED":
         if intent.status != "REFUNDED":
             intent.status = "REFUNDED"
         return
 
-    has_other_succeeded = any(
-        other.id != intent.id and other.status == "SUCCEEDED"
+    if order.status == "CANCELLED":
+        intent.status = "REFUNDED"
+        has_pending_or_paid_sibling = any(
+            other.id != intent.id and other.status in ("SUCCEEDED", "REFUND_PENDING")
+            for other in sibling_intents
+        )
+        if order.payment_status == "REFUND_PENDING" and not has_pending_or_paid_sibling:
+            order.payment_status = "REFUNDED"
+        append_order_event(
+            db,
+            order_id=order.id,
+            actor_user_id=None,
+            event_type=(
+                "PAYMENT_INTENT_REFUNDED"
+                if has_pending_or_paid_sibling
+                else "PAYMENT_REFUNDED"
+            ),
+            from_status="CANCELLED",
+            to_status="CANCELLED",
+            metadata_json={
+                "provider_intent_id": intent.provider_intent_id,
+                "event_id": event_id,
+            },
+            now=current_time,
+        )
+        return
+
+    has_other_succeeded_or_pending = any(
+        other.id != intent.id and other.status in ("SUCCEEDED", "REFUND_PENDING")
         for other in sibling_intents
     )
     if (
-        has_other_succeeded
-        or order.payment_status != "PAID"
-        or intent.status != "SUCCEEDED"
+        has_other_succeeded_or_pending
+        or order.payment_status not in ("PAID", "REFUND_PENDING")
+        or intent.status not in ("SUCCEEDED", "REFUND_PENDING")
     ):
         intent.status = "REFUNDED"
         append_order_event(
@@ -1786,6 +2046,7 @@ def mark_order_refunded(
                 "event_id": event_id,
                 "reason": "non_winning_or_unpaid_intent_refunded",
             },
+            now=current_time,
         )
         return
 
@@ -1834,4 +2095,5 @@ def mark_order_refunded(
             "provider_intent_id": intent.provider_intent_id,
             "event_id": event_id,
         },
+        now=current_time,
     )

@@ -43,12 +43,12 @@ Complete every item before deploying to any shared staging or production environ
 - **`PAYMENT_WEBHOOK_SECRET`**: Coordinate dual-step rotation with payment provider webhook signing configuration so verified webhook delivery never drops during cutover.
 
 ### 3.2 Alembic Database Migration & Rollback Runbook
-All schema changes strictly flow through Alembic (`Base.metadata.create_all()` is forbidden in app startup). Current linear head: `0001_initial_schema`.
+All schema changes strictly flow through Alembic (`Base.metadata.create_all()` is forbidden in app startup). Current linear head: `0002_phase1_commerce_integrity`.
 
 1. **Before deploying**:
    ```bash
    cd backend
-   alembic heads   # Expect exactly 1 head revision
+   alembic heads   # Expect exactly 1 head revision (0002_phase1_commerce_integrity)
    ```
 2. **Pre-migration backup**: Take a verified PostgreSQL snapshot / `pg_dump` before upgrading production schemas.
 3. **Apply migration**:
@@ -73,6 +73,16 @@ unset ADMIN_BOOTSTRAP_PASSWORD
 ```
 
 For non-production staging environments where demo seed data is desired (`INFO-1`), always override `DEMO_ADMIN_PASSWORD`, `DEMO_STAFF_PASSWORD`, and `DEMO_CUSTOMER_PASSWORD` when passing `--with-demo-users`.
+
+### 3.4 Expired Reservation Sweeper (`app.cli sweep-expired-reservations`) & Phase 1 Remediation Summary
+Phase 1 audit remediation (`REM-P1-BE` / `REM-P1-FE` / `REM-P1-QA` / `REM-P1-SEC`) added:
+- **Periodic & CLI Sweeper (`H-01`, `M-06`)**: FastAPI `lifespan` runs a periodic expired-reservation sweeper every `RESERVATION_SWEEPER_INTERVAL_SECONDS` (default `60`, disabled in `test` or `0`), and operators/cron can run bounded sweeps via:
+  ```bash
+  python -m app.cli sweep-expired-reservations --batch-size 100 --max-batches 20
+  ```
+- **Durable Refund Staging (`H-02`, `M-01`, `M-02`)**: Automated edge-case captures and 3-phase admin refunds track state via `payment_refund_requests` and `REFUND_PENDING` without holding database `FOR UPDATE` row locks across refund gateway calls.
+- **Webhook Retry & Read-Only Cart (`H-03`, `H-05`)**: Failed webhook events (`payment_webhook_events.status = 'FAILED'`) are safely reclaimable on retry while `PROCESSED` rows remain idempotent; `GET /api/v1/cart` is read-only and `CartProvider` is mounted only under the storefront layout.
+- **Atomic Guest Pending Cap (`H-06`)**: Enforced atomically in PostgreSQL via `orders.guest_client_key_hash` and namespaced `pg_advisory_xact_lock(2, hashtext(...))`. Note: until Phase 2 `H-04` configures `--proxy-headers`, reverse-proxied traffic collapses `request.client.host` to the proxy IP (sharing one guest pending-order bucket), and general IP sliding-window rate limiting (`SlidingWindowRateLimiter`) remains per-process in memory.
 
 ---
 

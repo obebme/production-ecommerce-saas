@@ -1727,4 +1727,45 @@ describe("OrderHistoryView (/orders)", () => {
       "/products"
     );
   });
+
+  it("renders REFUND_PENDING payment badge and pending-refund event labels in storefront OrderDetailView", async () => {
+    mockPathname = "/orders/ORD-20261121-REFPND";
+    const order = makeOrderDetail({
+      order_number: "ORD-20261121-REFPND",
+      status: "CANCELLED",
+      payment_status: "REFUND_PENDING",
+      fulfillment_status: "CANCELLED",
+      payment_intent: makePaymentIntent({ status: "REFUND_PENDING" }),
+      events: [
+        {
+          id: "evt-stale-pend",
+          actor_user_id: null,
+          event_type: "STALE_INTENT_PAYMENT_REFUND_PENDING",
+          from_status: "PENDING_PAYMENT",
+          to_status: "PENDING_PAYMENT",
+          metadata: {},
+          created_at: "2026-11-21T10:02:00Z",
+        },
+      ],
+    });
+
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/auth/me")) {
+        return jsonResponse({ user: makeUser("customer"), csrf_token: "csrf-refpend" });
+      }
+      if (url.endsWith("/cart")) {
+        return jsonResponse(makeCart([]));
+      }
+      if (url.endsWith("/orders/ORD-20261121-REFPND")) {
+        return jsonResponse(order);
+      }
+      return errorResponse(404, "NOT_FOUND", `Unexpected ${url}`);
+    });
+
+    renderStorefront(<OrderDetailView orderNumber="ORD-20261121-REFPND" />);
+
+    expect((await screen.findAllByText("Refund Pending")).length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText("Stale Payment Refund Pending")).toBeInTheDocument();
+  });
 });

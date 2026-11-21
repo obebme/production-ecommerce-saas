@@ -47,10 +47,14 @@ from app.models.inventory import (
     ProductVariant,
 )
 from app.models.order import Order, OrderEvent
-from app.models.payment import PaymentIntent, PaymentWebhookEvent
+from app.models.payment import PaymentIntent, PaymentRefundRequest, PaymentWebhookEvent
 from app.modules.inventory.service import reclaim_expired_reservations_for_variants
 from app.modules.orders.service import SANDBOX_PROVIDER
-from app.modules.payments.service import MAX_WEBHOOK_BODY_BYTES
+from app.modules.payments.schemas import WebhookEventData, WebhookPayload
+from app.modules.payments.service import (
+    MAX_WEBHOOK_BODY_BYTES,
+    _persist_webhook_unexpected_failure,
+)
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 
@@ -1005,7 +1009,8 @@ def test_webhook_state_transition_matrix(
     )
     assert st_pi2_ok == 200
 
-    # Delayed success on pi1_id for already-PAID order -> pi1 REFUNDED, DUPLICATE_PAYMENT_REFUNDED
+    # Delayed success on pi1_id for already-PAID order -> pi1 REFUND_PENDING + RefundRequest,
+    # then verified charge.refunded -> pi1 REFUNDED
     st_dup_intent, _ = _post_signed_webhook(
         client,
         event_type="payment_intent.succeeded",
@@ -1018,14 +1023,39 @@ def test_webhook_state_transition_matrix(
     db_pi1 = db_session.scalar(
         select(PaymentIntent).where(PaymentIntent.provider_intent_id == pi1_id)
     )
-    assert db_pi1 is not None and db_pi1.status == "REFUNDED"
+    assert db_pi1 is not None and db_pi1.status == "REFUND_PENDING"
+    dup_req = db_session.scalar(
+        select(PaymentRefundRequest).where(PaymentRefundRequest.payment_intent_id == db_pi1.id)
+    )
+    assert dup_req is not None
+    assert dup_req.status == "PENDING"
+    assert dup_req.trigger_source == "DUPLICATE_PAYMENT"
     dup_ev = db_session.scalar(
         select(OrderEvent).where(
             OrderEvent.order_id == o_retry_id,
-            OrderEvent.event_type == "DUPLICATE_PAYMENT_REFUNDED",
+            OrderEvent.event_type == "DUPLICATE_PAYMENT_REFUND_PENDING",
         )
     )
     assert dup_ev is not None
+    db_retry_after_dup = db_session.get(Order, o_retry_id)
+    assert db_retry_after_dup is not None
+    assert (db_retry_after_dup.status, db_retry_after_dup.payment_status) == ("CONFIRMED", "PAID")
+
+    st_dup_chg_ref, _ = _post_signed_webhook(
+        client,
+        event_type="charge.refunded",
+        provider_intent_id=pi1_id,
+        order_number=o_retry["order"]["order_number"],
+        amount_cents=o_retry["order"]["total_cents"],
+    )
+    assert st_dup_chg_ref == 200
+    db_session.expire_all()
+    db_session.refresh(db_pi1)
+    db_session.refresh(dup_req)
+    assert db_pi1.status == "REFUNDED"
+    assert dup_req.status == "SUCCEEDED"
+    db_session.refresh(db_retry_after_dup)
+    assert (db_retry_after_dup.status, db_retry_after_dup.payment_status) == ("CONFIRMED", "PAID")
     db_session.refresh(stock)
     assert (stock.on_hand, stock.reserved) == (7, 0)
 
@@ -1065,7 +1095,8 @@ def test_webhook_state_transition_matrix(
     assert late_commit is not None
     assert (late_commit.delta_on_hand, late_commit.delta_reserved) == (-2, 0)
 
-    # 4. Late payment_intent.succeeded after RESERVATION_EXPIRED when OUT of stock -> REFUNDED
+    # 4. Late payment_intent.succeeded after RESERVATION_EXPIRED when OUT of stock ->
+    #    CANCELLED + REFUND_PENDING (paid_at remains None), then charge.refunded -> REFUNDED
     o_late_oos = _place_checkout_order(client, variant_id=var.id, quantity=3, session=session)
     o_late_oos_id = uuid.UUID(o_late_oos["order"]["id"])
     _expire_order_reservations(db_session, order_id=o_late_oos_id, variant_ids=[var.id])
@@ -1085,12 +1116,19 @@ def test_webhook_state_transition_matrix(
     db_late_oos = db_session.get(Order, o_late_oos_id)
     assert db_late_oos is not None
     assert (db_late_oos.status, db_late_oos.payment_status, db_late_oos.fulfillment_status) == (
-        "REFUNDED",
-        "REFUNDED",
+        "CANCELLED",
+        "REFUND_PENDING",
         "CANCELLED",
     )
+    assert db_late_oos.paid_at is None
     oos_intent = db_session.get(PaymentIntent, uuid.UUID(o_late_oos["payment_intent"]["id"]))
-    assert oos_intent is not None and oos_intent.status == "REFUNDED"
+    assert oos_intent is not None and oos_intent.status == "REFUND_PENDING"
+    oos_req = db_session.scalar(
+        select(PaymentRefundRequest).where(PaymentRefundRequest.payment_intent_id == oos_intent.id)
+    )
+    assert oos_req is not None
+    assert oos_req.status == "PENDING"
+    assert oos_req.trigger_source == "LATE_PAYMENT_OUT_OF_STOCK"
     assert (
         db_session.scalar(
             select(OrderEvent).where(
@@ -1100,10 +1138,31 @@ def test_webhook_state_transition_matrix(
         )
         is not None
     )
+    st_oos_ref, _ = _post_signed_webhook(
+        client,
+        event_type="charge.refunded",
+        provider_intent_id=o_late_oos["payment_intent"]["provider_intent_id"],
+        order_number=o_late_oos["order"]["order_number"],
+        amount_cents=o_late_oos["order"]["total_cents"],
+    )
+    assert st_oos_ref == 200
+    db_session.expire_all()
+    db_session.refresh(db_late_oos)
+    db_session.refresh(oos_intent)
+    db_session.refresh(oos_req)
+    assert (db_late_oos.status, db_late_oos.payment_status, db_late_oos.fulfillment_status) == (
+        "CANCELLED",
+        "REFUNDED",
+        "CANCELLED",
+    )
+    assert db_late_oos.paid_at is None
+    assert oos_intent.status == "REFUNDED"
+    assert oos_req.status == "SUCCEEDED"
     db_session.refresh(stock)
     assert (stock.on_hand, stock.reserved) == (2, 0)
 
-    # 5. Late payment_intent.succeeded after explicit RELEASED cancel -> REFUNDED
+    # 5. Late payment_intent.succeeded after explicit RELEASED cancel ->
+    #    CANCELLED + REFUND_PENDING (paid_at remains None), then charge.refunded -> REFUNDED
     o_explicit = _place_checkout_order(client, variant_id=var.id, quantity=1, session=session)
     o_explicit_id = uuid.UUID(o_explicit["order"]["id"])
     assert (
@@ -1125,10 +1184,21 @@ def test_webhook_state_transition_matrix(
     db_explicit = db_session.get(Order, o_explicit_id)
     assert db_explicit is not None
     assert (db_explicit.status, db_explicit.payment_status, db_explicit.fulfillment_status) == (
-        "REFUNDED",
-        "REFUNDED",
+        "CANCELLED",
+        "REFUND_PENDING",
         "CANCELLED",
     )
+    assert db_explicit.paid_at is None
+    explicit_intent = db_session.get(PaymentIntent, uuid.UUID(o_explicit["payment_intent"]["id"]))
+    assert explicit_intent is not None and explicit_intent.status == "REFUND_PENDING"
+    explicit_req = db_session.scalar(
+        select(PaymentRefundRequest).where(
+            PaymentRefundRequest.payment_intent_id == explicit_intent.id
+        )
+    )
+    assert explicit_req is not None
+    assert explicit_req.status == "PENDING"
+    assert explicit_req.trigger_source == "LATE_PAYMENT_AFTER_CANCEL"
     assert (
         db_session.scalar(
             select(OrderEvent).where(
@@ -1138,6 +1208,26 @@ def test_webhook_state_transition_matrix(
         )
         is not None
     )
+    st_explicit_ref, _ = _post_signed_webhook(
+        client,
+        event_type="charge.refunded",
+        provider_intent_id=o_explicit["payment_intent"]["provider_intent_id"],
+        order_number=o_explicit["order"]["order_number"],
+        amount_cents=o_explicit["order"]["total_cents"],
+    )
+    assert st_explicit_ref == 200
+    db_session.expire_all()
+    db_session.refresh(db_explicit)
+    db_session.refresh(explicit_intent)
+    db_session.refresh(explicit_req)
+    assert (db_explicit.status, db_explicit.payment_status, db_explicit.fulfillment_status) == (
+        "CANCELLED",
+        "REFUNDED",
+        "CANCELLED",
+    )
+    assert db_explicit.paid_at is None
+    assert explicit_intent.status == "REFUNDED"
+    assert explicit_req.status == "SUCCEEDED"
     db_session.refresh(stock)
     assert (stock.on_hand, stock.reserved) == (2, 0)
 
@@ -1625,6 +1715,446 @@ def _seed_pg_user_and_cart(
     return user_id, session_cookie, csrf_cookie, csrf_token
 
 
+def test_h02_late_payment_refund_pending_and_analytics_revenue_not_inflated(
+    client: TestClient,
+    db_session: Session,
+    login_as: Callable[..., AuthenticatedSession],
+) -> None:
+    """H-02: Late payments stay REFUND_PENDING/CANCELLED and never inflate analytics."""
+    _, _, var, stock = _seed_variant(db_session, sku="H02-ANA", price_cents=10000, on_hand=10)
+    customer = login_as(client, role="customer", email="h02-buyer@example.com")
+
+    # 1. Legitimate paid order
+    paid_order = _place_checkout_order(client, variant_id=var.id, quantity=1, session=customer)
+    paid_total = paid_order["order"]["total_cents"]
+    st_paid, _ = _post_signed_webhook(
+        client,
+        event_type="payment_intent.succeeded",
+        provider_intent_id=paid_order["payment_intent"]["provider_intent_id"],
+        order_number=paid_order["order"]["order_number"],
+        amount_cents=paid_total,
+    )
+    assert st_paid == 200
+
+    # 2. Explicitly cancelled order receiving late payment_intent.succeeded
+    late_cancel_order = _place_checkout_order(
+        client, variant_id=var.id, quantity=2, session=customer
+    )
+    assert (
+        client.post(
+            f"/api/v1/orders/{late_cancel_order['order']['order_number']}/cancel",
+            headers=_csrf_headers(customer),
+        ).status_code
+        == 200
+    )
+    st_late_cxl, _ = _post_signed_webhook(
+        client,
+        event_type="payment_intent.succeeded",
+        provider_intent_id=late_cancel_order["payment_intent"]["provider_intent_id"],
+        order_number=late_cancel_order["order"]["order_number"],
+        amount_cents=late_cancel_order["order"]["total_cents"],
+    )
+    assert st_late_cxl == 200
+
+    # 3. Expired out-of-stock order receiving late payment_intent.succeeded
+    late_oos_order = _place_checkout_order(client, variant_id=var.id, quantity=5, session=customer)
+    late_oos_id = uuid.UUID(late_oos_order["order"]["id"])
+    _expire_order_reservations(db_session, order_id=late_oos_id, variant_ids=[var.id])
+    stock.on_hand = 1
+    db_session.commit()
+    st_late_oos, _ = _post_signed_webhook(
+        client,
+        event_type="payment_intent.succeeded",
+        provider_intent_id=late_oos_order["payment_intent"]["provider_intent_id"],
+        order_number=late_oos_order["order"]["order_number"],
+        amount_cents=late_oos_order["order"]["total_cents"],
+    )
+    assert st_late_oos == 200
+
+    db_session.expire_all()
+    for late_id in (uuid.UUID(late_cancel_order["order"]["id"]), late_oos_id):
+        db_late = db_session.get(Order, late_id)
+        assert db_late is not None
+        assert db_late.status == "CANCELLED"
+        assert db_late.payment_status == "REFUND_PENDING"
+        assert db_late.paid_at is None
+
+    # Analytics summary BEFORE charge.refunded: only paid_order counts
+    _use_auth_cookies(client, login_as(client, role="admin", email="h02-admin@example.com"))
+    today_str = datetime.now(UTC).date().isoformat()
+    sum_before = client.get(
+        "/api/v1/admin/analytics/summary",
+        params={"from": today_str, "to": today_str},
+    )
+    assert sum_before.status_code == 200, sum_before.text
+    assert sum_before.json()["gross_revenue_cents"] == paid_total
+    assert sum_before.json()["refunded_revenue_cents"] == 0
+    assert sum_before.json()["net_revenue_cents"] == paid_total
+    assert sum_before.json()["paid_orders_count"] == 1
+
+    # Settle both pending refunds via charge.refunded -> analytics STILL must not be inflated
+    for late_order_data in (late_cancel_order, late_oos_order):
+        st_ref, _ = _post_signed_webhook(
+            client,
+            event_type="charge.refunded",
+            provider_intent_id=late_order_data["payment_intent"]["provider_intent_id"],
+            order_number=late_order_data["order"]["order_number"],
+            amount_cents=late_order_data["order"]["total_cents"],
+        )
+        assert st_ref == 200
+
+    sum_after = client.get(
+        "/api/v1/admin/analytics/summary",
+        params={"from": today_str, "to": today_str},
+    )
+    assert sum_after.status_code == 200
+    assert sum_after.json()["gross_revenue_cents"] == paid_total
+    assert sum_after.json()["refunded_revenue_cents"] == 0
+    assert sum_after.json()["net_revenue_cents"] == paid_total
+    assert sum_after.json()["paid_orders_count"] == 1
+
+
+def test_h03_webhook_failed_event_retry_and_in_progress_409(
+    client: TestClient,
+    db_session: Session,
+    login_as: Callable[..., AuthenticatedSession],
+) -> None:
+    """H-03: FAILED webhook retries with same event_id; PROCESSING -> 409; PROCESSED ignores."""
+    _, _, var, _ = _seed_variant(db_session, sku="H03-WH", price_cents=4000, on_hand=10)
+    session = login_as(client, role="customer", email="h03-buyer@example.com")
+    placed = _place_checkout_order(client, variant_id=var.id, quantity=1, session=session)
+    order_id = uuid.UUID(placed["order"]["id"])
+    order_number = placed["order"]["order_number"]
+    total_cents = placed["order"]["total_cents"]
+    real_pi_id = placed["payment_intent"]["provider_intent_id"]
+
+    # Temporarily rename provider_intent_id to simulate out-of-order delivery before intent exists
+    db_pi = db_session.get(PaymentIntent, uuid.UUID(placed["payment_intent"]["id"]))
+    assert db_pi is not None
+    db_pi.provider_intent_id = f"pi_temp_{uuid.uuid4().hex[:12]}"
+    db_session.commit()
+
+    shared_event_id = f"evt_h03_retry_{uuid.uuid4().hex[:10]}"
+    raw_body, headers = _signed_webhook_request(
+        event_id=shared_event_id,
+        event_type="payment_intent.succeeded",
+        provider_intent_id=real_pi_id,
+        order_number=order_number,
+        amount_cents=total_cents,
+    )
+
+    first_attempt = client.post(
+        f"/api/v1/webhooks/payments/{SANDBOX_PROVIDER}",
+        content=raw_body,
+        headers=headers,
+    )
+    assert first_attempt.status_code == 422, first_attempt.text
+    assert first_attempt.json()["error"]["code"] == "WEBHOOK_PAYLOAD_MISMATCH"
+
+    db_session.expire_all()
+    wh_row = db_session.scalar(
+        select(PaymentWebhookEvent).where(
+            PaymentWebhookEvent.provider == SANDBOX_PROVIDER,
+            PaymentWebhookEvent.provider_event_id == shared_event_id,
+        )
+    )
+    assert wh_row is not None
+    assert wh_row.status == "FAILED"
+    assert wh_row.error_message is not None and real_pi_id in wh_row.error_message
+
+    # Restore intent ID (simulating intent commit finishing) and retry with exact same event_id
+    db_pi.provider_intent_id = real_pi_id
+    db_session.commit()
+
+    retry_attempt = client.post(
+        f"/api/v1/webhooks/payments/{SANDBOX_PROVIDER}",
+        content=raw_body,
+        headers=headers,
+    )
+    assert retry_attempt.status_code == 200, retry_attempt.text
+    assert retry_attempt.json() == {"received": True, "status": "PROCESSED"}
+
+    db_session.expire_all()
+    db_session.refresh(wh_row)
+    assert wh_row.status == "PROCESSED"
+    assert wh_row.error_message is None
+    reloaded_order = db_session.get(Order, order_id)
+    assert reloaded_order is not None and reloaded_order.payment_status == "PAID"
+
+    # Subsequent delivery of PROCESSED event_id returns IGNORED_DUPLICATE
+    dup_attempt = client.post(
+        f"/api/v1/webhooks/payments/{SANDBOX_PROVIDER}",
+        content=raw_body,
+        headers=headers,
+    )
+    assert dup_attempt.status_code == 200
+    assert dup_attempt.json() == {"received": True, "status": "IGNORED_DUPLICATE"}
+
+    # An event currently in PROCESSING returns 409 WEBHOOK_IN_PROGRESS
+    in_prog_event_id = f"evt_h03_prog_{uuid.uuid4().hex[:10]}"
+    db_session.add(
+        PaymentWebhookEvent(
+            provider=SANDBOX_PROVIDER,
+            provider_event_id=in_prog_event_id,
+            event_type="payment_intent.succeeded",
+            signature_verified=True,
+            payload_json={},
+            status="PROCESSING",
+        )
+    )
+    db_session.commit()
+    prog_raw, prog_hdrs = _signed_webhook_request(
+        event_id=in_prog_event_id,
+        event_type="payment_intent.succeeded",
+        provider_intent_id=real_pi_id,
+        order_number=order_number,
+        amount_cents=total_cents,
+    )
+    in_prog_resp = client.post(
+        f"/api/v1/webhooks/payments/{SANDBOX_PROVIDER}",
+        content=prog_raw,
+        headers=prog_hdrs,
+    )
+    assert in_prog_resp.status_code == 409
+    assert in_prog_resp.json()["error"]["code"] == "WEBHOOK_IN_PROGRESS"
+
+
+def test_m02_stale_cancelled_intent_capture_and_sibling_cancellation(
+    client: TestClient,
+    db_session: Session,
+    login_as: Callable[..., AuthenticatedSession],
+) -> None:
+    """M-02: Cancelled intent cannot revive on late success/fail; winning success cancels sibs."""
+    _, _, var, _ = _seed_variant(db_session, sku="M02-STALE", price_cents=6000, on_hand=10)
+    session = login_as(client, role="customer", email="m02-buyer@example.com")
+    placed = _place_checkout_order(client, variant_id=var.id, quantity=1, session=session)
+    order_id = uuid.UUID(placed["order"]["id"])
+    order_number = placed["order"]["order_number"]
+    total_cents = placed["order"]["total_cents"]
+    pi1_id = placed["payment_intent"]["provider_intent_id"]
+
+    # Create pi2 -> supersedes/cancels pi1 to CANCELLED
+    pi2_resp = client.post(
+        "/api/v1/payments/intents",
+        json={"order_number": order_number},
+        headers=_csrf_headers(session, extra={"Idempotency-Key": uuid.uuid4().hex}),
+    )
+    assert pi2_resp.status_code == 201
+    pi2_id = pi2_resp.json()["payment_intent"]["provider_intent_id"]
+
+    # Seed an extra open PROCESSING sibling pi3 to verify payment_intent.succeeded cancels it too
+    pi3 = PaymentIntent(
+        order_id=order_id,
+        provider=SANDBOX_PROVIDER,
+        provider_intent_id=f"pi_sandbox_sib_{uuid.uuid4().hex[:12]}",
+        idempotency_key=uuid.uuid4().hex.ljust(64, "a")[:64],
+        request_fingerprint=uuid.uuid4().hex.ljust(64, "b")[:64],
+        amount_cents=total_cents,
+        currency="USD",
+        status="PROCESSING",
+    )
+    db_session.add(pi3)
+    db_session.commit()
+
+    # 1. payment_intent.failed on CANCELLED pi1 must NOT overwrite order.payment_status to FAILED
+    st_stale_fail, _ = _post_signed_webhook(
+        client,
+        event_type="payment_intent.failed",
+        provider_intent_id=pi1_id,
+        order_number=order_number,
+        amount_cents=total_cents,
+        failure_code="stale_fail",
+        failure_message="Delayed failure",
+    )
+    assert st_stale_fail == 200
+    db_session.expire_all()
+    db_order = db_session.get(Order, order_id)
+    db_pi1 = db_session.scalar(
+        select(PaymentIntent).where(PaymentIntent.provider_intent_id == pi1_id)
+    )
+    assert db_order is not None and db_order.payment_status == "REQUIRES_PAYMENT"
+    assert db_pi1 is not None and db_pi1.status == "CANCELLED"
+
+    # 2. payment_intent.succeeded on CANCELLED pi1 must NOT revive pi1 or mark order PAID
+    st_stale_ok, _ = _post_signed_webhook(
+        client,
+        event_type="payment_intent.succeeded",
+        provider_intent_id=pi1_id,
+        order_number=order_number,
+        amount_cents=total_cents,
+    )
+    assert st_stale_ok == 200
+    db_session.expire_all()
+    db_session.refresh(db_order)
+    db_session.refresh(db_pi1)
+    assert (db_order.status, db_order.payment_status) == ("PENDING_PAYMENT", "REQUIRES_PAYMENT")
+    assert db_pi1.status == "REFUND_PENDING"
+    stale_req = db_session.scalar(
+        select(PaymentRefundRequest).where(PaymentRefundRequest.payment_intent_id == db_pi1.id)
+    )
+    assert stale_req is not None
+    assert stale_req.status == "PENDING"
+    assert stale_req.trigger_source == "STALE_INTENT_CAPTURE"
+    assert (
+        db_session.scalar(
+            select(OrderEvent).where(
+                OrderEvent.order_id == order_id,
+                OrderEvent.event_type == "STALE_INTENT_PAYMENT_REFUND_PENDING",
+            )
+        )
+        is not None
+    )
+
+    # 3. Winning payment_intent.succeeded on pi2 marks order PAID and cancels open sibling pi3
+    st_pi2_ok, _ = _post_signed_webhook(
+        client,
+        event_type="payment_intent.succeeded",
+        provider_intent_id=pi2_id,
+        order_number=order_number,
+        amount_cents=total_cents,
+    )
+    assert st_pi2_ok == 200
+    db_session.expire_all()
+    db_session.refresh(db_order)
+    db_session.refresh(pi3)
+    assert (db_order.status, db_order.payment_status) == ("CONFIRMED", "PAID")
+    assert pi3.status == "CANCELLED"
+
+
+def test_sec_rem_p1_01_persist_webhook_unexpected_failure_preserves_terminal_or_active(
+    db_session: Session,
+) -> None:
+    """SEC-REM-P1-01: _persist_webhook_unexpected_failure never downgrades PROCESSED/PROCESSING."""
+    for initial_status in ("PROCESSED", "PROCESSING"):
+        event_id = f"evt_sec01_{initial_status.lower()}_{uuid.uuid4().hex[:8]}"
+        row = PaymentWebhookEvent(
+            provider=SANDBOX_PROVIDER,
+            provider_event_id=event_id,
+            event_type="payment_intent.succeeded",
+            signature_verified=True,
+            payload_json={"event_id": event_id},
+            status=initial_status,
+            processed_at=datetime.now(UTC) if initial_status == "PROCESSED" else None,
+            error_message=None,
+        )
+        db_session.add(row)
+        db_session.commit()
+
+        payload = WebhookPayload(
+            event_id=event_id,
+            event_type="payment_intent.succeeded",
+            data=WebhookEventData(
+                provider_intent_id="pi_sec_01",
+                order_number="ORD-SEC-01",
+                amount_cents=1000,
+                currency="USD",
+            ),
+        )
+        # Exercise both lookup by row.id and fallback lookup by (provider, provider_event_id)
+        for lookup_id in (row.id, uuid.uuid4()):
+            _persist_webhook_unexpected_failure(
+                db_session,
+                webhook_event_id=lookup_id,
+                provider=SANDBOX_PROVIDER,
+                payload=payload,
+                error_message="Unexpected transient error",
+                now=datetime.now(UTC),
+            )
+            db_session.expire_all()
+            reloaded = db_session.get(PaymentWebhookEvent, row.id)
+            assert reloaded is not None
+            assert reloaded.status == initial_status
+            assert reloaded.error_message is None
+
+
+def test_sec_rem_p1_02_charge_refunded_does_not_close_order_while_sibling_refund_pending(
+    client: TestClient,
+    db_session: Session,
+    login_as: Callable[..., AuthenticatedSession],
+) -> None:
+    """SEC-REM-P1-02: charge.refunded keeps order open while a sibling intent is REFUND_PENDING."""
+    _, _, var, _ = _seed_variant(db_session, sku="SEC02-SIB", price_cents=5000, on_hand=10)
+    session = login_as(client, role="customer", email="sec02-buyer@example.com")
+    placed = _place_checkout_order(client, variant_id=var.id, quantity=1, session=session)
+    order_id = uuid.UUID(placed["order"]["id"])
+    order_number = placed["order"]["order_number"]
+    total_cents = placed["order"]["total_cents"]
+    pi1_id = placed["payment_intent"]["provider_intent_id"]
+
+    # Fail pi1 -> retry with pi2 -> win on pi2 -> duplicate success on pi1 (REFUND_PENDING)
+    assert (
+        _post_signed_webhook(
+            client,
+            event_type="payment_intent.failed",
+            provider_intent_id=pi1_id,
+            order_number=order_number,
+            amount_cents=total_cents,
+        )[0]
+        == 200
+    )
+    pi2_resp = client.post(
+        "/api/v1/payments/intents",
+        json={"order_number": order_number},
+        headers=_csrf_headers(session, extra={"Idempotency-Key": uuid.uuid4().hex}),
+    )
+    assert pi2_resp.status_code == 201
+    pi2_id = pi2_resp.json()["payment_intent"]["provider_intent_id"]
+
+    assert (
+        _post_signed_webhook(
+            client,
+            event_type="payment_intent.succeeded",
+            provider_intent_id=pi2_id,
+            order_number=order_number,
+            amount_cents=total_cents,
+        )[0]
+        == 200
+    )
+    assert (
+        _post_signed_webhook(
+            client,
+            event_type="payment_intent.succeeded",
+            provider_intent_id=pi1_id,
+            order_number=order_number,
+            amount_cents=total_cents,
+        )[0]
+        == 200
+    )
+
+    # Now pi2 receives charge.refunded while duplicate sibling pi1 is still REFUND_PENDING
+    st_win_ref, _ = _post_signed_webhook(
+        client,
+        event_type="charge.refunded",
+        provider_intent_id=pi2_id,
+        order_number=order_number,
+        amount_cents=total_cents,
+    )
+    assert st_win_ref == 200
+
+    db_session.expire_all()
+    db_order = db_session.get(Order, order_id)
+    db_pi1 = db_session.scalar(
+        select(PaymentIntent).where(PaymentIntent.provider_intent_id == pi1_id)
+    )
+    db_pi2 = db_session.scalar(
+        select(PaymentIntent).where(PaymentIntent.provider_intent_id == pi2_id)
+    )
+    assert db_order is not None
+    assert db_order.status == "CONFIRMED"
+    assert db_order.payment_status == "PAID"
+    assert db_pi1 is not None and db_pi1.status == "REFUND_PENDING"
+    assert db_pi2 is not None and db_pi2.status == "REFUNDED"
+    assert (
+        db_session.scalar(
+            select(OrderEvent).where(
+                OrderEvent.order_id == order_id,
+                OrderEvent.event_type == "PAYMENT_INTENT_REFUNDED",
+            )
+        )
+        is not None
+    )
+
+
 @pytest.mark.skipif(
     not os.environ.get("TEST_DATABASE_URL"),
     reason="Live PostgreSQL TEST_DATABASE_URL not set",
@@ -1955,6 +2485,177 @@ def test_live_postgresql_be003_checkout_and_webhook_concurrency() -> None:
                 ).all()
             )
             assert len(wh_rows) == 1 and wh_rows[0].status == "PROCESSED"
+
+        # ------------------------------------------------------------------
+        # 5. H-06: 6 concurrent guest checkouts from same IP -> strictly 3x 201 + 3x 429
+        # ------------------------------------------------------------------
+        v_gcap = None
+        with pg_session_factory() as setup_db:
+            prod_gcap = setup_db.scalar(select(Product).limit(1))
+            assert prod_gcap is not None
+            v_gcap = ProductVariant(
+                product_id=prod_gcap.id,
+                sku=f"PG-GCAP-{uuid.uuid4().hex[:6]}",
+                title="PG Guest Cap Variant",
+                attributes_json={"cap": "guest"},
+                price_cents=2500,
+                currency="USD",
+                is_active=True,
+            )
+            setup_db.add(v_gcap)
+            setup_db.flush()
+            setup_db.add(
+                InventoryStock(
+                    variant_id=v_gcap.id,
+                    on_hand=30,
+                    reserved=0,
+                    low_stock_threshold=2,
+                    version=1,
+                )
+            )
+            setup_db.commit()
+
+        guest_cart_tokens: list[str] = []
+        for _ in range(6):
+            with TestClient(pg_app) as gc_setup:
+                add_r = gc_setup.post(
+                    "/api/v1/cart/items",
+                    json={"variant_id": str(v_gcap.id), "quantity": 1},
+                    headers={"Origin": DEFAULT_ORIGIN},
+                )
+                assert add_r.status_code == 200, add_r.text
+                tok = gc_setup.cookies.get(GUEST_CART_COOKIE_NAME)
+                assert tok is not None
+                guest_cart_tokens.append(tok)
+
+        pg_app.state.rate_limiter.reset()
+        pg_app.state.guest_pending_tracker.reset()
+        gcap_barrier = threading.Barrier(6)
+
+        def _guest_cap_worker(idx_and_tok: tuple[int, str]) -> tuple[int, dict[str, Any]]:
+            idx, cart_tok = idx_and_tok
+            with TestClient(pg_app) as w_client:
+                w_client.cookies.set(GUEST_CART_COOKIE_NAME, cart_tok)
+                gcap_barrier.wait(timeout=15)
+                resp = w_client.post(
+                    "/api/v1/checkout/orders",
+                    json=_checkout_payload(email=f"pg-gcap-{idx}@example.com"),
+                    headers={
+                        "Origin": DEFAULT_ORIGIN,
+                        "Idempotency-Key": uuid.uuid4().hex,
+                    },
+                )
+                return int(resp.status_code), dict(resp.json())
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            gcap_results = [
+                f.result(timeout=20)
+                for f in [
+                    pool.submit(_guest_cap_worker, (idx, tok))
+                    for idx, tok in enumerate(guest_cart_tokens)
+                ]
+            ]
+
+        gcap_statuses = [st for st, _ in gcap_results]
+        assert gcap_statuses.count(201) == 3, gcap_results
+        assert gcap_statuses.count(429) == 3, gcap_results
+        for st, body in gcap_results:
+            if st == 429:
+                assert body["error"]["code"] == "RATE_LIMIT_EXCEEDED"
+
+        with pg_session_factory() as verify_db:
+            from app.core.security import hash_token
+
+            expected_ip_hash = hash_token("guest_ip:testclient")
+            gcap_orders = list(
+                verify_db.scalars(
+                    select(Order).where(
+                        Order.guest_client_key_hash == expected_ip_hash,
+                        Order.status == "PENDING_PAYMENT",
+                    )
+                ).all()
+            )
+            assert len(gcap_orders) == 3
+
+        # ------------------------------------------------------------------
+        # 6. M-06: Concurrent expired-reservation reclaim vs payment_intent.succeeded webhook
+        # ------------------------------------------------------------------
+        m06_user = _seed_pg_user_and_cart(
+            pg_app,
+            pg_session_factory,
+            email=f"m06-{uuid.uuid4().hex[:6]}@example.com",
+            password_hash=pw_hash,
+            cart_items=[(v_gcap.id, 1)],
+        )
+        with TestClient(pg_app) as m06_client:
+            m06_client.cookies.set(SESSION_COOKIE_NAME, m06_user[1])
+            m06_client.cookies.set(CSRF_COOKIE_NAME, m06_user[2])
+            m06_co = m06_client.post(
+                "/api/v1/checkout/orders",
+                json=_checkout_payload(email="m06-race@example.com"),
+                headers={
+                    "Origin": DEFAULT_ORIGIN,
+                    "X-CSRF-Token": m06_user[3],
+                    "Idempotency-Key": uuid.uuid4().hex,
+                },
+            )
+            assert m06_co.status_code == 201, m06_co.text
+            m06_body = m06_co.json()
+            m06_order_id = uuid.UUID(m06_body["order"]["id"])
+
+        with pg_session_factory() as exp_db:
+            m06_res = exp_db.scalar(
+                select(InventoryReservation).where(
+                    InventoryReservation.order_id == m06_order_id
+                )
+            )
+            assert m06_res is not None
+            m06_res.expires_at = datetime.now(UTC) - timedelta(minutes=10)
+            exp_db.commit()
+
+        m06_raw, m06_hdrs = _signed_webhook_request(
+            event_id=f"evt_m06_{uuid.uuid4().hex[:10]}",
+            event_type="payment_intent.succeeded",
+            provider_intent_id=m06_body["payment_intent"]["provider_intent_id"],
+            order_number=m06_body["order"]["order_number"],
+            amount_cents=int(m06_body["order"]["total_cents"]),
+        )
+        m06_barrier = threading.Barrier(2)
+
+        def _m06_reclaim_worker() -> int:
+            with pg_session_factory() as r_db:
+                m06_barrier.wait(timeout=15)
+                reclaimed = reclaim_expired_reservations_for_variants(r_db, [v_gcap.id])
+                r_db.commit()
+                return reclaimed
+
+        def _m06_webhook_worker() -> int:
+            with TestClient(pg_app) as w_client:
+                m06_barrier.wait(timeout=15)
+                resp = w_client.post(
+                    f"/api/v1/webhooks/payments/{SANDBOX_PROVIDER}",
+                    content=m06_raw,
+                    headers=m06_hdrs,
+                )
+                return int(resp.status_code)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f_rec = pool.submit(_m06_reclaim_worker)
+            f_wh = pool.submit(_m06_webhook_worker)
+            _rec_cnt = f_rec.result(timeout=20)
+            wh_status = f_wh.result(timeout=20)
+
+        assert wh_status == 200
+        with pg_session_factory() as verify_db:
+            m06_final = verify_db.get(Order, m06_order_id)
+            assert m06_final is not None
+            # Must end consistently in CONFIRMED/PAID (never both CANCELLED and PAID)
+            assert m06_final.status == "CONFIRMED"
+            assert m06_final.payment_status == "PAID"
+            m06_final_res = verify_db.scalar(
+                select(InventoryReservation).where(InventoryReservation.order_id == m06_order_id)
+            )
+            assert m06_final_res is not None and m06_final_res.status == "COMMITTED"
     finally:
         pg_engine.dispose()
         get_engine(pg_settings).dispose()

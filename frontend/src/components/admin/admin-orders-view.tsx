@@ -58,6 +58,7 @@ const PAYMENT_STATUSES: PaymentStatus[] = [
   "REQUIRES_PAYMENT",
   "PAID",
   "FAILED",
+  "REFUND_PENDING",
   "REFUNDED",
   "CANCELLED",
 ];

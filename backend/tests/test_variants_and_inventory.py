@@ -27,6 +27,7 @@ from tests.conftest import (
     AuthenticatedSession,
 )
 
+from app import cli as app_cli
 from app.core.audit import REDACTED_VALUE, record_audit_log, sanitize_audit_payload
 from app.core.config import Settings
 from app.core.database import clear_db_caches, create_engine_from_url, get_engine
@@ -43,7 +44,10 @@ from app.models.inventory import (
 )
 from app.models.order import Order, OrderEvent, OrderItem
 from app.models.payment import PaymentIntent
-from app.modules.inventory.service import reclaim_expired_reservations_for_variants
+from app.modules.inventory.service import (
+    reclaim_all_expired_reservations,
+    reclaim_expired_reservations_for_variants,
+)
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 
@@ -911,7 +915,7 @@ def test_admin_inventory_list_search_escaping_stock_status_and_pagination(
     p2 = client.get("/api/v1/admin/inventory", params={"page": 2, "page_size": 2}).json()
     assert p2["total"] == 4 and p2["has_next"] is False and len(p2["items"]) == 2
 
-    # Single-joined-query budget check (1 auth query + count + rows <= 3 total, zero N+1)
+    # Single-joined-query budget check (1 auth + 1 reclaim probe + count + rows <= 4, zero N+1)
     engine = db_session.get_bind()
     executed_sql: list[str] = []
 
@@ -932,7 +936,7 @@ def test_admin_inventory_list_search_escaping_stock_status_and_pagination(
     finally:
         event.remove(engine, "before_cursor_execute", _capture_sql)
     assert budget_resp.status_code == 200
-    assert len(executed_sql) <= 3
+    assert len(executed_sql) <= 4
     inventory_queries = [sql for sql in executed_sql if "inventory_stocks" in sql]
     assert len(inventory_queries) <= 2
 
@@ -1275,6 +1279,187 @@ def test_audit_log_defensive_sanitization_and_secret_redaction(
     assert cursor["lvl"] == "[TRUNCATED]"
 
 
+def test_h01_m06_reclaim_all_and_cli_sweeper_bounded_batches(
+    db_session: Session,
+    test_settings: Settings,
+) -> None:
+    """H-01/M-06: reclaim_all_expired_reservations & CLI sweeper reclaim >100 orders safely."""
+    # Seed 105 expired PENDING_PAYMENT orders and 1 active order
+    _, prod, var, stock = _seed_catalog_for_inventory(
+        db_session,
+        sku="SWEEP-105",
+        on_hand=120,
+        reserved=106,
+        low_stock_threshold=5,
+    )
+    past_exp = datetime.now(UTC) - timedelta(minutes=15)
+    future_exp = datetime.now(UTC) + timedelta(minutes=15)
+
+    for idx in range(105):
+        _seed_order_with_reservations(
+            db_session,
+            order_number=f"ORD-SWEEP-{idx:03d}",
+            items=[(prod, var, 1, past_exp)],
+        )
+
+    active_order, _, _ = _seed_order_with_reservations(
+        db_session,
+        order_number="ORD-SWEEP-ACTIVE",
+        items=[(prod, var, 1, future_exp)],
+    )
+
+    # Bounded batch cap: 2 batches * 25 = 50 reclaimed
+    first_reclaimed = reclaim_all_expired_reservations(
+        db_session,
+        batch_size=25,
+        max_batches=2,
+    )
+    assert first_reclaimed == 50
+
+    # Add an M-06 order with SUCCEEDED PaymentIntent before CLI sweeper finishes remaining 55
+    paid_race_order, _, paid_race_intent = _seed_order_with_reservations(
+        db_session,
+        order_number="ORD-SWEEP-PAID-RACE",
+        items=[(prod, var, 1, past_exp)],
+    )
+    assert paid_race_intent is not None
+    paid_race_intent.status = "SUCCEEDED"
+    db_session.refresh(stock)
+    stock.reserved += 1
+    db_session.commit()
+
+    cli_factory = sessionmaker(
+        bind=db_session.get_bind(),
+        autoflush=False,
+        autocommit=False,
+        expire_on_commit=False,
+    )
+
+    # CLI validation rejects invalid batch bounds
+    assert (
+        app_cli.main(
+            ["sweep-expired-reservations", "--batch-size", "0", "--max-batches", "5"],
+            session_factory=cli_factory,
+            settings=test_settings,
+        )
+        == 1
+    )
+
+    # CLI sweeper finishes remaining 55 expired orders cleanly
+    rc = app_cli.main(
+        ["sweep-expired-reservations", "--batch-size", "25", "--max-batches", "10"],
+        session_factory=cli_factory,
+        settings=test_settings,
+    )
+    assert rc == 0
+
+    db_session.expire_all()
+    db_session.refresh(stock)
+    assert stock.on_hand == 120
+    assert stock.reserved == 2  # only active_order (1) + paid_race_order (1) remain reserved
+
+    reloaded_active = db_session.get(Order, active_order.id)
+    assert reloaded_active is not None and reloaded_active.status == "PENDING_PAYMENT"
+
+    # M-06: Order with SUCCEEDED PaymentIntent must NOT be cancelled by sweeper
+    reloaded_paid_race = db_session.get(Order, paid_race_order.id)
+    assert reloaded_paid_race is not None and reloaded_paid_race.status == "PENDING_PAYMENT"
+
+
+def test_h01_storefront_and_admin_inventory_reclaim_last_unit_expired_reservations(
+    client: TestClient,
+    db_session: Session,
+    login_as: Callable[..., AuthenticatedSession],
+) -> None:
+    """H-01: Storefront catalog & admin inventory endpoints reclaim expired last-unit holds."""
+    _, prod_list, var_list, stock_list = _seed_catalog_for_inventory(
+        db_session,
+        sku="LAST-LIST",
+        product_title="Last Unit List",
+        on_hand=1,
+        reserved=1,
+        low_stock_threshold=1,
+    )
+    _, prod_detail, var_detail, stock_detail = _seed_catalog_for_inventory(
+        db_session,
+        sku="LAST-DETAIL",
+        product_title="Last Unit Detail",
+        on_hand=1,
+        reserved=1,
+        low_stock_threshold=1,
+    )
+    _, prod_adj, var_adj, stock_adj = _seed_catalog_for_inventory(
+        db_session,
+        sku="LAST-ADJ",
+        product_title="Last Unit Adjust",
+        on_hand=1,
+        reserved=1,
+        low_stock_threshold=1,
+    )
+    past_exp = datetime.now(UTC) - timedelta(minutes=10)
+
+    o_list, _, _ = _seed_order_with_reservations(
+        db_session, order_number="ORD-H01-LIST", items=[(prod_list, var_list, 1, past_exp)]
+    )
+    o_detail, _, _ = _seed_order_with_reservations(
+        db_session, order_number="ORD-H01-DETAIL", items=[(prod_detail, var_detail, 1, past_exp)]
+    )
+    o_adj, _, _ = _seed_order_with_reservations(
+        db_session, order_number="ORD-H01-ADJ", items=[(prod_adj, var_adj, 1, past_exp)]
+    )
+
+    # 1. Storefront GET /products/{slug} reclaims expired hold for that product
+    detail_resp = client.get(f"/api/v1/products/{prod_detail.slug}")
+    assert detail_resp.status_code == 200, detail_resp.text
+    detail_var = detail_resp.json()["variants"][0]
+    assert detail_var["in_stock"] is True
+    assert detail_var["available_quantity"] == 1
+
+    # 2. Storefront GET /products?in_stock=true reclaims remaining expired holds (incl. prod_list)
+    list_resp = client.get("/api/v1/products", params={"in_stock": "true", "page_size": 50})
+    assert list_resp.status_code == 200, list_resp.text
+    returned_slugs = {item["slug"] for item in list_resp.json()["items"]}
+    assert {prod_list.slug, prod_detail.slug, prod_adj.slug} <= returned_slugs
+
+    # Seed another expired reservation for admin inventory list + adjust tests
+    stock_adj.reserved = 1
+    db_session.commit()
+    o_adj2, _, _ = _seed_order_with_reservations(
+        db_session, order_number="ORD-H01-ADJ2", items=[(prod_adj, var_adj, 1, past_exp)]
+    )
+    o_list2, _, _ = _seed_order_with_reservations(
+        db_session, order_number="ORD-H01-LIST2", items=[(prod_list, var_list, 1, past_exp)]
+    )
+    stock_list.reserved = 1
+    db_session.commit()
+
+    staff_session = login_as(client, role="staff")
+
+    # 3. GET /admin/inventory reclaims expired reservations before listing
+    inv_resp = client.get("/api/v1/admin/inventory", params={"q": "LAST-LIST"})
+    assert inv_resp.status_code == 200
+    assert inv_resp.json()["items"][0]["reserved"] == 0
+    assert inv_resp.json()["items"][0]["available_quantity"] == 1
+
+    # 4. POST /admin/inventory/{id}/adjust reclaims expired hold first so -1 succeeds (not 409)
+    adj_resp = client.post(
+        f"/api/v1/admin/inventory/{var_adj.id}/adjust",
+        json={"delta_on_hand": -1, "note": "Damaged unit write-off"},
+        headers=_csrf_headers(staff_session),
+    )
+    assert adj_resp.status_code == 200, adj_resp.text
+    assert adj_resp.json()["on_hand"] == 0
+    assert adj_resp.json()["reserved"] == 0
+
+    db_session.expire_all()
+    for oid in (o_list.id, o_detail.id, o_adj.id, o_adj2.id, o_list2.id):
+        reloaded = db_session.get(Order, oid)
+        assert reloaded is not None and reloaded.status == "CANCELLED"
+        assert reloaded.cancellation_reason == "RESERVATION_EXPIRED"
+    db_session.refresh(stock_detail)
+    assert stock_detail.reserved == 0
+
+
 def _run_alembic(*args: str, database_url: str) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["DATABASE_URL"] = database_url
@@ -1537,13 +1722,6 @@ def test_live_postgresql_be002_constraints_jsonb_partial_index_and_concurrency()
             )
             setup_db.commit()
 
-            # Seed expired PENDING_PAYMENT order holding reserved=5 on variant
-            expired_order, _, _ = _seed_order_with_reservations(
-                setup_db,
-                order_number=f"ORD-PG-{uuid.uuid4().hex[:8]}",
-                items=[(prod, variant, 5, datetime.now(UTC) - timedelta(minutes=5))],
-            )
-
         # Login admin and verify PATCH image replacement, INET audit log, and HTTP edge cases
         with TestClient(pg_app, client=("203.0.113.42", 50000)) as pg_client:
             login_resp = pg_client.post(
@@ -1602,6 +1780,14 @@ def test_live_postgresql_be002_constraints_jsonb_partial_index_and_concurrency()
             assert inet_row[2] == "PRODUCT_UPDATED"
             assert inet_row[3] == "product"
 
+        # Seed expired PENDING_PAYMENT order after GET /products checks (which reclaim holds)
+        with pg_session_factory() as exp_seed_db:
+            expired_order, _, _ = _seed_order_with_reservations(
+                exp_seed_db,
+                order_number=f"ORD-PG-{uuid.uuid4().hex[:8]}",
+                items=[(prod, variant, 5, datetime.now(UTC) - timedelta(minutes=5))],
+            )
+
         # 4. Verify FOR UPDATE SKIP LOCKED skips locked order cleanly without blocking
         with pg_session_factory() as lock_db, pg_session_factory() as probe_db:
             locked = lock_db.scalar(
@@ -1643,7 +1829,8 @@ def test_live_postgresql_be002_constraints_jsonb_partial_index_and_concurrency()
             reclaim_counts = [f.result(timeout=20) for f in reclaim_futures]
 
         assert adjust_statuses == [200, 200, 200, 200]
-        assert sum(reclaim_counts) == 1
+        # Either _reclaim_worker or _adjust_worker (H-01) reclaims expired_order exactly once
+        assert sum(reclaim_counts) in (0, 1)
 
         with pg_session_factory() as verify_db:
             final_stock = verify_db.get(InventoryStock, variant.id)
@@ -1779,7 +1966,7 @@ def test_live_postgresql_be002_constraints_jsonb_partial_index_and_concurrency()
             mv_adjust_statuses = [f.result(timeout=20) for f in a_futs]
 
         assert mv_adjust_statuses == [200, 200, 200]
-        assert sum(mv_reclaimed_counts) == 3
+        assert 0 <= sum(mv_reclaimed_counts) <= 3
 
         with pg_session_factory() as mv_verify_db:
             for exp_o, exp_res_list in (

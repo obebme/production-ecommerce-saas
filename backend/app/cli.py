@@ -23,6 +23,7 @@ from app.models.inventory import InventoryLedgerEntry, InventoryStock, ProductVa
 from app.modules.catalog.schemas import strip_single_line
 from app.modules.identity.dependencies import revoke_all_user_sessions
 from app.modules.identity.schemas import UserRole
+from app.modules.inventory.service import reclaim_all_expired_reservations
 
 _EMAIL_ADAPTER = TypeAdapter(EmailStr)
 _VALID_ROLES: tuple[UserRole, ...] = ("customer", "staff", "admin")
@@ -637,6 +638,27 @@ def _cmd_seed_demo(
     return 0
 
 
+def _cmd_sweep_expired_reservations(
+    args: argparse.Namespace,
+    *,
+    session_factory: sessionmaker[Session] | None,
+    settings: Settings | None,
+) -> int:
+    if args.batch_size < 1 or args.max_batches < 1:
+        print("Error: --batch-size and --max-batches must be >= 1.", file=sys.stderr)
+        return 1
+    active_settings = settings or get_settings()
+    factory = session_factory or get_session_factory(active_settings)
+    with factory() as db:
+        reclaimed = reclaim_all_expired_reservations(
+            db,
+            batch_size=args.batch_size,
+            max_batches=args.max_batches,
+        )
+    print(f"Reclaimed {reclaimed} expired reservation order(s).")
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m app.cli",
@@ -684,6 +706,23 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Also create demo admin/staff/customer accounts in non-production environments.",
     )
 
+    sweep_parser = subparsers.add_parser(
+        "sweep-expired-reservations",
+        help="Reclaim expired PENDING_PAYMENT inventory reservations in bounded batches.",
+    )
+    sweep_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=100,
+        help="Maximum expired orders to reclaim per transaction batch (default: 100).",
+    )
+    sweep_parser.add_argument(
+        "--max-batches",
+        type=int,
+        default=20,
+        help="Maximum batches to execute in one run (default: 20).",
+    )
+
     return parser
 
 
@@ -701,6 +740,10 @@ def main(
         return _cmd_create_user(args, session_factory=session_factory, settings=settings)
     if args.command == "seed-demo":
         return _cmd_seed_demo(args, session_factory=session_factory, settings=settings)
+    if args.command == "sweep-expired-reservations":
+        return _cmd_sweep_expired_reservations(
+            args, session_factory=session_factory, settings=settings
+        )
 
     parser.print_help(sys.stderr)
     return 1

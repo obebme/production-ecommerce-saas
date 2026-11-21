@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol, cast
 
 from sqlalchemy import ColumnElement, func, or_, select
@@ -22,7 +22,7 @@ from app.core.pagination import PaginatedResponse, PaginationParams, escape_like
 from app.models.identity import AuditLog, User
 from app.models.inventory import InventoryLedgerEntry, InventoryReservation, InventoryStock
 from app.models.order import Order, OrderEvent, OrderItem
-from app.models.payment import PaymentIntent
+from app.models.payment import PaymentIntent, PaymentRefundRequest
 from app.modules.admin.schemas import (
     AdminOrderDetailDTO,
     AdminOrderListItemDTO,
@@ -38,6 +38,10 @@ from app.modules.admin.schemas import (
 from app.modules.catalog.schemas import ensure_utc_datetime, strip_single_line
 from app.modules.identity.dependencies import revoke_all_user_sessions
 from app.modules.identity.schemas import UserRole
+from app.modules.inventory.service import (
+    reclaim_expired_if_any,
+    reclaim_expired_reservations_for_variants,
+)
 from app.modules.orders.schemas import (
     AddressDTO,
     FulfillmentStatus,
@@ -265,6 +269,7 @@ def list_admin_orders(
     """List paginated orders across all customers/guests with filters and zero N+1 counts."""
     norm_from, norm_to = _validate_optional_ts_range(from_ts, to_ts)
     cleaned_q = _normalize_optional_search_q(q)
+    reclaim_expired_if_any(db)
 
     filters: list[ColumnElement[bool]] = []
     if status is not None:
@@ -366,6 +371,20 @@ def get_admin_order_detail(db: Session, order_number: str) -> AdminOrderDetailDT
             code="ORDER_NOT_FOUND",
             message="Order not found.",
         )
+    if order.status == "PENDING_PAYMENT":
+        variant_ids = list(
+            db.scalars(
+                select(InventoryReservation.variant_id)
+                .where(
+                    InventoryReservation.order_id == order.id,
+                    InventoryReservation.status == "ACTIVE",
+                )
+                .distinct()
+            ).all()
+        )
+        if variant_ids and reclaim_expired_reservations_for_variants(db, variant_ids) > 0:
+            db.commit()
+            db.refresh(order)
     return _build_admin_order_detail_dto(db, order)
 
 
@@ -617,6 +636,131 @@ def cancel_admin_order(
     return _build_admin_order_detail_dto(db, locked_order)
 
 
+def _apply_refund_restock_if_needed(
+    db: Session,
+    *,
+    locked_order: Order,
+    qty_by_variant: dict[uuid.UUID, int],
+    stocks_by_variant: dict[uuid.UUID, InventoryStock],
+    actor_user_id: uuid.UUID,
+    reason: str | None,
+) -> None:
+    if not qty_by_variant:
+        return
+    already_restocked = db.scalar(
+        select(InventoryLedgerEntry.id)
+        .where(
+            InventoryLedgerEntry.order_id == locked_order.id,
+            InventoryLedgerEntry.reason == "RETURN_RESTOCK",
+        )
+        .limit(1)
+    )
+    if already_restocked is not None:
+        return
+
+    base_note = (
+        f"Order {locked_order.order_number} refund restock: {reason}"
+        if reason
+        else f"Order {locked_order.order_number} refund restock"
+    )[:255]
+
+    for variant_id in sorted(qty_by_variant.keys()):
+        qty = qty_by_variant[variant_id]
+        stock = stocks_by_variant.get(variant_id)
+        if stock is None:
+            continue
+        stock.on_hand += qty
+        stock.version += 1
+        db.add(
+            InventoryLedgerEntry(
+                variant_id=variant_id,
+                order_id=locked_order.id,
+                actor_user_id=actor_user_id,
+                reason="RETURN_RESTOCK",
+                delta_on_hand=qty,
+                delta_reserved=0,
+                on_hand_after=stock.on_hand,
+                reserved_after=stock.reserved,
+                note=base_note,
+            )
+        )
+
+
+def _mark_admin_refund_failed(
+    db: Session,
+    *,
+    order_id: uuid.UUID,
+    failed_req_id: uuid.UUID,
+    failed_intent_id: uuid.UUID,
+    revert_to_succeeded_ids: set[uuid.UUID],
+    succeeded_results: list[tuple[uuid.UUID, uuid.UUID, str]],
+    error_message: str,
+) -> None:
+    """Short TX recording gateway refund failure and reverting only pre-SUCCEEDED intents."""
+    now = datetime.now(UTC)
+    locked_order, intents = lock_order_and_payment_intents_for_update(
+        db,
+        order_id=order_id,
+    )
+    intents_by_id = {intent.id: intent for intent in intents}
+    req_ids = [failed_req_id, *(req_id for req_id, _, _ in succeeded_results)]
+    reqs = list(
+        db.scalars(
+            select(PaymentRefundRequest)
+            .where(PaymentRefundRequest.id.in_(req_ids))
+            .order_by(PaymentRefundRequest.id.asc())
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).all()
+    )
+    reqs_by_id = {req.id: req for req in reqs}
+
+    for req_id, intent_id, refund_ref in succeeded_results:
+        req = reqs_by_id.get(req_id)
+        if req is not None:
+            req.status = "SUCCEEDED"
+            req.provider_refund_id = refund_ref
+            req.error_message = None
+            req.completed_at = now
+        intent = intents_by_id.get(intent_id)
+        if intent is not None:
+            intent.status = "REFUNDED"
+
+    failed_req = reqs_by_id.get(failed_req_id)
+    if failed_req is not None:
+        failed_req.status = "FAILED"
+        failed_req.error_message = error_message[:500]
+        failed_req.completed_at = now
+
+    failed_intent = intents_by_id.get(failed_intent_id)
+    if (
+        failed_intent is not None
+        and failed_intent.id in revert_to_succeeded_ids
+        and failed_intent.status == "REFUND_PENDING"
+    ):
+        failed_intent.status = "SUCCEEDED"
+
+    for intent in intents:
+        if intent.id in revert_to_succeeded_ids and intent.status == "REFUND_PENDING":
+            intent.status = "SUCCEEDED"
+
+    has_any_refunded = any(intent.status == "REFUNDED" for intent in intents)
+    has_unreverted_admin_pending = any(
+        intent.status == "REFUND_PENDING" and intent.id not in revert_to_succeeded_ids
+        for intent in intents
+    )
+    if has_any_refunded:
+        locked_order.payment_status = "REFUND_PENDING"
+    elif any(intent.status == "SUCCEEDED" for intent in intents):
+        locked_order.payment_status = "PAID"
+    elif has_unreverted_admin_pending:
+        locked_order.payment_status = "REFUND_PENDING"
+    elif locked_order.payment_status == "REFUND_PENDING":
+        locked_order.payment_status = "PAID"
+
+    db.commit()
+
+
 def refund_admin_order(
     db: Session,
     *,
@@ -626,7 +770,7 @@ def refund_admin_order(
     ip_address: str | None,
     refund_gateway: PaymentRefundGateway = _DEFAULT_REFUND_GATEWAY,
 ) -> AdminOrderDetailDTO:
-    """Refund a paid order (admin only) with optional RETURN_RESTOCK in canonical lock order."""
+    """Refund a paid order in 3 phases with zero DB row locks held during gateway calls."""
     valid_order_number = normalize_valid_order_number_or_none(order_number)
     if valid_order_number is None:
         raise NotFoundError(
@@ -641,12 +785,11 @@ def refund_admin_order(
             message="Order not found.",
         )
 
-    # Universal lock order: PaymentIntent -> Order -> InventoryReservation -> InventoryStock.
+    # Phase A (short locked TX): validate state, cancel open sibling intents, stage REFUND_PENDING.
     locked_order, intents = lock_order_and_payment_intents_for_update(
         db,
         order_id=order_id,
     )
-
     reservations = list(
         db.scalars(
             select(InventoryReservation)
@@ -684,9 +827,17 @@ def refund_admin_order(
             ).all()
         }
 
+    refundable_intents = [
+        intent for intent in intents if intent.status in ("SUCCEEDED", "REFUND_PENDING")
+    ]
+    has_refunded_intent = any(intent.status == "REFUNDED" for intent in intents)
+    can_recover_refund_pending = (
+        locked_order.payment_status == "REFUND_PENDING"
+        and (bool(refundable_intents) or has_refunded_intent)
+    )
     if (
-        locked_order.payment_status != "PAID"
-        or locked_order.status not in ("CONFIRMED", "PROCESSING", "SHIPPED", "COMPLETED")
+        locked_order.status not in ("CONFIRMED", "PROCESSING", "SHIPPED", "COMPLETED")
+        or (locked_order.payment_status != "PAID" and not can_recover_refund_pending)
     ):
         db.rollback()
         raise ConflictError(
@@ -717,21 +868,234 @@ def refund_admin_order(
     prior_status = locked_order.status
     prior_fulfillment = locked_order.fulfillment_status
 
-    refund_references: list[str] = []
     for intent in intents:
+        if intent.status in ("REQUIRES_ACTION", "PROCESSING"):
+            intent.status = "CANCELLED"
+
+    existing_reqs: dict[uuid.UUID, PaymentRefundRequest] = {}
+    if refundable_intents:
+        existing_reqs = {
+            req.payment_intent_id: req
+            for req in db.scalars(
+                select(PaymentRefundRequest)
+                .where(
+                    PaymentRefundRequest.payment_intent_id.in_(
+                        [intent.id for intent in refundable_intents]
+                    )
+                )
+                .order_by(PaymentRefundRequest.id.asc())
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            ).all()
+        }
+
+    now_phase_a = datetime.now(UTC)
+    already_succeeded_refs: list[str] = []
+    revert_to_succeeded_ids: set[uuid.UUID] = set()
+    pending_targets: list[tuple[uuid.UUID, uuid.UUID, str, str, int, str]] = []
+    for intent in refundable_intents:
+        req = existing_reqs.get(intent.id)
+        if (
+            intent.status == "REFUND_PENDING"
+            and req is not None
+            and req.trigger_source != "ADMIN_REFUND"
+        ):
+            # Do not hijack automated duplicate/stale refund requests into admin refund flow.
+            continue
+        if req is not None and req.status == "SUCCEEDED":
+            intent.status = "REFUNDED"
+            if req.provider_refund_id:
+                already_succeeded_refs.append(req.provider_refund_id)
+            continue
         if intent.status == "SUCCEEDED":
-            refund_ref = refund_gateway.refund_intent(
+            revert_to_succeeded_ids.add(intent.id)
+        if req is None:
+            req = PaymentRefundRequest(
+                order_id=locked_order.id,
+                payment_intent_id=intent.id,
                 provider=intent.provider,
                 provider_intent_id=intent.provider_intent_id,
                 amount_cents=intent.amount_cents,
                 currency=intent.currency,
                 reason=payload.reason,
+                trigger_source="ADMIN_REFUND",
+                status="PENDING",
+                actor_user_id=actor_user_id,
+                restock_on_confirm=payload.restock,
             )
-            refund_references.append(refund_ref)
-            intent.status = "REFUNDED"
-        elif intent.status in ("REQUIRES_ACTION", "PROCESSING"):
-            intent.status = "REFUNDED"
+            db.add(req)
+            db.flush()
+        elif req.status == "FAILED":
+            req.status = "PENDING"
+            req.error_message = None
+            req.completed_at = None
+            req.reason = payload.reason
+            req.trigger_source = "ADMIN_REFUND"
+            req.actor_user_id = actor_user_id
+            req.restock_on_confirm = payload.restock
+            req.updated_at = now_phase_a
+        else:
+            # status == "PENDING": guard against concurrent duplicate ADMIN_REFUND calls.
+            if (
+                req.trigger_source == "ADMIN_REFUND"
+                and (now_phase_a - ensure_utc_datetime(req.updated_at)) < timedelta(seconds=60)
+            ):
+                db.rollback()
+                raise ConflictError(
+                    code="REFUND_IN_PROGRESS",
+                    message="A refund request is already in progress for this order.",
+                )
+            req.reason = payload.reason
+            req.trigger_source = "ADMIN_REFUND"
+            req.actor_user_id = actor_user_id
+            req.restock_on_confirm = payload.restock
+            req.updated_at = now_phase_a
+        intent.status = "REFUND_PENDING"
+        pending_targets.append(
+            (
+                req.id,
+                intent.id,
+                intent.provider,
+                intent.provider_intent_id,
+                intent.amount_cents,
+                intent.currency,
+            )
+        )
 
+    if not pending_targets:
+        locked_order.status = "REFUNDED"
+        locked_order.payment_status = "REFUNDED"
+        locked_order.fulfillment_status = (
+            "RETURNED"
+            if prior_status in ("SHIPPED", "COMPLETED")
+            or prior_fulfillment in ("SHIPPED", "DELIVERED")
+            else "CANCELLED"
+        )
+        if payload.restock:
+            _apply_refund_restock_if_needed(
+                db,
+                locked_order=locked_order,
+                qty_by_variant=qty_by_variant,
+                stocks_by_variant=stocks_by_variant,
+                actor_user_id=actor_user_id,
+                reason=payload.reason,
+            )
+        append_order_event(
+            db,
+            order_id=locked_order.id,
+            actor_user_id=actor_user_id,
+            event_type="ORDER_REFUNDED",
+            from_status=prior_status,
+            to_status="REFUNDED",
+            metadata_json={
+                "reason": payload.reason,
+                "restock": payload.restock,
+                "refund_references": already_succeeded_refs,
+            },
+        )
+        record_audit_log(
+            db,
+            actor_user_id=actor_user_id,
+            action="ORDER_REFUNDED",
+            resource_type="order",
+            resource_id=locked_order.order_number,
+            before_state=before_state,
+            after_state={
+                **_order_audit_snapshot(locked_order),
+                "reason": payload.reason,
+                "restock": payload.restock,
+                "refund_references": already_succeeded_refs,
+            },
+            ip_address=ip_address,
+        )
+        db.commit()
+        db.refresh(locked_order)
+        return _build_admin_order_detail_dto(db, locked_order)
+
+    locked_order.payment_status = "REFUND_PENDING"
+    db.commit()
+
+    # Phase B (no DB locks held): execute external/sandbox refund gateway calls.
+    refund_results: list[tuple[uuid.UUID, uuid.UUID, str]] = []
+    for req_id, intent_id, provider, provider_intent_id, amount_cents, currency in pending_targets:
+        try:
+            refund_ref = refund_gateway.refund_intent(
+                provider=provider,
+                provider_intent_id=provider_intent_id,
+                amount_cents=amount_cents,
+                currency=currency,
+                reason=payload.reason,
+            )
+        except Exception as exc:
+            _mark_admin_refund_failed(
+                db,
+                order_id=order_id,
+                failed_req_id=req_id,
+                failed_intent_id=intent_id,
+                revert_to_succeeded_ids=revert_to_succeeded_ids,
+                succeeded_results=refund_results,
+                error_message=str(exc) or exc.__class__.__name__,
+            )
+            raise
+        refund_results.append((req_id, intent_id, refund_ref))
+
+    # Phase C (short locked TX): finalize refund records, order status, restock, and audit trail.
+    now = datetime.now(UTC)
+    locked_order, intents = lock_order_and_payment_intents_for_update(
+        db,
+        order_id=order_id,
+    )
+    stocks_by_variant = {}
+    if sorted_variant_ids:
+        stocks_by_variant = {
+            stock.variant_id: stock
+            for stock in db.scalars(
+                select(InventoryStock)
+                .where(InventoryStock.variant_id.in_(sorted_variant_ids))
+                .order_by(InventoryStock.variant_id.asc())
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            ).all()
+        }
+
+    intents_by_id = {intent.id: intent for intent in intents}
+    reqs_by_id = {
+        req.id: req
+        for req in db.scalars(
+            select(PaymentRefundRequest)
+            .where(PaymentRefundRequest.id.in_([req_id for req_id, _, _ in refund_results]))
+            .order_by(PaymentRefundRequest.id.asc())
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).all()
+    }
+    refund_references: list[str] = list(already_succeeded_refs)
+    for req_id, intent_id, refund_ref in refund_results:
+        refund_references.append(refund_ref)
+        req_row = reqs_by_id.get(req_id)
+        if req_row is not None:
+            req_row.status = "SUCCEEDED"
+            req_row.provider_refund_id = refund_ref
+            req_row.error_message = None
+            req_row.completed_at = req_row.completed_at or now
+        intent_row = intents_by_id.get(intent_id)
+        if intent_row is not None:
+            intent_row.status = "REFUNDED"
+
+    if payload.restock:
+        for variant_id in sorted(qty_by_variant.keys()):
+            qty = qty_by_variant[variant_id]
+            stock = stocks_by_variant.get(variant_id)
+            if stock is not None and stock.on_hand + qty > _INT32_MAX:
+                db.rollback()
+                raise ValidationAppError(
+                    code="INVALID_STOCK_ADJUSTMENT",
+                    message="Restocked on_hand quantity exceeds maximum supported limit.",
+                )
+
+    was_already_refunded = (
+        locked_order.status == "REFUNDED" and locked_order.payment_status == "REFUNDED"
+    )
     locked_order.status = "REFUNDED"
     locked_order.payment_status = "REFUNDED"
     locked_order.fulfillment_status = (
@@ -741,62 +1105,46 @@ def refund_admin_order(
         else "CANCELLED"
     )
 
-    if payload.restock:
-        base_note = (
-            f"Order {locked_order.order_number} refund restock: {payload.reason}"
-            if payload.reason
-            else f"Order {locked_order.order_number} refund restock"
-        )[:255]
-
-        for variant_id in sorted(qty_by_variant.keys()):
-            qty = qty_by_variant[variant_id]
-            stock = stocks_by_variant.get(variant_id)
-            if stock is None:
-                continue
-            stock.on_hand += qty
-            stock.version += 1
-            db.add(
-                InventoryLedgerEntry(
-                    variant_id=variant_id,
-                    order_id=locked_order.id,
-                    actor_user_id=actor_user_id,
-                    reason="RETURN_RESTOCK",
-                    delta_on_hand=qty,
-                    delta_reserved=0,
-                    on_hand_after=stock.on_hand,
-                    reserved_after=stock.reserved,
-                    note=base_note,
-                )
+    if not was_already_refunded:
+        if payload.restock:
+            _apply_refund_restock_if_needed(
+                db,
+                locked_order=locked_order,
+                qty_by_variant=qty_by_variant,
+                stocks_by_variant=stocks_by_variant,
+                actor_user_id=actor_user_id,
+                reason=payload.reason,
             )
+        append_order_event(
+            db,
+            order_id=locked_order.id,
+            actor_user_id=actor_user_id,
+            event_type="ORDER_REFUNDED",
+            from_status=prior_status,
+            to_status="REFUNDED",
+            metadata_json={
+                "reason": payload.reason,
+                "restock": payload.restock,
+                "refund_references": refund_references,
+            },
+            now=now,
+        )
+        record_audit_log(
+            db,
+            actor_user_id=actor_user_id,
+            action="ORDER_REFUNDED",
+            resource_type="order",
+            resource_id=locked_order.order_number,
+            before_state=before_state,
+            after_state={
+                **_order_audit_snapshot(locked_order),
+                "reason": payload.reason,
+                "restock": payload.restock,
+                "refund_references": refund_references,
+            },
+            ip_address=ip_address,
+        )
 
-    append_order_event(
-        db,
-        order_id=locked_order.id,
-        actor_user_id=actor_user_id,
-        event_type="ORDER_REFUNDED",
-        from_status=prior_status,
-        to_status="REFUNDED",
-        metadata_json={
-            "reason": payload.reason,
-            "restock": payload.restock,
-            "refund_references": refund_references,
-        },
-    )
-    record_audit_log(
-        db,
-        actor_user_id=actor_user_id,
-        action="ORDER_REFUNDED",
-        resource_type="order",
-        resource_id=locked_order.order_number,
-        before_state=before_state,
-        after_state={
-            **_order_audit_snapshot(locked_order),
-            "reason": payload.reason,
-            "restock": payload.restock,
-            "refund_references": refund_references,
-        },
-        ip_address=ip_address,
-    )
     db.commit()
     db.refresh(locked_order)
     return _build_admin_order_detail_dto(db, locked_order)

@@ -7,7 +7,6 @@ import "./globals.css";
 import { ThemeProvider } from "@/components/shared/theme-provider";
 import { ToastProvider } from "@/components/ui/toast";
 import { AuthProvider } from "@/providers/auth-provider";
-import { CartProvider } from "@/providers/cart-provider";
 
 export const metadata: Metadata = {
   title: {
@@ -28,9 +27,7 @@ export default function RootLayout({
       <body className="min-h-screen bg-background font-sans text-foreground antialiased">
         <ThemeProvider>
           <ToastProvider>
-            <AuthProvider>
-              <CartProvider>{children}</CartProvider>
-            </AuthProvider>
+            <AuthProvider>{children}</AuthProvider>
           </ToastProvider>
         </ThemeProvider>
       </body>

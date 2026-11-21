@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
 from app.core.audit import record_audit_log
+from app.core.database import ts_lt
 from app.core.errors import ConflictError, NotFoundError, ValidationAppError
 from app.core.order_events import append_order_event
 from app.core.pagination import PaginatedResponse, PaginationParams, escape_like_query
@@ -72,40 +73,49 @@ def _stock_snapshot(stock: InventoryStock) -> dict[str, Any]:
     }
 
 
-def reclaim_expired_reservations_for_variants(
+def _reclaim_expired_reservations_batch(
     db: Session,
-    variant_ids: Sequence[uuid.UUID],
     *,
+    variant_ids: Sequence[uuid.UUID] | None,
+    batch_size: int = 100,
     now: datetime | None = None,
 ) -> int:
-    """Atomically expire overdue PENDING_PAYMENT orders touching any of variant_ids.
+    """Atomically expire a bounded batch of overdue PENDING_PAYMENT orders.
 
-    Strictly obeys the global canonical lock hierarchy across the entire batch:
+    Supports both variant-scoped reclamation (variant_ids != None) and store-wide
+    reclamation (variant_ids is None). Strictly obeys the global canonical lock hierarchy:
       1. payment_intents (ORDER BY id ASC FOR UPDATE SKIP LOCKED)
       2. orders (ORDER BY id ASC FOR UPDATE SKIP LOCKED)
       3. inventory_reservations (ORDER BY id ASC FOR UPDATE)
       4. inventory_stocks (ORDER BY variant_id ASC FOR UPDATE)
     """
-    unique_variant_ids = sorted(set(variant_ids))
-    if not unique_variant_ids:
-        return 0
+    unique_variant_ids: list[uuid.UUID] | None = None
+    if variant_ids is not None:
+        unique_variant_ids = sorted(set(variant_ids))
+        if not unique_variant_ids:
+            return 0
 
     current_time = ensure_utc_datetime(now) if now is not None else datetime.now(UTC)
 
     # 1. Select expired candidate order IDs without taking row locks.
+    candidate_stmt = (
+        select(InventoryReservation.order_id)
+        .join(Order, Order.id == InventoryReservation.order_id)
+        .where(
+            InventoryReservation.status == "ACTIVE",
+            ts_lt(db, InventoryReservation.expires_at, current_time),
+            Order.status == "PENDING_PAYMENT",
+        )
+    )
+    if unique_variant_ids is not None:
+        candidate_stmt = candidate_stmt.where(
+            InventoryReservation.variant_id.in_(unique_variant_ids)
+        )
     candidate_order_ids = list(
         db.scalars(
-            select(InventoryReservation.order_id)
-            .join(Order, Order.id == InventoryReservation.order_id)
-            .where(
-                InventoryReservation.variant_id.in_(unique_variant_ids),
-                InventoryReservation.status == "ACTIVE",
-                InventoryReservation.expires_at < current_time,
-                Order.status == "PENDING_PAYMENT",
-            )
-            .distinct()
+            candidate_stmt.distinct()
             .order_by(InventoryReservation.order_id.asc())
-            .limit(100)
+            .limit(batch_size)
         ).all()
     )
     if not candidate_order_ids:
@@ -165,6 +175,44 @@ def reclaim_expired_reservations_for_variants(
         for order in locked_orders
         if order.payment_status != "PAID"
     }
+    if not eligible_orders:
+        return 0
+
+    # 3b. Re-query and lock PaymentIntent rows for locked orders (FOR UPDATE SKIP LOCKED)
+    # to detect any concurrently committed PaymentIntent created between steps 2 and 3.
+    locked_order_ids = sorted(eligible_orders.keys())
+    rechecked_counts: dict[uuid.UUID, int] = {oid: 0 for oid in locked_order_ids}
+    for oid, cnt in db.execute(
+        select(PaymentIntent.order_id, func.count(PaymentIntent.id))
+        .where(PaymentIntent.order_id.in_(locked_order_ids))
+        .group_by(PaymentIntent.order_id)
+    ).all():
+        rechecked_counts[oid] = int(cnt)
+
+    relocked_intents = list(
+        db.scalars(
+            select(PaymentIntent)
+            .where(PaymentIntent.order_id.in_(locked_order_ids))
+            .order_by(PaymentIntent.id.asc())
+            .with_for_update(skip_locked=True)
+            .execution_options(populate_existing=True)
+        ).all()
+    )
+    relocked_by_order: dict[uuid.UUID, list[PaymentIntent]] = {
+        oid: [] for oid in locked_order_ids
+    }
+    for intent in relocked_intents:
+        relocked_by_order[intent.order_id].append(intent)
+
+    for oid in locked_order_ids:
+        order_intents = relocked_by_order[oid]
+        if len(order_intents) < rechecked_counts[oid] or any(
+            intent.status == "SUCCEEDED" for intent in order_intents
+        ):
+            eligible_orders.pop(oid, None)
+        else:
+            intents_by_order[oid] = order_intents
+
     if not eligible_orders:
         return 0
 
@@ -273,6 +321,82 @@ def reclaim_expired_reservations_for_variants(
 
     db.flush()
     return reclaimed_orders
+
+
+def reclaim_expired_reservations_for_variants(
+    db: Session,
+    variant_ids: Sequence[uuid.UUID],
+    *,
+    now: datetime | None = None,
+) -> int:
+    """Atomically expire overdue PENDING_PAYMENT orders touching any of variant_ids."""
+    return _reclaim_expired_reservations_batch(
+        db,
+        variant_ids=variant_ids,
+        batch_size=100,
+        now=now,
+    )
+
+
+def reclaim_all_expired_reservations(
+    db: Session,
+    *,
+    batch_size: int = 100,
+    max_batches: int = 20,
+    now: datetime | None = None,
+    auto_commit: bool = True,
+) -> int:
+    """Reclaim expired PENDING_PAYMENT orders store-wide in bounded batches."""
+    total_reclaimed = 0
+    for _ in range(max_batches):
+        reclaimed = _reclaim_expired_reservations_batch(
+            db,
+            variant_ids=None,
+            batch_size=batch_size,
+            now=now,
+        )
+        if reclaimed <= 0:
+            if auto_commit:
+                db.rollback()
+            break
+        total_reclaimed += reclaimed
+        if auto_commit:
+            db.commit()
+    return total_reclaimed
+
+
+def reclaim_expired_if_any(
+    db: Session,
+    *,
+    batch_size: int = 100,
+    now: datetime | None = None,
+) -> int:
+    """Check cheaply for expired reservations and reclaim one bounded batch if any exist."""
+    current_time = ensure_utc_datetime(now) if now is not None else datetime.now(UTC)
+    has_expired = db.scalar(
+        select(1)
+        .select_from(InventoryReservation)
+        .join(Order, Order.id == InventoryReservation.order_id)
+        .where(
+            InventoryReservation.status == "ACTIVE",
+            ts_lt(db, InventoryReservation.expires_at, current_time),
+            Order.status == "PENDING_PAYMENT",
+        )
+        .limit(1)
+    )
+    if has_expired is None:
+        return 0
+    reclaimed = _reclaim_expired_reservations_batch(
+        db,
+        variant_ids=None,
+        batch_size=batch_size,
+        now=current_time,
+    )
+    if reclaimed > 0:
+        db.commit()
+    else:
+        db.rollback()
+    return reclaimed
 
 
 def get_variant_availability(db: Session, variant_id: uuid.UUID) -> VariantAvailabilityDTO:
@@ -581,6 +705,7 @@ def list_admin_inventory(
     pagination: PaginationParams,
 ) -> PaginatedResponse[AdminInventoryItemDTO]:
     """List paginated inventory rows via a single joined query (zero N+1)."""
+    reclaim_expired_if_any(db)
     cleaned_q = normalize_search_query(q)
     available_expr = case(
         (
@@ -688,6 +813,9 @@ def adjust_inventory_stock(
             message="Stock adjustment delta_on_hand must be non-zero.",
             details={"variant_id": str(variant_id), "delta_on_hand": 0},
         )
+
+    if reclaim_expired_reservations_for_variants(db, [variant_id]) > 0:
+        db.commit()
 
     stock = db.scalar(
         select(InventoryStock)

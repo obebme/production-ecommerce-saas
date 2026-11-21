@@ -1,4 +1,4 @@
-"""Payments and webhook deduplication ORM models: payment_intents, payment_webhook_events."""
+"""Payments, refunds, and webhook deduplication ORM models."""
 
 from __future__ import annotations
 
@@ -61,6 +61,9 @@ class PaymentIntent(Base):
     )
 
     order: Mapped[Order] = relationship(back_populates="payment_intents")
+    refund_request: Mapped[PaymentRefundRequest | None] = relationship(
+        back_populates="payment_intent", uselist=False
+    )
 
     __table_args__ = (
         UniqueConstraint(
@@ -70,7 +73,8 @@ class PaymentIntent(Base):
         CheckConstraint("amount_cents >= 0", name="amount_non_negative"),
         CheckConstraint(
             "status IN ("
-            "'REQUIRES_ACTION','PROCESSING','SUCCEEDED','FAILED','CANCELLED','REFUNDED'"
+            "'REQUIRES_ACTION','PROCESSING','SUCCEEDED','FAILED',"
+            "'CANCELLED','REFUND_PENDING','REFUNDED'"
             ")",
             name="status_valid",
         ),
@@ -118,4 +122,68 @@ class PaymentWebhookEvent(Base):
             "provider_event_id",
             unique=True,
         ),
+    )
+
+
+class PaymentRefundRequest(Base):
+    """Durable refund intent record tracking pending/completed/failed provider refunds."""
+
+    __tablename__ = "payment_refund_requests"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUIDType,
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=text("gen_random_uuid()"),
+    )
+    order_id: Mapped[uuid.UUID] = mapped_column(
+        UUIDType, ForeignKey("orders.id", ondelete="CASCADE"), nullable=False
+    )
+    payment_intent_id: Mapped[uuid.UUID] = mapped_column(
+        UUIDType, ForeignKey("payment_intents.id", ondelete="CASCADE"), nullable=False
+    )
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider_intent_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    amount_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    currency: Mapped[str] = mapped_column(CHAR3, nullable=False)
+    reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    trigger_source: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False)
+    provider_refund_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    actor_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUIDType, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    restock_on_confirm: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    error_message: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMPTZ, nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMPTZ, nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
+
+    order: Mapped[Order] = relationship(back_populates="refund_requests")
+    payment_intent: Mapped[PaymentIntent] = relationship(back_populates="refund_request")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "payment_intent_id",
+            name="uq_payment_refund_requests_payment_intent_id",
+        ),
+        CheckConstraint("amount_cents >= 0", name="amount_non_negative"),
+        CheckConstraint(
+            "trigger_source IN ("
+            "'ADMIN_REFUND','DUPLICATE_PAYMENT','LATE_PAYMENT_OUT_OF_STOCK',"
+            "'LATE_PAYMENT_AFTER_CANCEL','STALE_INTENT_CAPTURE'"
+            ")",
+            name="trigger_source_valid",
+        ),
+        CheckConstraint(
+            "status IN ('PENDING','SUCCEEDED','FAILED')",
+            name="status_valid",
+        ),
+        Index("idx_refund_requests_status_created", "status", created_at.asc()),
     )

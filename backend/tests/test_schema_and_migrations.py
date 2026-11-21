@@ -1,4 +1,4 @@
-"""Tests for ORM schema metadata parity (17 tables, checks, partial/unique indexes) and Alembic."""
+"""Tests for ORM schema metadata parity (18 tables, checks, partial/unique indexes) and Alembic."""
 
 from __future__ import annotations
 
@@ -8,10 +8,10 @@ import sys
 from pathlib import Path
 
 import pytest
-from sqlalchemy import CheckConstraint, UniqueConstraint
+from sqlalchemy import CheckConstraint, UniqueConstraint, inspect
 
-import app.models  # noqa: F401 — populate Base.metadata with all 17 ORM models
-from app.core.database import Base
+import app.models  # noqa: F401 — populate Base.metadata with all 18 ORM models
+from app.core.database import Base, create_engine_from_url
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 
@@ -34,6 +34,7 @@ EXPECTED_TABLES: frozenset[str] = frozenset(
         "order_events",
         "payment_intents",
         "payment_webhook_events",
+        "payment_refund_requests",
     }
 )
 
@@ -87,6 +88,11 @@ EXPECTED_CHECK_CONSTRAINTS: dict[str, set[str]] = {
         "ck_payment_intents_status_valid",
     },
     "payment_webhook_events": {"ck_payment_webhook_events_status_valid"},
+    "payment_refund_requests": {
+        "ck_payment_refund_requests_amount_non_negative",
+        "ck_payment_refund_requests_trigger_source_valid",
+        "ck_payment_refund_requests_status_valid",
+    },
 }
 
 EXPECTED_UNIQUE_CONSTRAINTS: dict[str, set[str]] = {
@@ -100,6 +106,7 @@ EXPECTED_UNIQUE_CONSTRAINTS: dict[str, set[str]] = {
         "uq_payment_intents_provider_intent_id",
         "uq_payment_intents_idempotency_key",
     },
+    "payment_refund_requests": {"uq_payment_refund_requests_payment_intent_id"},
 }
 
 EXPECTED_UNIQUE_INDEXES: dict[str, set[str]] = {
@@ -115,9 +122,12 @@ EXPECTED_UNIQUE_INDEXES: dict[str, set[str]] = {
 EXPECTED_PARTIAL_INDEXES: dict[str, set[str]] = {
     "auth_sessions": {"idx_auth_sessions_user_active"},
     "product_images": {"uq_product_primary_image"},
-    "inventory_reservations": {"idx_reservations_active_expiry"},
+    "inventory_reservations": {
+        "idx_reservations_active_expiry",
+        "idx_reservations_variant_active_expiry",
+    },
     "carts": {"uq_active_user_cart"},
-    "orders": {"idx_orders_user_placed"},
+    "orders": {"idx_orders_user_placed", "idx_orders_guest_pending_client"},
     "payment_intents": {"uq_active_succeeded_intent_per_order"},
 }
 
@@ -136,7 +146,7 @@ def _run_alembic(*args: str, database_url: str = "") -> subprocess.CompletedProc
 
 
 def test_orm_metadata_contains_all_17_tables_checks_and_indexes() -> None:
-    """Base.metadata must expose all 17 tables, CHECK constraints, unique and partial indexes."""
+    """Base.metadata must expose all 18 tables, CHECK constraints, unique and partial indexes."""
     tables = Base.metadata.tables
     assert set(tables.keys()) == EXPECTED_TABLES
 
@@ -174,12 +184,12 @@ def test_orm_metadata_contains_all_17_tables_checks_and_indexes() -> None:
 
 
 def test_alembic_single_head_and_offline_upgrade_downgrade_sql() -> None:
-    """Alembic has one head (0001_initial_schema) and compiles offline upgrade/downgrade SQL."""
+    """Alembic has one head (0002_phase1_commerce_integrity) and compiles offline SQL."""
     heads_res = _run_alembic("heads")
     assert heads_res.returncode == 0, heads_res.stderr
     head_lines = [line.strip() for line in heads_res.stdout.splitlines() if line.strip()]
     assert len(head_lines) == 1
-    assert head_lines[0].startswith("0001_initial_schema")
+    assert head_lines[0].startswith("0002_phase1_commerce_integrity")
 
     upgrade_res = _run_alembic("upgrade", "head", "--sql")
     assert upgrade_res.returncode == 0, upgrade_res.stderr
@@ -189,7 +199,7 @@ def test_alembic_single_head_and_offline_upgrade_downgrade_sql() -> None:
         for ck_name in expected_checks:
             assert f"CONSTRAINT {ck_name} CHECK" in upgrade_res.stdout
 
-    downgrade_res = _run_alembic("downgrade", "0001_initial_schema:base", "--sql")
+    downgrade_res = _run_alembic("downgrade", "0002_phase1_commerce_integrity:base", "--sql")
     assert downgrade_res.returncode == 0, downgrade_res.stderr
     for table_name in EXPECTED_TABLES:
         assert f"DROP TABLE {table_name}" in downgrade_res.stdout
@@ -200,10 +210,44 @@ def test_alembic_single_head_and_offline_upgrade_downgrade_sql() -> None:
     reason="Live PostgreSQL TEST_DATABASE_URL is not configured in this environment.",
 )
 def test_alembic_live_postgresql_upgrade_and_downgrade() -> None:
-    """Apply and rollback 0001_initial_schema against a live PostgreSQL database when configured."""
+    """Verify 0001 -> 0002 upgrade, downgrade to 0001, re-upgrade to head, and downgrade base."""
     test_db_url = os.environ["TEST_DATABASE_URL"]
-    up_res = _run_alembic("upgrade", "head", database_url=test_db_url)
-    assert up_res.returncode == 0, up_res.stderr
+    pg_engine = create_engine_from_url(test_db_url)
+    try:
+        up_res = _run_alembic("upgrade", "head", database_url=test_db_url)
+        assert up_res.returncode == 0, up_res.stderr
 
-    down_res = _run_alembic("downgrade", "base", database_url=test_db_url)
-    assert down_res.returncode == 0, down_res.stderr
+        insp_head = inspect(pg_engine)
+        assert set(insp_head.get_table_names()) >= EXPECTED_TABLES
+        assert "payment_refund_requests" in insp_head.get_table_names()
+        order_cols_head = {col["name"] for col in insp_head.get_columns("orders")}
+        assert "guest_client_key_hash" in order_cols_head
+        order_indexes_head = {idx["name"] for idx in insp_head.get_indexes("orders")}
+        assert "idx_orders_guest_pending_client" in order_indexes_head
+        res_indexes_head = {
+            idx["name"] for idx in insp_head.get_indexes("inventory_reservations")
+        }
+        assert "idx_reservations_variant_active_expiry" in res_indexes_head
+
+        # Downgrade 0002 -> 0001_initial_schema
+        down_0001 = _run_alembic("downgrade", "0001_initial_schema", database_url=test_db_url)
+        assert down_0001.returncode == 0, down_0001.stderr
+
+        insp_0001 = inspect(pg_engine)
+        assert "payment_refund_requests" not in insp_0001.get_table_names()
+        order_cols_0001 = {col["name"] for col in insp_0001.get_columns("orders")}
+        assert "guest_client_key_hash" not in order_cols_0001
+
+        # Re-upgrade 0001 -> head (0002_phase1_commerce_integrity)
+        reup_res = _run_alembic("upgrade", "head", database_url=test_db_url)
+        assert reup_res.returncode == 0, reup_res.stderr
+
+        insp_reup = inspect(pg_engine)
+        assert "payment_refund_requests" in insp_reup.get_table_names()
+        order_cols_reup = {col["name"] for col in insp_reup.get_columns("orders")}
+        assert "guest_client_key_hash" in order_cols_reup
+
+        down_res = _run_alembic("downgrade", "base", database_url=test_db_url)
+        assert down_res.returncode == 0, down_res.stderr
+    finally:
+        pg_engine.dispose()

@@ -1032,4 +1032,9 @@ describe("StorefrontHeader", () => {
     await screen.findByRole("navigation", { name: "Mobile navigation" });
     expect(screen.queryByRole("link", { name: "Admin Console" })).not.toBeInTheDocument();
   });
+
+  it("renders REFUND_PENDING StatusBadge with warning label", () => {
+    render(<StatusBadge domain="payment" value="REFUND_PENDING" />);
+    expect(screen.getByText("Refund Pending")).toBeInTheDocument();
+  });
 });

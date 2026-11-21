@@ -1,4 +1,4 @@
-"""SQLAlchemy ORM model registry exporting all 17 tables for Alembic discovery."""
+"""SQLAlchemy ORM model registry exporting all 18 tables for Alembic discovery."""
 
 from app.core.database import Base
 from app.models.cart import Cart, CartItem
@@ -11,7 +11,7 @@ from app.models.inventory import (
     ProductVariant,
 )
 from app.models.order import Order, OrderEvent, OrderItem
-from app.models.payment import PaymentIntent, PaymentWebhookEvent
+from app.models.payment import PaymentIntent, PaymentRefundRequest, PaymentWebhookEvent
 
 __all__ = [
     "AuditLog",
@@ -27,6 +27,7 @@ __all__ = [
     "OrderEvent",
     "OrderItem",
     "PaymentIntent",
+    "PaymentRefundRequest",
     "PaymentWebhookEvent",
     "Product",
     "ProductImage",

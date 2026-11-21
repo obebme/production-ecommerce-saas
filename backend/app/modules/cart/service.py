@@ -258,20 +258,46 @@ def get_cart(
     raw_guest_token: str | None,
     settings: Settings,
 ) -> tuple[CartDTO, str | None]:
-    """Return the caller's ACTIVE cart, lazily creating one if absent."""
+    """Return the caller's ACTIVE cart without creating a new Cart row on read."""
     now = datetime.now(UTC)
-    cart, new_guest_token, mutated = _get_or_create_caller_cart(
-        db,
-        user_id=user_id,
-        raw_guest_token=raw_guest_token,
-        now=now,
-    )
+    cart: Cart | None = None
+    mutated = False
 
-    # Persist lazy cart creation/abandonment before single-query projection.
+    if user_id is not None:
+        candidate = db.scalar(
+            select(Cart).where(Cart.user_id == user_id, Cart.status == "ACTIVE")
+        )
+        if candidate is not None and ensure_utc_datetime(candidate.expires_at) <= now:
+            candidate.status = "ABANDONED"
+            mutated = True
+        else:
+            cart = candidate
+    else:
+        cart, mutated = _resolve_active_guest_cart(
+            db,
+            raw_guest_token,
+            now=now,
+            lock=False,
+        )
+
     if mutated:
         db.commit()
 
-    return build_cart_dto(db, cart, settings, reclaim_expired=True), new_guest_token
+    if cart is None:
+        return (
+            CartDTO(
+                id=uuid.UUID(int=0),
+                currency="USD",
+                items=[],
+                item_count=0,
+                subtotal_cents=0,
+                estimated_shipping_cents=0,
+                estimated_total_cents=0,
+            ),
+            None,
+        )
+
+    return build_cart_dto(db, cart, settings, reclaim_expired=True), None
 
 
 def add_cart_item(

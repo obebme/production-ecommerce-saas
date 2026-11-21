@@ -161,6 +161,13 @@ class InventoryReservation(Base):
             postgresql_where=text("status = 'ACTIVE'"),
             sqlite_where=text("status = 'ACTIVE'"),
         ),
+        Index(
+            "idx_reservations_variant_active_expiry",
+            "variant_id",
+            "expires_at",
+            postgresql_where=text("status = 'ACTIVE'"),
+            sqlite_where=text("status = 'ACTIVE'"),
+        ),
     )
 
 

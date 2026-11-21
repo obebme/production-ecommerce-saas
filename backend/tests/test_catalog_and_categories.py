@@ -485,21 +485,21 @@ def test_public_products_list_and_detail_bounded_query_budget_no_n_plus_1(
     assert q_count_small <= 4
     assert q_count_large == q_count_small
 
-    # With category_slug adds at most 1 category-tree lookup query, still constant
+    # With category_slug adds at most 1 category-tree lookup query + 1 reclaim probe, still constant
     q_count_cat, cat_resp = _count_sql_queries(
         db_session,
         lambda: client.get("/api/v1/products", params={"category_slug": "audio", "page_size": 50}),
     )
     assert cat_resp.status_code == 200
-    assert q_count_cat <= 4
+    assert q_count_cat <= 5
 
-    # Detail endpoint runs in a single joined query
+    # Detail endpoint runs in 1 joined query + 1 variant-scoped reclaim check
     q_count_detail, detail_resp = _count_sql_queries(
         db_session,
         lambda: client.get("/api/v1/products/speaker-01"),
     )
     assert detail_resp.status_code == 200
-    assert q_count_detail == 1
+    assert q_count_detail == 2
 
 
 def test_public_product_detail_returns_active_variants_availability_and_404_when_hidden(
@@ -674,7 +674,7 @@ def test_public_and_admin_catalog_pagination_bounds_short_circuit_and_slug_valid
     assert bad_public_page.status_code == 422
     assert bad_public_page.json()["error"]["code"] == "VALIDATION_ERROR"
 
-    # offset >= total short-circuits after COUNT without querying rows
+    # offset >= total short-circuits after reclaim probe + COUNT without querying rows
     pub_queries, pub_page_50 = _count_sql_queries(
         db_session,
         lambda: client.get("/api/v1/products", params={"page": 50, "page_size": 20}),
@@ -687,7 +687,7 @@ def test_public_and_admin_catalog_pagination_bounds_short_circuit_and_slug_valid
         "page_size": 20,
         "has_next": False,
     }
-    assert pub_queries == 1
+    assert pub_queries == 2
 
     # Pre-query slug & category_slug validation rejects NUL/overlong slugs with 0 SQL queries
     nul_detail_queries, nul_detail = _count_sql_queries(
@@ -719,7 +719,7 @@ def test_public_and_admin_catalog_pagination_bounds_short_circuit_and_slug_valid
         "page_size": 20,
         "has_next": False,
     }
-    assert cat_nul_queries == 0
+    assert cat_nul_queries == 1
 
     # Admin products page bound & offset >= total short-circuit
     login_as(client, role="staff")

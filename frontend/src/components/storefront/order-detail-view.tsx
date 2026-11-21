@@ -63,6 +63,7 @@ const INTENT_STATUS_BADGE: Record<
   SUCCEEDED: { label: "Succeeded", variant: "success" },
   FAILED: { label: "Failed", variant: "destructive" },
   CANCELLED: { label: "Cancelled", variant: "secondary" },
+  REFUND_PENDING: { label: "Refund Pending", variant: "warning" },
   REFUNDED: { label: "Refunded", variant: "destructive" },
 };
 
@@ -78,6 +79,8 @@ const EVENT_LABELS: Record<string, string> = {
   PAYMENT_REFUNDED: "Payment Refunded",
   ORDER_REFUNDED: "Order Refunded",
   DUPLICATE_PAYMENT_REFUNDED: "Duplicate Payment Refunded",
+  DUPLICATE_PAYMENT_REFUND_PENDING: "Duplicate Payment Refund Pending",
+  STALE_INTENT_PAYMENT_REFUND_PENDING: "Stale Payment Refund Pending",
   PAYMENT_SUCCEEDED_OUT_OF_STOCK: "Payment Refunded (Stock Expired)",
   PAYMENT_SUCCEEDED_AFTER_CANCEL: "Payment Refunded (Order Cancelled)",
   PAYMENT_INTENT_REFUNDED: "Payment Intent Refunded",

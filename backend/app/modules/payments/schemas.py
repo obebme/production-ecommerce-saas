@@ -16,6 +16,7 @@ PaymentIntentStatus = Literal[
     "SUCCEEDED",
     "FAILED",
     "CANCELLED",
+    "REFUND_PENDING",
     "REFUNDED",
 ]
 WebhookEventType = Literal[

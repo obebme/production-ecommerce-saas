@@ -29,6 +29,7 @@ from app.modules.analytics.schemas import (
     TopProductsResponse,
 )
 from app.modules.catalog.service import compute_variant_availability
+from app.modules.inventory.service import reclaim_expired_if_any
 from app.modules.orders.schemas import OrderStatus
 
 MAX_ANALYTICS_SPAN_DAYS = 366
@@ -435,6 +436,7 @@ def get_inventory_health(
     pagination: PaginationParams,
 ) -> InventoryHealthResponse:
     """Return active SKU inventory health summary counts and paginated low/out-of-stock alerts."""
+    reclaim_expired_if_any(db)
     on_hand_expr = func.coalesce(InventoryStock.on_hand, 0)
     reserved_expr = func.coalesce(InventoryStock.reserved, 0)
     threshold_expr = func.coalesce(InventoryStock.low_stock_threshold, 5)

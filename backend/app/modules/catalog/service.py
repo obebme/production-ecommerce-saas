@@ -254,7 +254,10 @@ def list_public_products(
     pagination: PaginationParams,
 ) -> PaginatedResponse[ProductSummaryDTO]:
     """List paginated ACTIVE products in active categories with server-derived price/stock."""
+    from app.modules.inventory.service import reclaim_expired_if_any
+
     cleaned_q = normalize_search_query(q)
+    reclaim_expired_if_any(db)
 
     filters: list[ColumnElement[bool]] = [
         Product.status == "ACTIVE",
@@ -472,6 +475,50 @@ def get_public_product_by_slug(db: Session, slug: str) -> ProductDetailDTO:
             code="PRODUCT_NOT_FOUND",
             message="Product not found.",
         )
+
+    from app.modules.inventory.service import reclaim_expired_reservations_for_variants
+
+    active_variant_ids = [variant.id for variant in active_variants]
+    if reclaim_expired_reservations_for_variants(db, active_variant_ids) > 0:
+        db.commit()
+        product = (
+            db.execute(
+                select(Product)
+                .join(Category, Category.id == Product.category_id)
+                .where(
+                    Product.slug == normalized_slug,
+                    Product.status == "ACTIVE",
+                    Category.is_active.is_(True),
+                )
+                .options(
+                    joinedload(Product.category),
+                    joinedload(Product.images),
+                    joinedload(Product.variants).joinedload(ProductVariant.stock),
+                )
+                .execution_options(populate_existing=True)
+            )
+            .unique()
+            .scalar_one_or_none()
+        )
+        if product is None:
+            raise NotFoundError(
+                code="PRODUCT_NOT_FOUND",
+                message="Product not found.",
+            )
+        active_variants = sorted(
+            (variant for variant in product.variants if variant.is_active),
+            key=lambda variant: (
+                ensure_utc_datetime(variant.created_at),
+                variant.sku,
+                str(variant.id),
+            ),
+        )
+        if not active_variants:
+            raise NotFoundError(
+                code="PRODUCT_NOT_FOUND",
+                message="Product not found.",
+            )
+
     variant_dtos: list[ProductVariantPublicDTO] = []
     for variant in active_variants:
         _, _, available, _, in_stock, low_stock = compute_variant_availability(variant.stock)
