@@ -121,7 +121,7 @@ async def receive_payment_webhook(
     settings: Annotated[Settings, Depends(get_app_settings)],
 ) -> WebhookResponse:
     """Receive and verify provider webhooks strictly in 6-step security order."""
-    if provider not in service.ALLOWED_WEBHOOK_PROVIDERS:
+    if provider not in service.get_allowed_webhook_providers():
         raise NotFoundError(
             code="PROVIDER_NOT_FOUND",
             message="Payment provider not found.",

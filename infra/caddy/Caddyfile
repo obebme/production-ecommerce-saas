@@ -1,0 +1,45 @@
+# ==============================================================================
+# Atelier Commerce — Production Caddy v2 Reverse Proxy Configuration
+# ==============================================================================
+# Requirements:
+#   - `SITE_DOMAIN` must be set to the canonical HTTPS domain (e.g. shop.example.com).
+#   - Ports 80 and 443 are served by Caddy with automatic ACME TLS certificates.
+#   - If placing an external CDN or cloud load balancer in front of Caddy, configure
+#     `servers { trusted_proxies static <CDN_OR_LB_CIDRS> }` in a Caddy global block
+#     so Caddy preserves the upstream client IP when writing `X-Forwarded-For`.
+# ==============================================================================
+
+{$SITE_DOMAIN} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	# Block public access to Prometheus metrics at the edge.
+	# Internal scrapers should query http://api:8000/api/v1/metrics on the
+	# private Docker `internal` network with Authorization: Bearer <METRICS_BEARER_TOKEN>.
+	@metrics path /api/v1/metrics /api/v1/metrics/*
+	handle @metrics {
+		respond "Not Found" 404
+	}
+
+	# Proxy backend API requests to FastAPI (`api:8000`).
+	# Caddy appends/sets X-Forwarded-For, X-Forwarded-Proto, and X-Forwarded-Host;
+	# FastAPI's TRUSTED_PROXY_IPS validates Caddy's internal subnet peer IP.
+	handle /api/* {
+		reverse_proxy api:8000 {
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	# Proxy storefront and admin UI requests to Next.js (`web:3000`).
+	handle {
+		reverse_proxy web:3000 {
+			header_up X-Real-IP {remote_host}
+		}
+	}
+}

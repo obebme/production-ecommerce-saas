@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "improvement/**"]
   pull_request:
 
 permissions:
@@ -16,6 +16,7 @@ jobs:
   detect:
     name: Detect Workspace Modules
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       backend_present: ${{ steps.paths.outputs.backend_present }}
       frontend_present: ${{ steps.paths.outputs.frontend_present }}
@@ -41,10 +42,47 @@ jobs:
             echo "::notice::Skipping frontend-ci: frontend/package.json not present."
           fi
 
+  secret-scan:
+    name: Secret Scan (Gitleaks Git History)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout full Git history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install SHA-256 verified gitleaks v8.24.2
+        run: |
+          set -euo pipefail
+          GITLEAKS_VERSION="8.24.2"
+          TARBALL="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          BASE_URL="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          WORKDIR="$(mktemp -d)"
+          curl -fsSL "${BASE_URL}/${TARBALL}" -o "${WORKDIR}/${TARBALL}"
+          curl -fsSL "${BASE_URL}/gitleaks_${GITLEAKS_VERSION}_checksums.txt" -o "${WORKDIR}/checksums.txt"
+          (
+            cd "${WORKDIR}"
+            grep "  ${TARBALL}$" checksums.txt > target.sha256
+            if [ ! -s target.sha256 ]; then
+              echo "ERROR: Checksum entry for ${TARBALL} not found." >&2
+              exit 1
+            fi
+            sha256sum -c target.sha256
+            tar -xzf "${TARBALL}" gitleaks
+          )
+          install -m 0755 "${WORKDIR}/gitleaks" /usr/local/bin/gitleaks
+          rm -rf "${WORKDIR}"
+          gitleaks version
+
+      - name: Run Gitleaks across full Git history
+        run: gitleaks git -c .gitleaks.toml --log-opts="--all" --verbose --redact .
+
   ops-validate:
-    name: Validate Compose, Docker & Env Config
+    name: Validate Compose, Docker, Env & Container CVEs
     needs: detect
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -53,11 +91,13 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: backend/requirements.lock
 
       - name: Install PyYAML
         run: python -m pip install --no-cache-dir pyyaml
 
-      - name: Validate YAML syntax and .env.example coverage
+      - name: Validate YAML syntax, Compose topologies & .env.example coverage
         run: |
           python - <<'PY'
           import pathlib
@@ -65,22 +105,45 @@ jobs:
           import yaml
 
           # 1. YAML syntax checks
-          for rel_path in ("compose.yaml", ".github/workflows/ci.yml"):
+          for rel_path in ("compose.yaml", "compose.prod.yaml", ".github/workflows/ci.yml"):
               path = pathlib.Path(rel_path)
               data = yaml.safe_load(path.read_text(encoding="utf-8"))
               if not isinstance(data, dict):
                   raise SystemExit(f"Expected YAML mapping in {rel_path}")
               print(f"YAML valid: {rel_path}")
 
-          # 2. Verify only minimal baseline Compose services exist
+          # 2. Verify compose.yaml service set (dev baseline + optional redis profile)
           compose_data = yaml.safe_load(pathlib.Path("compose.yaml").read_text(encoding="utf-8"))
           services = set(compose_data.get("services", {}).keys())
-          expected_services = {"db", "migrate", "api", "web"}
+          expected_services = {"db", "migrate", "api", "web", "redis"}
           if services != expected_services:
               raise SystemExit(f"Compose services mismatch: got {sorted(services)}, expected {sorted(expected_services)}")
-          print(f"Compose baseline services verified: {sorted(services)}")
+          redis_profiles = compose_data["services"]["redis"].get("profiles", [])
+          if "redis" not in redis_profiles:
+              raise SystemExit("compose.yaml redis service must declare profiles: ['redis']")
+          print(f"compose.yaml services verified: {sorted(services)}")
 
-          # 3. Verify .env is not tracked in git
+          # 3. Verify compose.prod.yaml internal-network isolation & zero host DB/Redis/API/Web ports
+          prod_data = yaml.safe_load(pathlib.Path("compose.prod.yaml").read_text(encoding="utf-8"))
+          prod_services = prod_data.get("services", {})
+          expected_prod_services = {"db", "redis", "migrate", "api", "web", "caddy"}
+          if set(prod_services.keys()) != expected_prod_services:
+              raise SystemExit(
+                  f"compose.prod.yaml services mismatch: got {sorted(prod_services.keys())}, "
+                  f"expected {sorted(expected_prod_services)}"
+              )
+          prod_networks = prod_data.get("networks", {})
+          if not prod_networks.get("internal", {}).get("internal") is True:
+              raise SystemExit("compose.prod.yaml network 'internal' must set internal: true")
+          for internal_svc in ("db", "redis", "migrate", "api", "web"):
+              svc_cfg = prod_services[internal_svc]
+              if svc_cfg.get("ports"):
+                  raise SystemExit(f"compose.prod.yaml service '{internal_svc}' must NOT publish host ports")
+              if svc_cfg.get("networks") != ["internal"]:
+                  raise SystemExit(f"compose.prod.yaml service '{internal_svc}' must only attach to 'internal' network")
+          print("compose.prod.yaml internal-network isolation and zero host DB/Redis ports verified.")
+
+          # 4. Verify .env is not tracked in git
           tracked = subprocess.run(
               ["git", "ls-files", "--error-unmatch", ".env"],
               capture_output=True,
@@ -89,8 +152,12 @@ jobs:
           if tracked.returncode == 0:
               raise SystemExit("ERROR: .env file must never be tracked in Git")
 
-          # 4. Verify .env.example required variables and placeholder safety
+          # 5. Verify .env.example required variables and placeholder safety
           required_vars = [
+              "POSTGRES_HOST_PORT",
+              "API_HOST_PORT",
+              "WEB_HOST_PORT",
+              "REDIS_HOST_PORT",
               "POSTGRES_USER",
               "POSTGRES_PASSWORD",
               "POSTGRES_DB",
@@ -102,14 +169,25 @@ jobs:
               "GUEST_ORDER_HMAC_SECRET",
               "PAYMENT_WEBHOOK_SECRET",
               "PAYMENT_SANDBOX_MODE",
+              "PAYMENT_PROVIDER",
               "SESSION_TTL_HOURS",
               "RESERVATION_SWEEPER_INTERVAL_SECONDS",
+              "RATE_LIMIT_KEY_PREFIX",
+              "RATE_LIMIT_FAILURE_MODE",
+              "LOG_FORMAT",
+              "METRICS_ENABLED",
               "FREE_SHIPPING_THRESHOLD_CENTS",
               "STANDARD_SHIPPING_CENTS",
               "TAX_RATE_BPS",
               "NEXT_PUBLIC_API_BASE_URL",
               "NEXT_PUBLIC_SITE_URL",
               "INTERNAL_API_BASE_URL",
+          ]
+          optional_present_vars = [
+              "TRUSTED_PROXY_IPS",
+              "REDIS_URL",
+              "MIGRATION_DATABASE_URL",
+              "METRICS_BEARER_TOKEN",
           ]
           env_values = {}
           for raw_line in pathlib.Path(".env.example").read_text(encoding="utf-8").splitlines():
@@ -123,44 +201,87 @@ jobs:
           if missing:
               raise SystemExit(f"Missing or empty variables in .env.example: {missing}")
 
-          if "TRUSTED_PROXY_IPS" not in env_values:
-              raise SystemExit("Missing optional key TRUSTED_PROXY_IPS in .env.example")
+          missing_optional = [var for var in optional_present_vars if var not in env_values]
+          if missing_optional:
+              raise SystemExit(f"Missing optional keys in .env.example: {missing_optional}")
 
           for secret_var in ("POSTGRES_PASSWORD", "CSRF_HMAC_SECRET", "GUEST_ORDER_HMAC_SECRET", "PAYMENT_WEBHOOK_SECRET"):
               if not env_values[secret_var].startswith("CHANGE_ME_DEV_ONLY_"):
                   raise SystemExit(f"{secret_var} in .env.example must use a CHANGE_ME_DEV_ONLY_ placeholder")
 
-          print(f".env.example coverage verified ({len(required_vars)} required variables + TRUSTED_PROXY_IPS present)")
+          print(
+              f".env.example coverage verified ({len(required_vars)} non-empty + "
+              f"{len(optional_present_vars)} optional keys present)"
+          )
 
-          # 5. Verify hash-pinned backend lockfile exists
+          # 6. Verify hash-pinned backend lockfile exists
           if not pathlib.Path("backend/requirements.lock").is_file():
               raise SystemExit("ERROR: backend/requirements.lock must exist for hash-verified dependency installs")
           print("Verified backend/requirements.lock exists.")
           PY
 
-      - name: Validate Compose configuration with .env.example
+      - name: Validate Compose configurations (dev + redis profile + prod)
         run: |
           docker compose --env-file .env.example config --quiet
-          echo "docker compose config passed."
+          docker compose --profile redis --env-file .env.example config --quiet
+          SITE_DOMAIN=shop.example.com \
+          POSTGRES_USER=ecom_admin \
+          POSTGRES_PASSWORD=ci_validate_only_pg_password \
+          POSTGRES_DB=ecom_prod \
+          MIGRATION_DATABASE_URL=postgresql+psycopg://ecom_migrator:ci_validate@db:5432/ecom_prod \
+          DATABASE_URL=postgresql+psycopg://ecom_app:ci_validate@db:5432/ecom_prod \
+          ALLOWED_ORIGINS=https://shop.example.com \
+          CSRF_HMAC_SECRET=ci_validate_only_csrf_secret_min_32_characters_01 \
+          GUEST_ORDER_HMAC_SECRET=ci_validate_only_guest_secret_min_32_characters_02 \
+          PAYMENT_WEBHOOK_SECRET=ci_validate_only_webhook_secret_min_32_characters_03 \
+          PAYMENT_PROVIDER=live_psp_placeholder \
+          METRICS_BEARER_TOKEN=ci_validate_only_metrics_token_min_32_characters_04 \
+          NEXT_PUBLIC_SITE_URL=https://shop.example.com \
+            docker compose -f compose.prod.yaml config --quiet
+          echo "docker compose config passed for compose.yaml and compose.prod.yaml."
 
       - name: Build backend Docker image (when backend exists)
         if: needs.detect.outputs.backend_present == 'true'
-        run: docker build --file infra/docker/backend.Dockerfile ./backend
+        run: docker build --file infra/docker/backend.Dockerfile -t atelier-backend:ci ./backend
+
+      - name: Scan backend Docker image with Trivy
+        if: needs.detect.outputs.backend_present == 'true'
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: atelier-backend:ci
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
 
       - name: Build frontend Docker image (when frontend exists)
         if: needs.detect.outputs.frontend_present == 'true'
         run: |
           docker build \
             --file infra/docker/frontend.Dockerfile \
+            -t atelier-frontend:ci \
             --build-arg NEXT_PUBLIC_API_BASE_URL=http://localhost:8000/api/v1 \
             --build-arg NEXT_PUBLIC_SITE_URL=http://localhost:3000 \
             ./frontend
+
+      - name: Scan frontend Docker image with Trivy
+        if: needs.detect.outputs.frontend_present == 'true'
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: atelier-frontend:ci
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
 
   backend-ci:
     name: Backend Lint, Typecheck, Migrations & Tests
     needs: detect
     if: needs.detect.outputs.backend_present == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:16-alpine
@@ -175,10 +296,20 @@ jobs:
           --health-interval=5s
           --health-timeout=5s
           --health-retries=10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
     env:
       ENVIRONMENT: test
       DATABASE_URL: postgresql+psycopg://ecom_test:ecom_test_password@localhost:5432/ecom_test
       TEST_DATABASE_URL: postgresql+psycopg://ecom_test:ecom_test_password@localhost:5432/ecom_test
+      REDIS_TEST_URL: redis://localhost:6379/0
       COOKIE_SECURE: "false"
       ALLOWED_ORIGINS: http://localhost:3000
       TRUSTED_PROXY_IPS: ""
@@ -199,6 +330,8 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: backend/requirements.lock
 
       - name: Install backend dependencies and tooling
         working-directory: backend
@@ -215,7 +348,7 @@ jobs:
           elif [ -f pyproject.toml ]; then
             pip install -e ".[dev]" || pip install -e .
           fi
-          pip install ruff mypy pytest httpx pip-audit
+          pip install ruff mypy pytest httpx pip-audit "fakeredis[lua]>=2.26.0"
 
       - name: Verify Python dependency consistency
         working-directory: backend
@@ -273,16 +406,17 @@ jobs:
             echo "ERROR: Expected exactly 1 Alembic head revision, found $HEAD_COUNT." >&2
             exit 1
           fi
-          if ! printf '%s\n' "$HEADS_OUTPUT" | grep -qE '^0003_phase2_indexes_and_cleanup\b'; then
-            echo "ERROR: Expected Alembic head 0003_phase2_indexes_and_cleanup, got: $HEADS_OUTPUT" >&2
-            exit 1
-          fi
 
-      - name: Run Alembic migrations against PostgreSQL 16
+      - name: Run Alembic upgrade, schema drift check, and downgrade/re-upgrade verification
         working-directory: backend
-        run: alembic upgrade head
+        run: |
+          set -euo pipefail
+          alembic upgrade head
+          alembic check
+          alembic downgrade base
+          alembic upgrade head
 
-      - name: Run pytest suite (including live PostgreSQL 16 tests)
+      - name: Run pytest suite (including live PostgreSQL 16 & Redis tests)
         working-directory: backend
         run: pytest -v
 
@@ -291,6 +425,7 @@ jobs:
     needs: detect
     if: needs.detect.outputs.frontend_present == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
       CI: "true"
       NEXT_TELEMETRY_DISABLED: "1"
@@ -304,6 +439,8 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "22"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
 
       - name: Install frontend dependencies
         working-directory: frontend
@@ -343,6 +480,7 @@ jobs:
     name: Full-Stack Playwright E2E (PostgreSQL 16)
     needs: [backend-ci, frontend-ci]
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     services:
       postgres:
         image: postgres:16-alpine
@@ -383,11 +521,15 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: backend/requirements.lock
 
       - name: Setup Node.js 22
         uses: actions/setup-node@v4
         with:
           node-version: "22"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
 
       - name: Generate ephemeral CI test secrets and demo credentials
         run: |
