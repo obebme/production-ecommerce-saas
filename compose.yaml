@@ -1,7 +1,7 @@
 # ==============================================================================
-# E-Commerce SaaS — Minimal Local Development Compose Topology
-# Services: db (PostgreSQL 16), migrate (Alembic one-shot), api (FastAPI), web (Next.js)
-# Intentionally omits Redis, Celery, and extra infrastructure per ARCH-001.
+# E-Commerce SaaS — Local Development Compose Topology
+# Services: db (PostgreSQL 16), migrate (Alembic one-shot), api (FastAPI),
+#           web (Next.js), and optional redis (profile: redis)
 # ==============================================================================
 
 x-backend-env: &backend-env
@@ -14,8 +14,15 @@ x-backend-env: &backend-env
   GUEST_ORDER_HMAC_SECRET: ${GUEST_ORDER_HMAC_SECRET:?GUEST_ORDER_HMAC_SECRET must be set in .env}
   PAYMENT_WEBHOOK_SECRET: ${PAYMENT_WEBHOOK_SECRET:?PAYMENT_WEBHOOK_SECRET must be set in .env}
   PAYMENT_SANDBOX_MODE: ${PAYMENT_SANDBOX_MODE:-true}
+  PAYMENT_PROVIDER: ${PAYMENT_PROVIDER:-sandbox_simpay}
   SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-168}
   RESERVATION_SWEEPER_INTERVAL_SECONDS: ${RESERVATION_SWEEPER_INTERVAL_SECONDS:-60}
+  REDIS_URL: ${REDIS_URL:-}
+  RATE_LIMIT_KEY_PREFIX: ${RATE_LIMIT_KEY_PREFIX:-atelier:rl}
+  RATE_LIMIT_FAILURE_MODE: ${RATE_LIMIT_FAILURE_MODE:-fail_closed_sensitive}
+  LOG_FORMAT: ${LOG_FORMAT:-json}
+  METRICS_ENABLED: ${METRICS_ENABLED:-true}
+  METRICS_BEARER_TOKEN: ${METRICS_BEARER_TOKEN:-}
   FREE_SHIPPING_THRESHOLD_CENTS: ${FREE_SHIPPING_THRESHOLD_CENTS:-10000}
   STANDARD_SHIPPING_CENTS: ${STANDARD_SHIPPING_CENTS:-1000}
   TAX_RATE_BPS: ${TAX_RATE_BPS:-800}
@@ -29,7 +36,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
       POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB must be set in .env}
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5433}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -38,6 +45,32 @@ services:
       timeout: 5s
       retries: 10
       start_period: 5s
+
+  redis:
+    image: redis:7-alpine
+    profiles: ["redis"]
+    user: "redis"
+    command:
+      [
+        "redis-server",
+        "--save",
+        "",
+        "--appendonly",
+        "no",
+        "--maxmemory",
+        "128mb",
+        "--maxmemory-policy",
+        "volatile-ttl",
+      ]
+    ports:
+      - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
 
   migrate:
     build:
@@ -48,6 +81,7 @@ services:
     restart: "no"
     environment:
       <<: *backend-env
+      MIGRATION_DATABASE_URL: ${MIGRATION_DATABASE_URL:-}
     depends_on:
       db:
         condition: service_healthy
@@ -57,8 +91,9 @@ services:
       context: ./backend
       dockerfile: ../infra/docker/backend.Dockerfile
     restart: unless-stopped
+    stop_grace_period: 20s
     ports:
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:${API_HOST_PORT:-8000}:8000"
     environment:
       <<: *backend-env
     depends_on:
@@ -88,8 +123,9 @@ services:
         NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000/api/v1}
         NEXT_PUBLIC_SITE_URL: ${NEXT_PUBLIC_SITE_URL:-http://localhost:3000}
     restart: unless-stopped
+    stop_grace_period: 20s
     ports:
-      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:${WEB_HOST_PORT:-3000}:3000"
     environment:
       NODE_ENV: production
       PORT: "3000"

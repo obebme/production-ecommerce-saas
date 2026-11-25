@@ -3,9 +3,9 @@
 # Build context: ./backend
 #
 # Dependency Strategy:
-#   Prefers hash-verified `requirements.lock` (pip --require-hashes, generated
-#   via `uv pip compile --universal --generate-hashes`), falling back to
-#   `requirements.txt` or `pyproject.toml`. Fails explicitly if none exist.
+#   Strictly requires hash-verified `requirements.lock` (generated via
+#   `uv pip compile --universal --generate-hashes`) with `pip --require-hashes`.
+#   Fails explicitly if `requirements.lock` is missing (no unhashed fallback).
 # ==============================================================================
 
 FROM python:3.12-slim AS builder
@@ -23,19 +23,14 @@ RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /build
-COPY requirements.txt pyproject.toml requirements.lock* /build/
+COPY requirements.lock* /build/
 
 RUN python -m pip install --upgrade pip && \
-    if [ -f requirements.lock ]; then \
-        pip install --no-cache-dir --require-hashes -r requirements.lock; \
-    elif [ -f requirements.txt ]; then \
-        pip install --no-cache-dir -r requirements.txt; \
-    elif [ -f pyproject.toml ]; then \
-        pip install --no-cache-dir .; \
-    else \
-        echo "ERROR: Expected backend/requirements.lock, backend/requirements.txt, or backend/pyproject.toml in build context." >&2; \
+    if [ ! -f requirements.lock ]; then \
+        echo "ERROR: backend/requirements.lock is required for hash-verified dependency installs." >&2; \
         exit 1; \
-    fi
+    fi && \
+    pip install --no-cache-dir --require-hashes -r requirements.lock
 
 COPY . /build
 
@@ -62,9 +57,9 @@ USER appuser
 EXPOSE 8000
 
 HEALTHCHECK --interval=15s --timeout=5s --start-period=15s --retries=3 \
-    CMD ["python", "-c", "import sys, urllib.request; resp = urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=3); sys.exit(0 if resp.status == 200 else 1)"]
+    CMD ["python", "-c", "import sys, urllib.request; resp = urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health/live', timeout=3); sys.exit(0 if resp.status == 200 else 1)"]
 
 # App-level H-04 trusted-proxy parsing (TRUSTED_PROXY_IPS) validates TCP peer IP
 # before reading X-Forwarded-For. If overriding CMD behind a reverse proxy with
 # `--proxy-headers`, set `--forwarded-allow-ips=<exact-proxy-ip-or-cidr>` (never `*`).
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--timeout-graceful-shutdown", "15"]
