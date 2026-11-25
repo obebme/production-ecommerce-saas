@@ -91,3 +91,24 @@
 
 - **Live Redis Server**: `REDIS_TEST_URL` was not configured in this local Windows environment, so `test_redis_rate_limiter_live_redis_when_configured` skipped (`1` skip). All Redis Lua sliding-window, `PTTL`, multi-instance, concurrency, and outage behaviors were verified via `fakeredis` Lua runtime.
 - **E2E Ephemeral Backend Port**: `127.0.0.1:8000` was occupied by an unrelated local Docker container (`files-pasted-by-the-user-ai-api-1`), so `run_e2e_stack.py --auto-ports` ran uvicorn on ephemeral port `54549` (with Next.js standalone on `3000`) and restored the default `localhost:3000`/`8000` `.next` build upon completion.
+
+---
+
+## 5. Final Release Verification Addendum (`HARDEN-REL-VERIFY`)
+
+All previously deferred Docker, Trivy, live `PostgreSQL 16.16`, live `Redis 7.4.12`, least-privilege DB role, production Compose, failover, and fail-closed startup checks have since been executed against real containers:
+
+1. **Full Backend Suite on Real `postgres:16-alpine` (`16.16`) + `redis:7-alpine` (`7.4.12`)**:
+   - Executed `pytest -v` with `TEST_DATABASE_URL` pointing at `postgres:16-alpine` (`127.0.0.1:15432`) and `REDIS_TEST_URL=redis://127.0.0.1:16379/0`: **`227 passed, 0 skipped, 0 failed in 89.83s`** (confirming `test_redis_rate_limiter_live_redis_when_configured` passes against real Redis 7).
+2. **DB Role Separation (`init-roles.sql`) & Migrations on `PostgreSQL 16.16`**:
+   - Executed `infra/postgres/init-roles.sql` twice idempotently; verified `alembic heads` (`0003_phase2_indexes_and_cleanup`), `alembic upgrade head`, `alembic check` (`No new upgrade operations detected.`), `alembic downgrade base`, and `alembic upgrade head`.
+   - Verified `ecom_migrator` & `ecom_app` carry `(rolsuper=False, rolcreatedb=False, rolcreaterole=False, rolinherit=False, rolreplication=False)`; `ecom_app` succeeded on `INSERT/SELECT/UPDATE/DELETE` and was rejected with SQLSTATE `42501` on `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, and `alembic downgrade -1`.
+3. **Hardened Container Images & Trivy `0.58.1` (`HARDEN-REL-OPS-01`)**:
+   - Built `atelier-backend:relverify` (`c7c4b6c920d4`, `343MB`) and `atelier-frontend:relverify` (`dae132a979e3`, `382MB`). After remediation (`apt-get upgrade -y` + uninstalling `pip`/`ensurepip` from runtime in `backend.Dockerfile`; `apk upgrade --no-cache` + stripping global `npm`/`corepack`/`yarn` in `frontend.Dockerfile`), both images exited **`0`** under `--pkg-types os,library --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1` (`0` Python CVEs, `0` Node.js CVEs, `0` Alpine OS CVEs; `53` High / `88` Medium / `96` Low unfixed upstream Debian `13.8` advisories remain tracked).
+4. **`compose.prod.yaml` Runtime & Caddy Edge Security (`atelier-prodverify`)**:
+   - Executed exact bootstrap (`up -d db` -> `init-roles.sql` -> `up -d`): `migrate` exited `0`, `db`/`redis`/`api`/`web`/`caddy` all reached `Up (healthy)`, zero non-Caddy host ports published, `read_only` rootfs enforced on `api`/`web`/`redis`/`caddy`, HTTPS `GET /` returned `Strict-Transport-Security: max-age=31536000; includeSubDomains`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `script-src 'self' 'nonce-...'`, `/api/v1/metrics` returned **`404`** through Caddy and **`200`** (`116` lines) internally with bearer auth, and `app.*` emitted structured JSON logs with `request_id`.
+5. **Redis & PostgreSQL Failure Recovery (Zero API Restarts)**:
+   - Stopping `redis-1` yielded `/health/live=200`, `/health/ready=503 REDIS_UNAVAILABLE`, `/auth/login=503 RATE_LIMITER_UNAVAILABLE`, and `/products=200`; restarting `redis-1` automatically restored `200` on `/health/ready` and `/auth/login`.
+   - Stopping `db-1` yielded `/health/live=200`, `/health/ready=503 DATABASE_UNAVAILABLE`, and `/products=500` JSON error envelope; restarting `db-1` automatically restored `200` via SQLAlchemy `pool_pre_ping=True` (`RestartCount=0`, unchanged container `StartedAt`).
+6. **Production Sandbox Payment Rejection**:
+   - `uvicorn app.main:app` inside `atelier-backend:relverify` with `ENVIRONMENT=production` and `PAYMENT_PROVIDER=sandbox_simpay` exited **`3`** fail-closed for both `PAYMENT_SANDBOX_MODE=true` and `PAYMENT_SANDBOX_MODE=false`.

@@ -30,7 +30,8 @@ RUN python -m pip install --upgrade pip && \
         echo "ERROR: backend/requirements.lock is required for hash-verified dependency installs." >&2; \
         exit 1; \
     fi && \
-    pip install --no-cache-dir --require-hashes -r requirements.lock
+    pip install --no-cache-dir --require-hashes -r requirements.lock && \
+    python -m pip uninstall -y pip
 
 COPY . /build
 
@@ -42,8 +43,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:$PATH"
 
 RUN apt-get update && \
+    apt-get upgrade -y && \
     apt-get install -y --no-install-recommends libpq5 && \
-    rm -rf /var/lib/apt/lists/* && \
+    rm -rf /var/lib/apt/lists/* /usr/local/lib/python3.12/site-packages/pip* /usr/local/lib/python3.12/ensurepip /usr/local/bin/pip* && \
     groupadd --gid 10001 appgroup && \
     useradd --uid 10001 --gid appgroup --shell /usr/sbin/nologin --create-home appuser
 

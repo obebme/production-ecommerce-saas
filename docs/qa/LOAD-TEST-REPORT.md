@@ -129,3 +129,33 @@ rate_limit_decisions_total{backend="memory",decision="allowed",scope="checkout:o
    - **Recommendation**: In multi-worker production deployments behind Nginx/Caddy + Redis (`REDIS_URL`), scale horizontally across multiple Uvicorn/Gunicorn workers (`--workers 4+`) sized to CPU cores so Argon2id verification does not contend in a single process.
 2. **Environmental Scope**:
    - Executed on single-host Windows loopback against disposable PostgreSQL `18.6` with single-process `uvicorn` and in-memory rate limiting (`REDIS_URL` unset). Multi-worker Redis Lua rate-limiter throughput under load was not benchmarked against a live Redis server in this harness (`fakeredis` Lua concurrency/multi-instance parity was verified separately in `backend/tests/test_production_hardening.py`).
+
+---
+
+## 6. Final Release Verification — Multi-Worker (`1`/`2`/`4`) Container Scaling & `60s` Sustained Load
+
+### 6.1 Worker Scaling Comparison (`atelier-backend:relverify` + `postgres:16-alpine` + `redis:7-alpine`, `50` VUs, `20s`)
+- **Configuration**: Least-privilege `ecom_app` DB role, `DB_POOL_SIZE=8`, `DB_MAX_OVERFLOW=7` per worker, `RESERVATION_SWEEPER_INTERVAL_SECONDS=30`, live `RedisSlidingWindowRateLimiter` on `redis:7-alpine` (`7.4.12`), container `--memory=1200m`, sampled every `2.0s` via `docker stats` and `pg_stat_activity`.
+- **Two Executed Series**: Series A (`task-2841`, fresh container cold runs) and Series B (`task-2865`, saved telemetry JSON) are both reported without omission:
+
+| Workers | Series | Requests | Failures | RPS | Median / p95 / p99 (ms) | Login Med / p95 (ms) | Checkout Med / p95 (ms) | Avg / Peak API CPU | Avg / Peak API Mem (MiB) | Peak PG Conns | Post-Load PG Invariants |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`1`** | A (`task-2841`) | `1,668` | `0` | `82.66` | `390` / `830` / `1,400` | `910` / `1,500` | `490` / `810` | `274.13%` avg | `939.4` peak | `15` | **PASS** |
+| **`1`** | B (`task-2865`) | `1,590` | `0` | `79.26` | `440` / `840` / `1,100` | `640` / `1,200` | `550` / `870` | `150.49%` / `230.07%` | `182.25` / `586.2` | `15` | **PASS** |
+| **`2`** | A (`task-2841`) | `2,536` | `0` | `126.89` | `190` / `450` / `1,100` | `340` / `1,200` | `290` / `460` | `221.41%` avg | `228.3` peak | `30` | **PASS** |
+| **`2`** | B (`task-2865`) | `2,562` | `0` | `127.62` | `180` / `460` / `840` | `350` / `1,000` | `280` / `490` | `413.50%` / `1104.83%` | `276.55` / `504.8` | `30` | **PASS** |
+| **`4`** | A (`task-2841`) | `3,288` | `0` | `165.81` | `61` / `290` / `2,100` | `250` / `2,200` | `87` / `240` | `364.48%` avg | `1,200.13` peak | `39` | **PASS** |
+| **`4`** | B (`task-2865`) | `1,386` | `0` | `72.69` | `92` / `3,700` / `10,000` | `6,400` / `10,000` | `130` / `390` | `255.07%` / `864.34%` | `347.98` / `502.3` | `46` | **PASS** |
+
+- **Scaling Takeaway**: Stepping from `1` to `2` workers consistently improved throughput by **`+54%–+61%`** (`79–83` → `127–128` RPS) and cut median latency **>2.1x** (`390–440 ms` → `180–190 ms`) and checkout p95 nearly in half (`810–870 ms` → `460–490 ms`). Scaling to `4` workers reached **`165.81` RPS** and **`61 ms` median latency** when headroom was uncontended, while hitting the `1200 MiB` container memory cap during simultaneous `Argon2id` (`64 MiB`, `t=3`) logins and degrading tail login latency (`p95=3,700 ms`) when `r=25/s` concurrent Argon2id bursts contended on hypervisor CPU in Series B.
+
+### 6.2 Sustained `60s` Multi-Worker Load Test (`4` Uvicorn Workers)
+
+1. **Sustained Steady-State Run (`50` VUs, `0.8–1.4s` realistic shopper pacing, `4` Uvicorn workers on disposable `PostgreSQL 18.6`, `60s`)**:
+   - **Throughput & Latency**: **`4,640` requests**, **`78.34` RPS**, **`0` failures (`0.00%` error rate; `4,220` `2xx` + `151` expected `409 INSUFFICIENT_STOCK` scarcity rejections; `0` `429`s, `0` `5xx`s)**; **`p50 = 16.0 ms`**, avg `30.48 ms`, **`p95 = 130.0 ms`**, **`p99 = 450.0 ms`**, max `962.0 ms`.
+   - **Resource & Connection Telemetry (`30` x `2.0s` samples)**: Uvicorn `4`-worker RSS **`avg 540.63 MiB` / `peak 789.01 MiB`**; PostgreSQL RSS `avg 728.73 MiB` / `peak 803.75 MiB`; DB connections **`avg 23.87` / `peak 25`** (active queries `avg 0.30` / `peak 3`); PostgreSQL advisory-lock warnings: **`0`**. *(Note: Windows `psutil` per-child `cpu_percent(interval=None)` on freshly resolved child handles reported `0.0%` for the Uvicorn tree and `0.22%` avg / `2.8%` peak for PostgreSQL; container CPU scaling under `docker stats` is recorded in §6.1.)*
+   - **Post-Load Invariants (`invariants_ok = true`)**: `604` orders created (`604` paid), `0` negative/mismatched `inventory_stocks` rows, `0` duplicate `SUCCEEDED` payment intents, and scarcity SKU `ATL-LINEN-SND-L` settled at `on_hand=0`, `reserved=0`, `committed_qty=5` (`0` oversell).
+   - **`/api/v1/metrics` Scrape**: `200 OK`, `254` exposition lines (`db_pool_connections{state="checkedout"} 0.0` post-drain, `checkout_events_total{actor_type="user",outcome="created"} 214.0`, `payment_webhook_events_total{...,outcome="processed"} 214.0`).
+
+2. **Supplementary Unthrottled `60s` Multi-Worker Burst (`40` VUs, `0.15–0.45s` pacing, `4` workers in `atelier-backend:relverify` + `PostgreSQL 16.16` + `Redis 7.4.12`)**:
+   - **Throughput & Rate-Limit Verification**: Over `60s`, `40` aggressive VUs achieved **`9,528–9,566` requests (`160.65` RPS, `p50 = 32.0 ms`, `p95 = 200.0 ms`, `p99 = 340.0 ms`)** and **`0` `5xx` errors**, while each synthetic VU IP crossed single-IP limits (`>10` logins/min and `>30` checkouts/min), triggering **`338–346` (`~3.6%`) expected `429 RATE_LIMIT_EXCEEDED` responses** shared coherently across all 4 worker processes via Redis Lua. Post-run PG advisory-lock warnings remained **`0`** and DB invariants remained **`True`**.
