@@ -1,0 +1,16 @@
+title = "Atelier Commerce Gitleaks Configuration"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Exclude local virtualenvs, build caches, and the single verified SKILL.md prose false positive"
+paths = [
+  '''^backend/\.venv/''',
+  '''^frontend/node_modules/''',
+  '''^frontend/\.next/''',
+]
+regexTarget = "line"
+regexes = [
+  '''description: Implements FastAPI commerce services, SQLAlchemy/Alembic migrations, and correct order transactions\.''',
+]
