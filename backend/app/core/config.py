@@ -123,8 +123,20 @@ class Settings(BaseSettings):
 
     # Sandbox payments, session lifetime, and reservation sweeper
     payment_sandbox_mode: bool = True
+    payment_provider: str = "sandbox_simpay"
     session_ttl_hours: int = Field(default=168, ge=1, le=8760)
     reservation_sweeper_interval_seconds: int = Field(default=60, ge=0, le=3600)
+
+    # Distributed rate limiting, migrations, and observability
+    redis_url: str | None = Field(default=None, repr=False)
+    rate_limit_key_prefix: str = "atelier:rl"
+    rate_limit_failure_mode: Literal[
+        "fail_closed_sensitive", "fail_closed_all", "local_fallback"
+    ] = "fail_closed_sensitive"
+    migration_database_url: str | None = Field(default=None, repr=False)
+    log_format: Literal["json", "text"] = "json"
+    metrics_enabled: bool = True
+    metrics_bearer_token: str | None = Field(default=None, repr=False)
 
     # Server-authoritative shipping & tax configuration
     free_shipping_threshold_cents: int = Field(default=10000, ge=0)
@@ -135,6 +147,49 @@ class Settings(BaseSettings):
     next_public_api_base_url: str | None = None
     next_public_site_url: str | None = None
     internal_api_base_url: str | None = None
+
+    @field_validator("payment_provider", mode="before")
+    @classmethod
+    def _normalize_payment_provider(cls, value: object) -> str:
+        if not isinstance(value, str):
+            raise ValueError("PAYMENT_PROVIDER must be a non-empty string.")
+        normalized = value.strip().lower()
+        if not normalized:
+            raise ValueError("PAYMENT_PROVIDER must not be blank.")
+        return normalized
+
+    @field_validator("redis_url", mode="before")
+    @classmethod
+    def _validate_redis_url(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("REDIS_URL must be a string.")
+        if value == "":
+            return None
+        if any(ord(ch) < 0x20 or ord(ch) == 0x7F or ch.isspace() for ch in value):
+            raise ValueError("REDIS_URL must not contain whitespace or control characters.")
+        try:
+            parsed = urlsplit(value)
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError("REDIS_URL is not a valid URL.") from exc
+        if parsed.scheme.lower() not in ("redis", "rediss") or not parsed.hostname:
+            raise ValueError("REDIS_URL must use a redis:// or rediss:// scheme with a valid host.")
+        if port is not None and (port < 1 or port > 65535):
+            raise ValueError("REDIS_URL port must be between 1 and 65535.")
+        return value
+
+    @field_validator("migration_database_url", "metrics_bearer_token", mode="before")
+    @classmethod
+    def _normalize_optional_secret_url(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("Value must be a string.")
+        if value == "":
+            return None
+        return value
 
     @field_validator("allowed_origins", mode="before")
     @classmethod
@@ -292,6 +347,49 @@ class Settings(BaseSettings):
                         f"{timeout_field.upper()} must be greater than 0 "
                         f"when ENVIRONMENT={env_label}."
                     )
+
+            if self.metrics_bearer_token is not None:
+                token_val = self.metrics_bearer_token
+                if (
+                    token_val.strip() != token_val
+                    or len(token_val) < 32
+                    or _contains_insecure_placeholder(token_val)
+                ):
+                    raise ValueError(
+                        "METRICS_BEARER_TOKEN must be at least 32 characters without "
+                        "leading/trailing whitespace or development/CI placeholders "
+                        f"when ENVIRONMENT={env_label}."
+                    )
+
+            if self.migration_database_url is not None:
+                mig_url = self.migration_database_url.strip()
+                self.migration_database_url = mig_url
+                if not mig_url.lower().startswith(
+                    ("postgresql://", "postgresql+psycopg://")
+                ):
+                    raise ValueError(
+                        "MIGRATION_DATABASE_URL must use a postgresql:// or postgresql+psycopg:// "
+                        f"scheme when ENVIRONMENT={env_label}."
+                    )
+                if _contains_insecure_placeholder(mig_url):
+                    raise ValueError(
+                        "MIGRATION_DATABASE_URL must not contain development/CI placeholder "
+                        f"credentials when ENVIRONMENT={env_label}."
+                    )
+
+        if self.environment == "production":
+            from app.modules.payments.provider import is_production_provider_registered
+
+            if not is_production_provider_registered(self.payment_provider):
+                raise ValueError(
+                    f"PAYMENT_PROVIDER '{self.payment_provider}' is not a registered "
+                    "production-ready payment adapter when ENVIRONMENT=production."
+                )
+
+        if self.payment_provider == "sandbox_simpay" and not self.payment_sandbox_mode:
+            raise ValueError(
+                "PAYMENT_SANDBOX_MODE must be true when PAYMENT_PROVIDER=sandbox_simpay."
+            )
 
         return self
 

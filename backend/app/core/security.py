@@ -5,16 +5,12 @@ from __future__ import annotations
 import hashlib
 import hmac
 import ipaddress
-import math
 import re
 import secrets
 import threading
-import time
 import uuid
-from collections import OrderedDict, deque
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
-from typing import Protocol
+from collections import OrderedDict
+from collections.abc import Mapping, Sequence
 from urllib.parse import urlsplit
 
 from argon2 import PasswordHasher
@@ -22,7 +18,47 @@ from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatc
 from argon2.low_level import Type
 from fastapi import Request
 
-from app.core.errors import ForbiddenError, RateLimitExceededError
+from app.core.errors import ForbiddenError
+from app.core.rate_limit import (
+    RateLimitDecision,
+    RateLimiterProtocol,
+    RedisSlidingWindowRateLimiter,
+    SlidingWindowRateLimiter,
+    build_rate_limiter,
+    default_rate_limiter,
+    enforce_rate_limit,
+    get_rate_limiter,
+)
+
+__all__ = [
+    "GuestPendingOrderTracker",
+    "RateLimitDecision",
+    "RateLimiterProtocol",
+    "RedisSlidingWindowRateLimiter",
+    "SlidingWindowRateLimiter",
+    "build_rate_limiter",
+    "compute_webhook_signature_hex",
+    "default_guest_pending_tracker",
+    "default_rate_limiter",
+    "derive_csrf_token",
+    "derive_guest_order_token",
+    "enforce_rate_limit",
+    "generate_session_token",
+    "get_client_ip_key",
+    "get_guest_pending_tracker",
+    "get_rate_limiter",
+    "hash_password",
+    "hash_token",
+    "parse_client_ip",
+    "resolve_client_ip",
+    "sign_webhook_payload",
+    "validate_request_origin",
+    "verify_csrf_token",
+    "verify_guest_order_token",
+    "verify_password",
+    "verify_password_dummy",
+    "verify_webhook_signature",
+]
 
 _ARGON2_HASHER = PasswordHasher(
     time_cost=3,
@@ -338,130 +374,6 @@ def validate_request_origin(request: Request, allowed_origins: Sequence[str]) ->
         raise ForbiddenError(
             code="CSRF_INVALID",
             message="Missing Origin or Referer header on browser state-changing request.",
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class RateLimitDecision:
-    """Outcome of a sliding-window rate-limit check."""
-
-    allowed: bool
-    remaining: int
-    retry_after_seconds: int
-
-
-class RateLimiterProtocol(Protocol):
-    """Protocol for rate limiter implementations."""
-
-    def check_and_record(
-        self, key: str, limit: int, window_seconds: int
-    ) -> RateLimitDecision: ...
-
-    def reset(self) -> None: ...
-
-
-class SlidingWindowRateLimiter:
-    """Thread-safe in-memory sliding-window rate limiter for single-instance deployments."""
-
-    def __init__(
-        self,
-        clock: Callable[[], float] = time.monotonic,
-        max_keys: int = 10000,
-    ) -> None:
-        if max_keys < 1:
-            raise ValueError("max_keys must be at least 1.")
-        self._clock = clock
-        self._max_keys = max_keys
-        self._lock = threading.Lock()
-        self._buckets: OrderedDict[str, tuple[deque[float], int]] = OrderedDict()
-
-    def check_and_record(
-        self, key: str, limit: int, window_seconds: int
-    ) -> RateLimitDecision:
-        now = self._clock()
-        cutoff = now - window_seconds
-
-        with self._lock:
-            entry = self._buckets.get(key)
-            if entry is None:
-                if len(self._buckets) >= self._max_keys:
-                    self._prune_stale_buckets(now)
-                while len(self._buckets) >= self._max_keys:
-                    self._buckets.popitem(last=False)
-                timestamps: deque[float] = deque()
-                self._buckets[key] = (timestamps, window_seconds)
-            else:
-                timestamps, stored_window = entry
-                if stored_window != window_seconds:
-                    self._buckets[key] = (timestamps, window_seconds)
-                self._buckets.move_to_end(key)
-
-            while timestamps and timestamps[0] <= cutoff:
-                timestamps.popleft()
-
-            if limit <= 0:
-                return RateLimitDecision(
-                    allowed=False,
-                    remaining=0,
-                    retry_after_seconds=max(1, window_seconds),
-                )
-
-            if len(timestamps) >= limit:
-                retry_after = max(1, math.ceil(timestamps[0] + window_seconds - now))
-                return RateLimitDecision(
-                    allowed=False,
-                    remaining=0,
-                    retry_after_seconds=retry_after,
-                )
-
-            timestamps.append(now)
-            return RateLimitDecision(
-                allowed=True,
-                remaining=max(0, limit - len(timestamps)),
-                retry_after_seconds=0,
-            )
-
-    def _prune_stale_buckets(self, now: float) -> None:
-        stale_keys = [
-            bucket_key
-            for bucket_key, (timestamps, bucket_window) in self._buckets.items()
-            if not timestamps or timestamps[-1] <= now - bucket_window
-        ]
-        for bucket_key in stale_keys:
-            del self._buckets[bucket_key]
-
-    def reset(self) -> None:
-        """Clear all tracked rate-limit buckets (for tests)."""
-        with self._lock:
-            self._buckets.clear()
-
-
-default_rate_limiter = SlidingWindowRateLimiter()
-
-
-def get_rate_limiter(request: Request) -> RateLimiterProtocol:
-    """Resolve the active rate limiter from app.state or fallback singleton."""
-    limiter = getattr(request.app.state, "rate_limiter", None)
-    if limiter is not None:
-        return limiter  # type: ignore[no-any-return]
-    return default_rate_limiter
-
-
-def enforce_rate_limit(
-    limiter: RateLimiterProtocol,
-    *,
-    key: str,
-    limit: int,
-    window_seconds: int,
-) -> None:
-    """Enforce a sliding-window rate limit or raise 429 RATE_LIMIT_EXCEEDED."""
-    decision = limiter.check_and_record(key=key, limit=limit, window_seconds=window_seconds)
-    if not decision.allowed:
-        raise RateLimitExceededError(
-            code="RATE_LIMIT_EXCEEDED",
-            message="Too many requests. Please try again later.",
-            details={"retry_after_seconds": decision.retry_after_seconds},
-            headers={"Retry-After": str(decision.retry_after_seconds)},
         )
 
 

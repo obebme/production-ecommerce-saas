@@ -2,18 +2,26 @@
 
 from __future__ import annotations
 
+import contextlib
+import threading
+import time
 import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any, cast
 
-from sqlalchemy import ColumnElement, case, func, or_, select
+from sqlalchemy import ColumnElement, case, func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
 from app.core.audit import record_audit_log
 from app.core.database import ts_lt
 from app.core.errors import ConflictError, NotFoundError, ValidationAppError
+from app.core.observability import (
+    reservation_sweeper_duration_seconds,
+    reservation_sweeper_reclaimed_total,
+    reservation_sweeper_runs_total,
+)
 from app.core.order_events import append_order_event
 from app.core.pagination import PaginatedResponse, PaginationParams, escape_like_query
 from app.models.catalog import Category, Product
@@ -43,6 +51,7 @@ from app.modules.inventory.schemas import (
 )
 
 _INT32_MAX = 2_147_483_647
+ADVISORY_LOCK_NS_RESERVATION_SWEEPER = 4104
 
 
 def _variant_snapshot(variant: ProductVariant, stock: InventoryStock | None) -> dict[str, Any]:
@@ -363,6 +372,76 @@ def reclaim_all_expired_reservations(
         if auto_commit:
             db.commit()
     return total_reclaimed
+
+
+def run_coordinated_expired_reservation_sweep(
+    db: Session,
+    *,
+    batch_size: int = 100,
+    max_batches: int = 20,
+    stop_event: threading.Event | None = None,
+    now: datetime | None = None,
+) -> tuple[int, bool]:
+    """Run a leader-elected expired reservation sweep using PG session advisory locks."""
+    start_time = time.perf_counter()
+    is_pg = db.get_bind().dialect.name == "postgresql"
+    lock_acquired = False
+
+    if is_pg:
+        lock_acquired = bool(
+            db.scalar(
+                text("SELECT pg_try_advisory_lock(:ns, 1)"),
+                {"ns": ADVISORY_LOCK_NS_RESERVATION_SWEEPER},
+            )
+        )
+        if not lock_acquired:
+            db.rollback()
+            reservation_sweeper_runs_total.labels(outcome="skipped").inc()
+            reservation_sweeper_duration_seconds.observe(
+                max(0.0, time.perf_counter() - start_time)
+            )
+            return 0, False
+
+    total_reclaimed = 0
+    try:
+        for _ in range(max_batches):
+            if stop_event is not None and stop_event.is_set():
+                break
+            reclaimed = _reclaim_expired_reservations_batch(
+                db,
+                variant_ids=None,
+                batch_size=batch_size,
+                now=now,
+            )
+            if reclaimed <= 0:
+                db.rollback()
+                break
+            total_reclaimed += reclaimed
+            db.commit()
+
+        reservation_sweeper_runs_total.labels(outcome="completed").inc()
+        if total_reclaimed > 0:
+            reservation_sweeper_reclaimed_total.inc(total_reclaimed)
+        return total_reclaimed, True
+    except Exception:
+        db.rollback()
+        reservation_sweeper_runs_total.labels(outcome="error").inc()
+        raise
+    finally:
+        reservation_sweeper_duration_seconds.observe(
+            max(0.0, time.perf_counter() - start_time)
+        )
+        if lock_acquired:
+            try:
+                db.rollback()
+                db.execute(
+                    text("SELECT pg_advisory_unlock(:ns, 1)"),
+                    {"ns": ADVISORY_LOCK_NS_RESERVATION_SWEEPER},
+                )
+                db.commit()
+            except Exception:
+                with contextlib.suppress(Exception):
+                    db.rollback()
 
 
 def reclaim_expired_if_any(

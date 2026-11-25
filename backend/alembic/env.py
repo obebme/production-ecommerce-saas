@@ -20,19 +20,32 @@ target_metadata = Base.metadata
 
 
 def _resolve_database_url(*, offline: bool) -> str:
-    env_url = os.environ.get("DATABASE_URL", "").strip()
-    if env_url:
-        return env_url
+    env_migration_url = os.environ.get("MIGRATION_DATABASE_URL", "").strip()
+    if env_migration_url:
+        return env_migration_url
+
+    settings_error: Exception | None = None
     try:
         from app.core.config import get_settings
 
-        return get_settings().database_url
-    except Exception:
-        if offline:
-            fallback = config.get_main_option("sqlalchemy.url")
-            if fallback:
-                return fallback
-        raise
+        settings = get_settings()
+        if settings.migration_database_url:
+            return settings.migration_database_url
+        if settings.database_url:
+            return settings.database_url
+    except Exception as exc:
+        settings_error = exc
+
+    env_url = os.environ.get("DATABASE_URL", "").strip()
+    if env_url:
+        return env_url
+    if offline:
+        fallback = config.get_main_option("sqlalchemy.url")
+        if fallback:
+            return fallback
+    if settings_error is not None:
+        raise settings_error
+    raise RuntimeError("Neither MIGRATION_DATABASE_URL nor DATABASE_URL is configured.")
 
 
 def run_migrations_offline() -> None:

@@ -55,6 +55,7 @@ from app.modules.orders.service import (
     to_order_event_dto,
     to_order_item_dto,
 )
+from app.modules.payments.provider import get_default_payment_registry
 from app.modules.payments.schemas import PaymentIntentDTO
 
 _INT32_MAX = 2_147_483_647
@@ -94,7 +95,33 @@ class SandboxSimpayRefundGateway:
         return f"re_sandbox_{uuid.uuid4().hex}"
 
 
-_DEFAULT_REFUND_GATEWAY = SandboxSimpayRefundGateway()
+class RegistryPaymentRefundGateway:
+    """Default refund gateway resolving the registered PaymentProviderAdapter per intent."""
+
+    def refund_intent(
+        self,
+        *,
+        provider: str,
+        provider_intent_id: str,
+        amount_cents: int,
+        currency: str,
+        reason: str | None,
+    ) -> str:
+        adapter = get_default_payment_registry().get_or_none(provider)
+        if adapter is None:
+            raise ConflictError(
+                code="REFUND_NOT_ALLOWED",
+                message=f"Unsupported payment provider '{provider}' for refund.",
+            )
+        return adapter.refund(
+            provider_intent_id=provider_intent_id,
+            amount_cents=amount_cents,
+            currency=currency,
+            reason=reason,
+        )
+
+
+_DEFAULT_REFUND_GATEWAY: PaymentRefundGateway = RegistryPaymentRefundGateway()
 
 
 def _normalize_optional_search_q(raw_q: str | None) -> str | None:
