@@ -778,9 +778,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             != 0
         ):
-            raise RuntimeError(
-                f"alembic upgrade head failed: {alembic_log.read_text(encoding='utf-8', errors='replace')}"
-            )
+            alembic_err = alembic_log.read_text(encoding="utf-8", errors="replace")
+            raise RuntimeError(f"alembic upgrade head failed: {alembic_err}")
 
         if (
             _run_logged_tool(

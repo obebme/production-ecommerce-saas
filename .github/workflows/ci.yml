@@ -348,7 +348,7 @@ jobs:
           elif [ -f pyproject.toml ]; then
             pip install -e ".[dev]" || pip install -e .
           fi
-          pip install ruff mypy pytest httpx pip-audit
+          pip install ruff mypy pytest httpx pip-audit "fakeredis[lua]>=2.26.0"
 
       - name: Verify Python dependency consistency
         working-directory: backend
