@@ -246,7 +246,7 @@ jobs:
 
       - name: Scan backend Docker image with Trivy
         if: needs.detect.outputs.backend_present == 'true'
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: atelier-backend:ci
           format: table
@@ -267,7 +267,7 @@ jobs:
 
       - name: Scan frontend Docker image with Trivy
         if: needs.detect.outputs.frontend_present == 'true'
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: atelier-frontend:ci
           format: table
