@@ -24,6 +24,8 @@ interface ShippingInfo {
 async function signIn(page: Page, email: string, password: string): Promise<void> {
   await page.goto("/login");
   await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible();
+  await expect(page.locator("#login-email")).toHaveCount(1);
+  await expect(page.locator("#login-password")).toHaveCount(1);
   await page.locator("#login-email").fill(email);
   await page.locator("#login-password").fill(password);
   await page.getByRole("button", { name: "Sign In", exact: true }).click();
@@ -759,5 +761,148 @@ test.describe("REM-P2-M09 & FE-REDESIGN-001: Storefront SSR, Metadata, Theme, As
     expect(
       await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)
     ).toBe(true);
+  });
+});
+
+interface CspViolationRecord {
+  violatedDirective: string;
+  effectiveDirective: string;
+  blockedURI: string;
+  sourceFile: string;
+}
+
+type WindowWithCspLog = Window & {
+  __cspViolations?: CspViolationRecord[];
+};
+
+function extractScriptSrcDirective(cspHeader: string): string {
+  const directives = cspHeader.split(";").map((part) => part.trim());
+  const scriptSrc = directives.find((d) => d.startsWith("script-src "));
+  if (!scriptSrc) {
+    throw new Error(`Missing script-src directive in CSP header: ${cspHeader}`);
+  }
+  return scriptSrc;
+}
+
+function extractNonceFromCsp(cspHeader: string): string {
+  const scriptSrc = extractScriptSrcDirective(cspHeader);
+  expect(scriptSrc).not.toContain("'unsafe-inline'");
+  expect(scriptSrc).not.toContain("'unsafe-eval'");
+  const match = scriptSrc.match(/^script-src\s+'self'\s+'nonce-([A-Za-z0-9+/=_-]+)'/);
+  if (!match) {
+    throw new Error(`Expected script-src 'self' 'nonce-...' in CSP header, got: ${scriptSrc}`);
+  }
+  return match[1];
+}
+
+test.describe("HARDEN-QA-01: Per-Request Nonce CSP, Security Headers & Zero Violations", () => {
+  test("6. Strict nonce CSP headers, per-request nonce rotation, DOM script nonces & zero CSP violations across storefront + Recharts admin", async ({
+    browser,
+  }) => {
+    const { context, page } = await openContext(browser);
+    const consoleCspErrors: string[] = [];
+    page.on("console", (msg) => {
+      if (msg.type() === "error" && /content security policy|csp/i.test(msg.text())) {
+        consoleCspErrors.push(msg.text());
+      }
+    });
+
+    await page.addInitScript(() => {
+      const win = window as WindowWithCspLog;
+      win.__cspViolations = [];
+      document.addEventListener("securitypolicyviolation", (ev) => {
+        win.__cspViolations?.push({
+          violatedDirective: ev.violatedDirective,
+          effectiveDirective: ev.effectiveDirective,
+          blockedURI: ev.blockedURI,
+          sourceFile: ev.sourceFile,
+        });
+      });
+    });
+
+    try {
+      // 1. Consecutive requests to / must rotate CSP nonces & match inline script nonces
+      const homeRes1 = await page.request.get("/");
+      expect(homeRes1.status()).toBe(200);
+      const homeCsp1 = homeRes1.headers()["content-security-policy"];
+      expect(homeCsp1).toBeDefined();
+      const nonce1 = extractNonceFromCsp(homeCsp1);
+      const homeHtml1 = await homeRes1.text();
+      expect(homeHtml1).toContain(`nonce="${nonce1}"`);
+
+      const homeRes2 = await page.request.get("/");
+      expect(homeRes2.status()).toBe(200);
+      const homeCsp2 = homeRes2.headers()["content-security-policy"];
+      expect(homeCsp2).toBeDefined();
+      const nonce2 = extractNonceFromCsp(homeCsp2);
+      expect(nonce2).not.toBe(nonce1);
+
+      // 2. Verify security headers & strict CSP across key routes
+      for (const route of ["/", "/products/linen-overshirt", "/login", "/admin"] as const) {
+        const resp = await page.request.get(route);
+        expect(resp.status(), `Unexpected status for ${route}`).toBe(200);
+        const headers = resp.headers();
+        const csp = headers["content-security-policy"];
+        expect(csp, `Missing CSP header on ${route}`).toBeDefined();
+        extractNonceFromCsp(csp);
+        expect(headers["x-frame-options"]).toBe("DENY");
+        expect(headers["x-content-type-options"]).toBe("nosniff");
+        if (route === "/admin") {
+          expect(headers["referrer-policy"]).toBe("no-referrer");
+        }
+        if (route === "/admin" || route === "/login") {
+          expect(headers["cache-control"]).toContain("no-store");
+        }
+      }
+
+      for (const noStoreRoute of ["/cart", "/checkout"] as const) {
+        const resp = await page.request.get(noStoreRoute);
+        expect(resp.status()).toBe(200);
+        expect(resp.headers()["cache-control"]).toContain("no-store");
+      }
+
+      // 3. Rendered DOM inline <script> tags must carry nonces on storefront & login
+      for (const route of ["/", "/products/linen-overshirt", "/login"] as const) {
+        await page.goto(route);
+        await page.waitForLoadState("networkidle");
+        const inlineScripts = await page.evaluate(() => {
+          const scripts = Array.from(document.querySelectorAll("script"));
+          return scripts
+            .filter((el) => !el.getAttribute("src"))
+            .map((el) => ({
+              hasNonceAttr: el.hasAttribute("nonce"),
+              nonceProp: el.nonce || "",
+              snippet: (el.textContent || "").slice(0, 60),
+            }));
+        });
+        expect(inlineScripts.length, `Expected inline Next.js scripts on ${route}`).toBeGreaterThan(0);
+        for (const info of inlineScripts) {
+          expect(
+            info.hasNonceAttr || info.nonceProp.length > 0,
+            `Inline script missing nonce on ${route}: ${info.snippet}`
+          ).toBe(true);
+        }
+      }
+
+      // 4. Sign in as Admin and exercise Admin Analytics (Recharts SVG) with CSP violation listener
+      await signIn(page, ADMIN_EMAIL, ADMIN_PASSWORD);
+      await page.goto("/admin");
+      await expect(
+        page.getByRole("heading", { name: "Sales & Operations Dashboard" })
+      ).toBeVisible();
+      await expect
+        .poll(async () => await page.locator("main svg.recharts-surface").count(), {
+          message: "Expected Recharts SVG charts to render inside /admin",
+        })
+        .toBeGreaterThan(0);
+
+      const violations = await page.evaluate(
+        () => (window as WindowWithCspLog).__cspViolations ?? []
+      );
+      expect(violations, `Unexpected CSP violations: ${JSON.stringify(violations)}`).toEqual([]);
+      expect(consoleCspErrors).toEqual([]);
+    } finally {
+      await context.close();
+    }
   });
 });

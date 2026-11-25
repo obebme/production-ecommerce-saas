@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 from sqlalchemy import ColumnElement, case, func, or_, select, text
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
@@ -384,18 +385,44 @@ def run_coordinated_expired_reservation_sweep(
 ) -> tuple[int, bool]:
     """Run a leader-elected expired reservation sweep using PG session advisory locks."""
     start_time = time.perf_counter()
-    is_pg = db.get_bind().dialect.name == "postgresql"
+    bind = db.get_bind()
+    is_pg = bind.dialect.name == "postgresql"
     lock_acquired = False
+    lock_conn: Connection | None = None
+    advisory_conn: Connection | None = None
 
     if is_pg:
-        lock_acquired = bool(
-            db.scalar(
-                text("SELECT pg_try_advisory_lock(:ns, 1)"),
-                {"ns": ADVISORY_LOCK_NS_RESERVATION_SWEEPER},
+        try:
+            if isinstance(bind, Connection):
+                advisory_conn = bind
+            elif isinstance(bind, Engine):
+                lock_conn = bind.connect().execution_options(isolation_level="AUTOCOMMIT")
+                advisory_conn = lock_conn
+            else:
+                raise TypeError(f"Unsupported SQLAlchemy bind type: {type(bind)!r}")
+
+            lock_acquired = bool(
+                advisory_conn.scalar(
+                    text("SELECT pg_try_advisory_lock(:ns, 1)"),
+                    {"ns": ADVISORY_LOCK_NS_RESERVATION_SWEEPER},
+                )
             )
-        )
+        except Exception:
+            if lock_conn is not None:
+                with contextlib.suppress(Exception):
+                    lock_conn.close()
+                lock_conn = None
+            reservation_sweeper_runs_total.labels(outcome="error").inc()
+            reservation_sweeper_duration_seconds.observe(
+                max(0.0, time.perf_counter() - start_time)
+            )
+            raise
+
         if not lock_acquired:
-            db.rollback()
+            if lock_conn is not None:
+                with contextlib.suppress(Exception):
+                    lock_conn.close()
+                lock_conn = None
             reservation_sweeper_runs_total.labels(outcome="skipped").inc()
             reservation_sweeper_duration_seconds.observe(
                 max(0.0, time.perf_counter() - start_time)
@@ -431,17 +458,19 @@ def run_coordinated_expired_reservation_sweep(
         reservation_sweeper_duration_seconds.observe(
             max(0.0, time.perf_counter() - start_time)
         )
-        if lock_acquired:
+        if lock_acquired and advisory_conn is not None:
             try:
-                db.rollback()
-                db.execute(
+                advisory_conn.execute(
                     text("SELECT pg_advisory_unlock(:ns, 1)"),
                     {"ns": ADVISORY_LOCK_NS_RESERVATION_SWEEPER},
                 )
-                db.commit()
             except Exception:
-                with contextlib.suppress(Exception):
-                    db.rollback()
+                if lock_conn is not None:
+                    with contextlib.suppress(Exception):
+                        lock_conn.invalidate()
+        if lock_conn is not None:
+            with contextlib.suppress(Exception):
+                lock_conn.close()
 
 
 def reclaim_expired_if_any(

@@ -2125,42 +2125,107 @@ def test_cli_create_user_and_seed_demo(
     assert upd_audit.after_state["revoked_sessions_count"] >= 1
 
     # 3. seed-demo refuses with non-zero exit when ENVIRONMENT=production (writes zero rows)
-    prod_settings = Settings(
-        database_url="postgresql+psycopg://produser:prod-strong-password-val@db:5432/ecom_prod",
-        environment="production",
-        cookie_secure=True,
-        payment_sandbox_mode=False,
-        allowed_origins=["https://shop.example.com"],
-        csrf_hmac_secret="prod-csrf-secret-value-at-least-32-chars-01",
-        guest_order_hmac_secret="prod-guest-secret-value-at-least-32-chars-02",
-        payment_webhook_secret="prod-webhook-secret-value-at-least-32-chars-03",
+    from app.modules.payments.provider import (
+        ProviderIntentResult,
+        ProviderStatusResult,
+        get_default_payment_registry,
     )
-    assert (
-        cli.main(
-            ["seed-demo"],
-            session_factory=db_session_factory,
-            settings=prod_settings,
-        )
-        == 1
-    )
-    assert db_session.scalar(select(func.count(Category.id))) == 0
+    from app.modules.payments.schemas import WebhookPayload
 
-    # Also verify via ENVIRONMENT=production env resolution (get_settings cache cleared)
-    monkeypatch.setenv("ENVIRONMENT", "production")
-    monkeypatch.setenv(
-        "DATABASE_URL", "postgresql+psycopg://produser:prod-strong-password-val@db:5432/ecom_prod"
-    )
-    monkeypatch.setenv("COOKIE_SECURE", "true")
-    monkeypatch.setenv("PAYMENT_SANDBOX_MODE", "false")
-    monkeypatch.setenv("ALLOWED_ORIGINS", "https://shop.example.com")
-    monkeypatch.setenv("CSRF_HMAC_SECRET", "prod-csrf-secret-value-at-least-32-chars-01")
-    monkeypatch.setenv("GUEST_ORDER_HMAC_SECRET", "prod-guest-secret-value-at-least-32-chars-02")
-    monkeypatch.setenv("PAYMENT_WEBHOOK_SECRET", "prod-webhook-secret-value-at-least-32-chars-03")
-    get_settings.cache_clear()
+    class _SeedDemoMockProdAdapter:
+        @property
+        def provider_name(self) -> str:
+            return "mock_seed_demo_psp"
+
+        @property
+        def is_production_ready(self) -> bool:
+            return True
+
+        def create_intent(
+            self,
+            *,
+            order_number: str,
+            amount_cents: int,
+            currency: str,
+            idempotency_key: str,
+        ) -> ProviderIntentResult:
+            raise NotImplementedError
+
+        def retrieve_intent(self, *, provider_intent_id: str) -> ProviderStatusResult:
+            raise NotImplementedError
+
+        def cancel_intent(self, *, provider_intent_id: str) -> None:
+            raise NotImplementedError
+
+        def refund(
+            self,
+            *,
+            provider_intent_id: str,
+            amount_cents: int,
+            currency: str,
+            reason: str | None,
+        ) -> str:
+            raise NotImplementedError
+
+        def verify_and_parse_webhook(
+            self,
+            *,
+            raw_body: bytes,
+            timestamp_header: str | None,
+            signature_header: str | None,
+            webhook_secret: str,
+            now_ts: int | None = None,
+        ) -> WebhookPayload:
+            raise NotImplementedError
+
+    registry = get_default_payment_registry()
+    registry.register(_SeedDemoMockProdAdapter(), overwrite=True)
     try:
-        assert cli.main(["seed-demo"], session_factory=db_session_factory) == 1
-    finally:
+        prod_settings = Settings(
+            database_url="postgresql+psycopg://produser:prod-strong-password-val@db:5432/ecom_prod",
+            environment="production",
+            cookie_secure=True,
+            payment_sandbox_mode=False,
+            payment_provider="mock_seed_demo_psp",
+            allowed_origins=["https://shop.example.com"],
+            csrf_hmac_secret="prod-csrf-secret-value-at-least-32-chars-01",
+            guest_order_hmac_secret="prod-guest-secret-value-at-least-32-chars-02",
+            payment_webhook_secret="prod-webhook-secret-value-at-least-32-chars-03",
+        )
+        assert (
+            cli.main(
+                ["seed-demo"],
+                session_factory=db_session_factory,
+                settings=prod_settings,
+            )
+            == 1
+        )
+        assert db_session.scalar(select(func.count(Category.id))) == 0
+
+        # Also verify via ENVIRONMENT=production env resolution (get_settings cache cleared)
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.setenv(
+            "DATABASE_URL",
+            "postgresql+psycopg://produser:prod-strong-password-val@db:5432/ecom_prod",
+        )
+        monkeypatch.setenv("COOKIE_SECURE", "true")
+        monkeypatch.setenv("PAYMENT_SANDBOX_MODE", "false")
+        monkeypatch.setenv("PAYMENT_PROVIDER", "mock_seed_demo_psp")
+        monkeypatch.setenv("ALLOWED_ORIGINS", "https://shop.example.com")
+        monkeypatch.setenv("CSRF_HMAC_SECRET", "prod-csrf-secret-value-at-least-32-chars-01")
+        monkeypatch.setenv(
+            "GUEST_ORDER_HMAC_SECRET", "prod-guest-secret-value-at-least-32-chars-02"
+        )
+        monkeypatch.setenv(
+            "PAYMENT_WEBHOOK_SECRET", "prod-webhook-secret-value-at-least-32-chars-03"
+        )
         get_settings.cache_clear()
+        try:
+            assert cli.main(["seed-demo"], session_factory=db_session_factory) == 1
+        finally:
+            get_settings.cache_clear()
+    finally:
+        registry.unregister("mock_seed_demo_psp")
     assert db_session.scalar(select(func.count(Category.id))) == 0
 
     # 4. seed-demo idempotency (3 categories, 8 products, 11 variants, + optional 3 demo users)
@@ -2256,9 +2321,7 @@ def test_h01_admin_analytics_inventory_health_and_admin_orders_reclaim_expired(
     past_exp = datetime.now(UTC) - timedelta(minutes=15)
     for oid_str in (o1["order"]["id"], o2["order"]["id"]):
         res = db_session.scalar(
-            select(InventoryReservation).where(
-                InventoryReservation.order_id == uuid.UUID(oid_str)
-            )
+            select(InventoryReservation).where(InventoryReservation.order_id == uuid.UUID(oid_str))
         )
         assert res is not None
         res.expires_at = past_exp

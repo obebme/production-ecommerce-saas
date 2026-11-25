@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 from pathlib import Path
 from typing import Any
 
@@ -22,10 +23,85 @@ from app.core.database import (
     get_engine,
 )
 from app.main import _resolve_environment_for_docs, create_app
+from app.modules.payments.provider import (
+    ProviderIntentResult,
+    ProviderStatusResult,
+    get_default_payment_registry,
+)
+from app.modules.payments.schemas import WebhookPayload
 
 _STRONG_SECRET_A = "prod-csrf-hmac-secret-9f8e7d6c5b4a3210!"
 _STRONG_SECRET_B = "prod-guest-hmac-secret-1a2b3c4d5e6f7890!"
 _STRONG_SECRET_C = "prod-webhook-hmac-secret-0123456789abcdef!"
+_MOCK_PROD_PROVIDER = "mock_live_psp"
+
+
+class _MockProductionPaymentAdapter:
+    """Isolated test-only production-ready payment adapter stub."""
+
+    def __init__(self, name: str = _MOCK_PROD_PROVIDER) -> None:
+        self._name = name
+
+    @property
+    def provider_name(self) -> str:
+        return self._name
+
+    @property
+    def is_production_ready(self) -> bool:
+        return True
+
+    def create_intent(
+        self,
+        *,
+        order_number: str,
+        amount_cents: int,
+        currency: str,
+        idempotency_key: str,
+    ) -> ProviderIntentResult:
+        raise NotImplementedError
+
+    def retrieve_intent(self, *, provider_intent_id: str) -> ProviderStatusResult:
+        raise NotImplementedError
+
+    def cancel_intent(self, *, provider_intent_id: str) -> None:
+        raise NotImplementedError
+
+    def refund(
+        self,
+        *,
+        provider_intent_id: str,
+        amount_cents: int,
+        currency: str,
+        reason: str | None,
+    ) -> str:
+        raise NotImplementedError
+
+    def verify_and_parse_webhook(
+        self,
+        *,
+        raw_body: bytes,
+        timestamp_header: str | None,
+        signature_header: str | None,
+        webhook_secret: str,
+        now_ts: int | None = None,
+    ) -> WebhookPayload:
+        raise NotImplementedError
+
+
+@contextlib.contextmanager
+def _registered_prod_provider(
+    provider_name: str = _MOCK_PROD_PROVIDER,
+) -> Generator[None, None, None]:
+    """Temporarily register a mock production-ready provider and clean up afterwards."""
+    registry = get_default_payment_registry()
+    prior = registry.get_or_none(provider_name)
+    registry.register(_MockProductionPaymentAdapter(provider_name), overwrite=True)
+    try:
+        yield
+    finally:
+        registry.unregister(provider_name)
+        if prior is not None:
+            registry.register(prior, overwrite=True)
 
 
 def _valid_prod_kwargs(**overrides: Any) -> dict[str, Any]:
@@ -39,6 +115,7 @@ def _valid_prod_kwargs(**overrides: Any) -> dict[str, Any]:
         "guest_order_hmac_secret": _STRONG_SECRET_B,
         "payment_webhook_secret": _STRONG_SECRET_C,
         "payment_sandbox_mode": False,
+        "payment_provider": _MOCK_PROD_PROVIDER,
     }
     base.update(overrides)
     return base
@@ -87,11 +164,12 @@ def test_production_settings_reject_short_or_placeholder_secrets(
 
 def test_production_settings_valid_config_succeeds_and_normalizes_origins() -> None:
     """Valid production Settings succeeds and strips trailing slashes from origin entries."""
-    settings = Settings(
-        **_valid_prod_kwargs(
-            allowed_origins="https://shop.example.com/, https://admin.example.com/ "
+    with _registered_prod_provider():
+        settings = Settings(
+            **_valid_prod_kwargs(
+                allowed_origins="https://shop.example.com/, https://admin.example.com/ "
+            )
         )
-    )
     assert settings.environment == "production"
     assert settings.payment_sandbox_mode is False
     assert settings.cookie_secure is True
@@ -127,7 +205,10 @@ def test_settings_postgres_fallback_builds_escaped_psycopg_url(
     monkeypatch.setenv("PAYMENT_WEBHOOK_SECRET", _STRONG_SECRET_C)
 
     settings = Settings()
-    assert settings.database_url == "postgresql+psycopg://ecom+user:p%40ss%2Fw%3Ard%2B1@db:5432/ecom_db"
+    assert (
+        settings.database_url
+        == "postgresql+psycopg://ecom+user:p%40ss%2Fw%3Ard%2B1@db:5432/ecom_db"
+    )
 
 
 def test_settings_require_database_url_or_all_postgres_components(
@@ -267,14 +348,15 @@ def test_production_allowed_origins_rejects_unsafe_forms(bad_origin: str) -> Non
 
 def test_production_allowed_origins_normalizes_trailing_slash_and_default_port() -> None:
     """Production ALLOWED_ORIGINS normalizes case, trailing slashes, and default :443 port."""
-    settings = Settings(
-        **_valid_prod_kwargs(
-            allowed_origins=(
-                "HTTPS://shop.example.com:443/, https://shop.example.com/, "
-                "https://admin.example.com:8443/ "
+    with _registered_prod_provider():
+        settings = Settings(
+            **_valid_prod_kwargs(
+                allowed_origins=(
+                    "HTTPS://shop.example.com:443/, https://shop.example.com/, "
+                    "https://admin.example.com:8443/ "
+                )
             )
         )
-    )
     assert settings.allowed_origins == [
         "https://shop.example.com",
         "https://admin.example.com:8443",
@@ -354,7 +436,8 @@ def test_production_settings_reject_reused_hmac_secrets(overrides: dict[str, Any
 
 def test_production_create_app_disables_docs_and_openapi_endpoints() -> None:
     """Production create_app disables /api/v1/docs, /api/v1/redoc, and /api/v1/openapi.json."""
-    prod_settings = Settings(**_valid_prod_kwargs())
+    with _registered_prod_provider():
+        prod_settings = Settings(**_valid_prod_kwargs())
     prod_app = create_app(prod_settings)
     assert prod_app.docs_url is None
     assert prod_app.redoc_url is None
@@ -373,15 +456,16 @@ def test_production_create_app_disables_docs_and_openapi_endpoints() -> None:
 
 def test_h04_trusted_proxy_ips_parsing_and_rejection() -> None:
     """H-04: TRUSTED_PROXY_IPS accepts valid IPs/CIDRs and rejects wildcards/invalid entries."""
-    ok_str = Settings(
-        **_valid_prod_kwargs(
-            trusted_proxy_ips="10.0.0.0/8, 127.0.0.1, ::1, 10.0.0.0/8",
+    with _registered_prod_provider():
+        ok_str = Settings(
+            **_valid_prod_kwargs(
+                trusted_proxy_ips="10.0.0.0/8, 127.0.0.1, ::1, 10.0.0.0/8",
+            )
         )
-    )
-    assert ok_str.trusted_proxy_ips == ["10.0.0.0/8", "127.0.0.1/32", "::1/128"]
+        assert ok_str.trusted_proxy_ips == ["10.0.0.0/8", "127.0.0.1/32", "::1/128"]
 
-    ok_empty = Settings(**_valid_prod_kwargs(trusted_proxy_ips="[]"))
-    assert ok_empty.trusted_proxy_ips == []
+        ok_empty = Settings(**_valid_prod_kwargs(trusted_proxy_ips="[]"))
+        assert ok_empty.trusted_proxy_ips == []
 
     for bad_proxy in ("*", "10.0.0.*", "not-an-ip", "10.0.0.1/99", "10.0.0.1\n127.0.0.1"):
         with pytest.raises(ValidationError, match="TRUSTED_PROXY_IPS"):
@@ -480,17 +564,18 @@ def test_m05_postgres_engine_pool_timeouts_and_lifespan_disposal(
     monkeypatch.setattr(db_module, "create_engine", _fake_create_engine)
     clear_db_caches()
 
-    pg_settings = Settings(
-        **_valid_prod_kwargs(
-            db_pool_size=7,
-            db_max_overflow=14,
-            db_pool_timeout_seconds=22,
-            db_pool_recycle_seconds=900,
-            db_statement_timeout_ms=25000,
-            db_lock_timeout_ms=8000,
-            db_idle_in_transaction_timeout_ms=45000,
+    with _registered_prod_provider():
+        pg_settings = Settings(
+            **_valid_prod_kwargs(
+                db_pool_size=7,
+                db_max_overflow=14,
+                db_pool_timeout_seconds=22,
+                db_pool_recycle_seconds=900,
+                db_statement_timeout_ms=25000,
+                db_lock_timeout_ms=8000,
+                db_idle_in_transaction_timeout_ms=45000,
+            )
         )
-    )
 
     try:
         direct = create_engine_from_url(pg_settings.database_url, pg_settings)
@@ -629,3 +714,38 @@ def test_sec_rem_p2_02_non_deployed_envs_allow_zero_db_timeouts_and_accept_site_
     assert settings.db_lock_timeout_ms == 0
     assert settings.db_idle_in_transaction_timeout_ms == 0
     assert settings.next_public_site_url == "https://shop.example.com"
+
+
+def test_harden_qa_01_production_without_registered_provider_fails_closed() -> None:
+    """By default (no production PSP adapter registered), production Settings fails closed."""
+    assert not get_default_payment_registry().has_production_provider()
+    with pytest.raises(ValidationError, match="PAYMENT_PROVIDER"):
+        Settings(
+            database_url="postgresql+psycopg://app:secret@db:5432/ecommerce",
+            environment="production",
+            cookie_secure=True,
+            allowed_origins=["https://store.example.com"],
+            csrf_hmac_secret=_STRONG_SECRET_A,
+            guest_order_hmac_secret=_STRONG_SECRET_B,
+            payment_webhook_secret=_STRONG_SECRET_C,
+            payment_sandbox_mode=False,
+        )
+
+    with pytest.raises(ValidationError, match="PAYMENT_PROVIDER"):
+        Settings(**_valid_prod_kwargs(payment_provider="unregistered_psp"))
+
+
+def test_harden_qa_01_sandbox_simpay_requires_sandbox_mode_true() -> None:
+    """Dev mode with payment_provider='sandbox_simpay' and payment_sandbox_mode=False fails."""
+    with pytest.raises(ValidationError, match="PAYMENT_SANDBOX_MODE must be true"):
+        Settings(
+            database_url="sqlite:///./local_test.db",
+            environment="development",
+            cookie_secure=False,
+            allowed_origins=["http://localhost:3000"],
+            csrf_hmac_secret=_STRONG_SECRET_A,
+            guest_order_hmac_secret=_STRONG_SECRET_B,
+            payment_webhook_secret=_STRONG_SECRET_C,
+            payment_provider="sandbox_simpay",
+            payment_sandbox_mode=False,
+        )

@@ -42,6 +42,7 @@ DEFAULT_PG_BIN = r"E:\databasesql\bin"
 FORBIDDEN_DATA_DIR = Path(r"E:\databasesql\data")
 DEFAULT_NODE_EXE = Path(r"C:\Program Files\nodejs\node.exe")
 DEFAULT_NPX_CMD = Path(r"C:\Program Files\nodejs\npx.cmd")
+DEFAULT_NPM_CMD = Path(r"C:\Program Files\nodejs\npm.cmd")
 
 TEST_ROLE_NAME = "ecom_test_role"
 TEST_DB_NAME = "ecom_test_db"
@@ -188,11 +189,13 @@ def _resolve_runtime_paths(
     *,
     node_exe_raw: str,
     npx_cmd_raw: str,
+    npm_cmd_raw: str,
 ) -> dict[str, Path]:
     backend_python = BACKEND_DIR / ".venv" / "Scripts" / "python.exe"
     backend_alembic = BACKEND_DIR / ".venv" / "Scripts" / "alembic.exe"
     node_exe = Path(node_exe_raw).expanduser().resolve()
     npx_cmd = Path(npx_cmd_raw).expanduser().resolve()
+    npm_cmd = Path(npm_cmd_raw).expanduser().resolve()
     next_bin = FRONTEND_DIR / "node_modules" / "next" / "dist" / "bin" / "next"
     next_build_dir = FRONTEND_DIR / ".next"
     next_build_id = next_build_dir / "BUILD_ID"
@@ -202,6 +205,7 @@ def _resolve_runtime_paths(
         ("backend venv Alembic", backend_alembic),
         ("Node.js executable", node_exe),
         ("npx command", npx_cmd),
+        ("npm command", npm_cmd),
         ("Next.js CLI script", next_bin),
         ("Next.js production build marker (.next/BUILD_ID)", next_build_id),
     ]
@@ -218,6 +222,7 @@ def _resolve_runtime_paths(
         "backend_alembic": backend_alembic,
         "node_exe": node_exe,
         "npx_cmd": npx_cmd,
+        "npm_cmd": npm_cmd,
         "next_bin": next_bin,
     }
 
@@ -336,11 +341,13 @@ def _run_logged_tool_simple(
     log_path: Path,
     timeout_seconds: float,
     env: dict[str, str],
+    cwd: Path | None = None,
 ) -> int:
     """Run a non-daemon tool redirecting stdout/stderr strictly to a log file (no PIPE)."""
     with log_path.open("wb") as log_fh:
         proc = subprocess.run(
             cmd,
+            cwd=str(cwd) if cwd is not None else None,
             stdin=subprocess.DEVNULL,
             stdout=log_fh,
             stderr=subprocess.STDOUT,
@@ -395,6 +402,7 @@ def _preserve_and_print_logs(
             "seed.log",
             "uvicorn.log",
             "nextjs.log",
+            "next_build.log",
         ):
             lines = dest.read_text(encoding="utf-8", errors="replace").splitlines()
             tail = "\n".join(lines[-40:]) if lines else "(empty)"
@@ -619,6 +627,28 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Path to npx command (default: C:\\Program Files\\nodejs\\npx.cmd).",
     )
     parser.add_argument(
+        "--npm-cmd",
+        default=str(DEFAULT_NPM_CMD),
+        help="Path to npm command (default: C:\\Program Files\\nodejs\\npm.cmd).",
+    )
+    parser.add_argument(
+        "--backend-port",
+        type=int,
+        default=BACKEND_PORT,
+        help="Backend uvicorn port (default: 8000; pass 0 for auto free port).",
+    )
+    parser.add_argument(
+        "--frontend-port",
+        type=int,
+        default=FRONTEND_PORT,
+        help="Frontend Next.js port (default: 3000; pass 0 for auto free port).",
+    )
+    parser.add_argument(
+        "--auto-ports",
+        action="store_true",
+        help="Automatically select free ephemeral localhost ports if default ports are busy or requested.",
+    )
+    parser.add_argument(
         "--playwright-timeout",
         type=float,
         default=240.0,
@@ -654,13 +684,40 @@ def main(argv: Sequence[str] | None = None) -> int:
         runtime_paths = _resolve_runtime_paths(
             node_exe_raw=args.node_exe,
             npx_cmd_raw=args.npx_cmd,
+            npm_cmd_raw=args.npm_cmd,
         )
-        _assert_port_free(BACKEND_PORT, label="backend uvicorn")
-        _assert_port_free(FRONTEND_PORT, label="frontend next")
+
+        def _pick_port(requested: int, *, label: str, avoid: set[int]) -> int:
+            if requested == 0:
+                candidate = _allocate_free_loopback_port()
+                while candidate in avoid:
+                    candidate = _allocate_free_loopback_port()
+                return candidate
+            try:
+                _assert_port_free(requested, label=label)
+                return requested
+            except RuntimeError:
+                if not args.auto_ports:
+                    raise
+                candidate = _allocate_free_loopback_port()
+                while candidate in avoid:
+                    candidate = _allocate_free_loopback_port()
+                _log(f"Default {label} port {requested} busy; using ephemeral port {candidate}")
+                return candidate
+
         pg_port = _allocate_free_loopback_port()
+        backend_port = _pick_port(args.backend_port, label="backend uvicorn", avoid={pg_port})
+        frontend_port = _pick_port(
+            args.frontend_port, label="frontend next", avoid={pg_port, backend_port}
+        )
     except (OSError, RuntimeError, FileNotFoundError) as exc:
         _log(f"ERROR: {exc}", error=True)
         return 1
+
+    e2e_base_url = f"http://localhost:{frontend_port}"
+    public_api_base_url = f"http://localhost:{backend_port}/api/v1"
+    internal_api_base_url = f"http://{BACKEND_HOST}:{backend_port}/api/v1"
+    rebuilt_for_custom_ports = False
 
     run_dir = Path(tempfile.mkdtemp(prefix="ecom_e2e_pg18_")).resolve()
     _validate_temp_run_dir(run_dir)
@@ -673,6 +730,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     seed_log = run_dir / "seed.log"
     uvicorn_log = run_dir / "uvicorn.log"
     nextjs_log = run_dir / "nextjs.log"
+    next_build_log = run_dir / "next_build.log"
 
     base_env = _sanitized_base_env()
     role_password = secrets.token_urlsafe(24)
@@ -711,7 +769,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "DATABASE_URL": database_url,
             "ENVIRONMENT": "test",
             "COOKIE_SECURE": "false",
-            "ALLOWED_ORIGINS": E2E_BASE_URL,
+            "ALLOWED_ORIGINS": e2e_base_url,
             "PAYMENT_SANDBOX_MODE": "true",
             "CSRF_HMAC_SECRET": csrf_secret,
             "GUEST_ORDER_HMAC_SECRET": guest_order_secret,
@@ -729,8 +787,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         {
             "NODE_ENV": "production",
             "NEXT_TELEMETRY_DISABLED": "1",
-            "NEXT_PUBLIC_API_BASE_URL": PUBLIC_API_BASE_URL,
-            "INTERNAL_API_BASE_URL": INTERNAL_API_BASE_URL,
+            "NEXT_PUBLIC_API_BASE_URL": public_api_base_url,
+            "NEXT_PUBLIC_SITE_URL": e2e_base_url,
+            "INTERNAL_API_BASE_URL": internal_api_base_url,
+            "HOSTNAME": FRONTEND_HOST,
+            "PORT": str(frontend_port),
             "NO_PROXY": "127.0.0.1,localhost",
         }
     )
@@ -738,7 +799,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     playwright_env = dict(base_env)
     playwright_env.update(
         {
-            "E2E_BASE_URL": E2E_BASE_URL,
+            "E2E_BASE_URL": e2e_base_url,
             "E2E_ADMIN_EMAIL": DEMO_ADMIN_EMAIL,
             "E2E_ADMIN_PASSWORD": demo_admin_pw,
             "E2E_STAFF_EMAIL": DEMO_STAFF_EMAIL,
@@ -943,7 +1004,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise RuntimeError(f"seed-demo exited with status {seed_rc}.")
 
         # 5. Start live FastAPI backend (uvicorn)
-        _log(f"starting uvicorn on {BACKEND_HOST}:{BACKEND_PORT}")
+        _log(f"starting uvicorn on {BACKEND_HOST}:{backend_port}")
         uvicorn_log_fh = uvicorn_log.open("wb")
         with proc_lock:
             if watchdog_fired.is_set():
@@ -958,7 +1019,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "--host",
                     BACKEND_HOST,
                     "--port",
-                    str(BACKEND_PORT),
+                    str(backend_port),
                 ],
                 cwd=str(BACKEND_DIR),
                 env=backend_env,
@@ -970,32 +1031,71 @@ def main(argv: Sequence[str] | None = None) -> int:
             uvicorn_pid = uvicorn_proc.pid
 
         _poll_http_health(
-            url=f"http://{BACKEND_HOST}:{BACKEND_PORT}/api/v1/health",
+            url=f"http://{BACKEND_HOST}:{backend_port}/api/v1/health",
             procs_to_watch=[("uvicorn", uvicorn_proc)],
             watchdog_fired=watchdog_fired,
             deadline_seconds=45.0,
             expect_json_health=True,
         )
-        _log(f"backend healthy (pid={uvicorn_pid}) at {PUBLIC_API_BASE_URL}/health")
+        _log(f"backend healthy (pid={uvicorn_pid}) at {public_api_base_url}/health")
 
-        # 6. Start live Next.js production server
-        _log(f"starting next start on {FRONTEND_HOST}:{FRONTEND_PORT}")
+        # 6. Rebuild Next.js if non-default ports are used, then start production server
+        if backend_port != BACKEND_PORT or frontend_port != FRONTEND_PORT:
+            _log(
+                f"rebuilding Next.js for custom ports (API={public_api_base_url}, "
+                f"SITE={e2e_base_url})"
+            )
+            build_rc = _run_watched_logged(
+                [str(runtime_paths["npm_cmd"]), "run", "build"],
+                cwd=FRONTEND_DIR,
+                env=frontend_env,
+                log_path=next_build_log,
+                timeout_seconds=120.0,
+                stage_name="next build (custom ports)",
+            )
+            rebuilt_for_custom_ports = True
+            if watchdog_fired.is_set():
+                exit_code = 124
+                return exit_code
+            if build_rc != 0:
+                raise RuntimeError(f"next build for custom ports exited with status {build_rc}.")
+
+        standalone_dir = FRONTEND_DIR / ".next" / "standalone"
+        standalone_server = standalone_dir / "server.js"
+        if standalone_server.is_file():
+            static_src = FRONTEND_DIR / ".next" / "static"
+            static_dst = standalone_dir / ".next" / "static"
+            if static_src.is_dir():
+                shutil.copytree(static_src, static_dst, dirs_exist_ok=True)
+            public_src = FRONTEND_DIR / "public"
+            public_dst = standalone_dir / "public"
+            if public_src.is_dir():
+                shutil.copytree(public_src, public_dst, dirs_exist_ok=True)
+            next_cmd = [str(runtime_paths["node_exe"]), str(standalone_server)]
+            next_cwd = standalone_dir
+            next_mode = "node .next/standalone/server.js"
+        else:
+            next_cmd = [
+                str(runtime_paths["node_exe"]),
+                str(runtime_paths["next_bin"]),
+                "start",
+                "-H",
+                FRONTEND_HOST,
+                "-p",
+                str(frontend_port),
+            ]
+            next_cwd = FRONTEND_DIR
+            next_mode = "next start"
+
+        _log(f"starting {next_mode} on {FRONTEND_HOST}:{frontend_port}")
         nextjs_log_fh = nextjs_log.open("wb")
         with proc_lock:
             if watchdog_fired.is_set():
                 exit_code = 124
                 return exit_code
             nextjs_proc = subprocess.Popen(
-                [
-                    str(runtime_paths["node_exe"]),
-                    str(runtime_paths["next_bin"]),
-                    "start",
-                    "-H",
-                    FRONTEND_HOST,
-                    "-p",
-                    str(FRONTEND_PORT),
-                ],
-                cwd=str(FRONTEND_DIR),
+                next_cmd,
+                cwd=str(next_cwd),
                 env=frontend_env,
                 stdin=subprocess.DEVNULL,
                 stdout=nextjs_log_fh,
@@ -1005,13 +1105,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             nextjs_pid = nextjs_proc.pid
 
         _poll_http_health(
-            url=f"http://{FRONTEND_HOST}:{FRONTEND_PORT}/",
-            procs_to_watch=[("uvicorn", uvicorn_proc), ("next start", nextjs_proc)],
+            url=f"http://{FRONTEND_HOST}:{frontend_port}/",
+            procs_to_watch=[("uvicorn", uvicorn_proc), (next_mode, nextjs_proc)],
             watchdog_fired=watchdog_fired,
             deadline_seconds=45.0,
             expect_json_health=False,
         )
-        _log(f"frontend healthy (pid={nextjs_pid}) at {E2E_BASE_URL}/")
+        _log(f"frontend healthy (pid={nextjs_pid}) at {e2e_base_url}/")
 
         # 7. Run Playwright E2E suite
         pw_cmd = [str(runtime_paths["npx_cmd"]), "playwright", "test", *extra_args]
@@ -1141,10 +1241,33 @@ def main(argv: Sequence[str] | None = None) -> int:
                     seed_log,
                     uvicorn_log,
                     nextjs_log,
+                    next_build_log,
                 ],
                 diag_dir=Path(args.diag_dir) if args.diag_dir else None,
                 secrets_to_scrub=secrets_to_scrub,
             )
+
+        if rebuilt_for_custom_ports:
+            _log("restoring default Next.js production build (localhost:3000 / localhost:8000)")
+            restore_env = dict(base_env)
+            restore_env.update(
+                {
+                    "NODE_ENV": "production",
+                    "NEXT_TELEMETRY_DISABLED": "1",
+                    "NEXT_PUBLIC_API_BASE_URL": PUBLIC_API_BASE_URL,
+                    "NEXT_PUBLIC_SITE_URL": E2E_BASE_URL,
+                    "NO_PROXY": "127.0.0.1,localhost",
+                }
+            )
+            restore_rc = _run_logged_tool_simple(
+                [str(runtime_paths["npm_cmd"]), "run", "build"],
+                log_path=run_dir / "next_restore_build.log",
+                timeout_seconds=120.0,
+                env=restore_env,
+                cwd=FRONTEND_DIR,
+            )
+            if restore_rc != 0:
+                _log(f"WARNING: restoring default next build exited with {restore_rc}", error=True)
 
         _log(f"cleaning tempdir '{run_dir}'")
         shutil.rmtree(run_dir, ignore_errors=True)
